@@ -24,7 +24,7 @@ impl LintRule for LimitOffsetWithoutOrderBy {
     }
 
     fn description(&self) -> &'static str {
-        "Using LIMIT/OFFSET without ORDER BY may lead to non-deterministic results."
+        "Use of LIMIT and OFFSET without ORDER BY may lead to non-deterministic results."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

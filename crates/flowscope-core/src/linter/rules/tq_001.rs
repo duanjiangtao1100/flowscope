@@ -19,7 +19,7 @@ impl LintRule for TsqlSpPrefix {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid sp_ procedure prefix in TSQL."
+        "'SP_' prefix should not be used for user-defined stored procedures in T-SQL."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

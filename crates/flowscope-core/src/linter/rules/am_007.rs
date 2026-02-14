@@ -30,7 +30,7 @@ impl LintRule for AmbiguousSetColumns {
     }
 
     fn description(&self) -> &'static str {
-        "Set operation branches should return the same number of columns."
+        "Queries within set query produce different numbers of columns."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

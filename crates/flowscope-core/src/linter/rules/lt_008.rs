@@ -20,7 +20,7 @@ impl LintRule for LayoutCteNewline {
     }
 
     fn description(&self) -> &'static str {
-        "Blank line should separate CTE blocks from following code."
+        "Blank line expected but not found after CTE closing bracket."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

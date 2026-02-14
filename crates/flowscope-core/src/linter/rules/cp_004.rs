@@ -57,7 +57,7 @@ impl LintRule for CapitalisationLiterals {
     }
 
     fn description(&self) -> &'static str {
-        "NULL/TRUE/FALSE should use a consistent case style."
+        "Inconsistent capitalisation of boolean/null literal."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
@@ -102,8 +102,10 @@ fn literal_tokens_for_context(
                 if !source_word_matches(ctx.sql, start, end, word.value.as_str()) {
                     return None;
                 }
-                if matches!(word.value.to_ascii_uppercase().as_str(), "NULL" | "TRUE" | "FALSE")
-                    && !token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex)
+                if matches!(
+                    word.value.to_ascii_uppercase().as_str(),
+                    "NULL" | "TRUE" | "FALSE"
+                ) && !token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex)
                 {
                     out.push(word.value.clone());
                 }

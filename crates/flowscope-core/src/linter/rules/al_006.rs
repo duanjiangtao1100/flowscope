@@ -50,7 +50,7 @@ impl LintRule for AliasingLength {
     }
 
     fn description(&self) -> &'static str {
-        "Alias names should be readable and not excessively long."
+        "Enforce table alias lengths in from clauses and join conditions."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

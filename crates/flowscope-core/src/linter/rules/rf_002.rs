@@ -83,7 +83,7 @@ impl LintRule for ReferencesQualification {
     }
 
     fn description(&self) -> &'static str {
-        "Use qualification consistently in multi-table queries."
+        "References should be qualified if select has more than one referenced table/view."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

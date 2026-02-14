@@ -62,7 +62,7 @@ impl LintRule for LayoutSetOperators {
     }
 
     fn description(&self) -> &'static str {
-        "Set operators should be consistently line-broken."
+        "Set operators should be surrounded by newlines."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

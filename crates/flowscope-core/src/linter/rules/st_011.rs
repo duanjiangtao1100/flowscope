@@ -28,7 +28,7 @@ impl LintRule for StructureUnusedJoin {
     }
 
     fn description(&self) -> &'static str {
-        "Joined sources should be referenced meaningfully."
+        "Joined table not referenced in query."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

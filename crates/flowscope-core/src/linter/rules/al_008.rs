@@ -72,7 +72,7 @@ impl LintRule for AliasingUniqueColumn {
     }
 
     fn description(&self) -> &'static str {
-        "Column aliases should be unique in projection lists."
+        "Column aliases should be unique within each clause."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

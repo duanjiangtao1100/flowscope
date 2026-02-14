@@ -71,7 +71,7 @@ impl LintRule for AliasingSelfAliasColumn {
     }
 
     fn description(&self) -> &'static str {
-        "Column aliases should not alias to itself."
+        "Column aliases should not alias to itself, i.e. self-alias."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

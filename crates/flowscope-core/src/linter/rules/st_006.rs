@@ -21,7 +21,7 @@ impl LintRule for StructureColumnOrder {
     }
 
     fn description(&self) -> &'static str {
-        "Select wildcards then simple targets before calculations."
+        "Select wildcards then simple targets before calculations and aggregates."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

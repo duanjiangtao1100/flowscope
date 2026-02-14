@@ -20,7 +20,7 @@ impl LintRule for JinjaPadding {
     }
 
     fn description(&self) -> &'static str {
-        "Jinja tags should use consistent padding."
+        "Jinja tags should have a single whitespace on either side."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

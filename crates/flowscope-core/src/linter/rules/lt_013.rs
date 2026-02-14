@@ -19,7 +19,7 @@ impl LintRule for LayoutStartOfFile {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid leading blank lines at file start."
+        "Files must not begin with newlines or whitespace."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

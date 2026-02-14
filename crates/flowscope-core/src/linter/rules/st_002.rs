@@ -20,7 +20,7 @@ impl LintRule for StructureSimpleCase {
     }
 
     fn description(&self) -> &'static str {
-        "Use simple CASE when an expression repeatedly compares the same operand."
+        "Unnecessary 'CASE' statement."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

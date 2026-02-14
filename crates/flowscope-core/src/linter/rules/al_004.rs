@@ -75,7 +75,7 @@ impl LintRule for AliasingUniqueTable {
     }
 
     fn description(&self) -> &'static str {
-        "Table aliases should be unique within a statement."
+        "Table aliases should be unique within each clause."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

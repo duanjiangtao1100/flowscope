@@ -16,7 +16,8 @@ use super::semantic_helpers::{table_factor_alias_name, visit_selects_in_statemen
 
 pub struct ConventionBlockedWords {
     blocked_words: HashSet<String>,
-    blocked_regex: Option<Regex>,
+    blocked_regexes: Vec<Regex>,
+    match_source: bool,
 }
 
 impl ConventionBlockedWords {
@@ -27,19 +28,15 @@ impl ConventionBlockedWords {
             .map(|word| normalized_token(&word))
             .collect();
 
-        let blocked_regex = config
-            .rule_option_str(issue_codes::LINT_CV_009, "blocked_regex")
-            .filter(|pattern| !pattern.trim().is_empty())
-            .and_then(|pattern| {
-                RegexBuilder::new(pattern)
-                    .case_insensitive(true)
-                    .build()
-                    .ok()
-            });
+        let blocked_regexes = configured_blocked_regexes(config);
+        let match_source = config
+            .rule_option_bool(issue_codes::LINT_CV_009, "match_source")
+            .unwrap_or(false);
 
         Self {
             blocked_words,
-            blocked_regex,
+            blocked_regexes,
+            match_source,
         }
     }
 }
@@ -51,7 +48,8 @@ impl Default for ConventionBlockedWords {
                 .into_iter()
                 .map(|word| normalized_token(&word))
                 .collect(),
-            blocked_regex: None,
+            blocked_regexes: Vec::new(),
+            match_source: false,
         }
     }
 }
@@ -66,11 +64,17 @@ impl LintRule for ConventionBlockedWords {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid blocked placeholder words."
+        "Block a list of configurable words from being used."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if statement_contains_blocked_word(statement, self) {
+        let source_violation = self.match_source
+            && self
+                .blocked_regexes
+                .iter()
+                .any(|regex| regex.is_match(ctx.statement_sql()));
+
+        if source_violation || statement_contains_blocked_word(statement, self) {
             vec![Issue::warning(
                 issue_codes::LINT_CV_009,
                 "Blocked placeholder words detected (e.g., TODO/FIXME/foo/bar).",
@@ -97,6 +101,32 @@ fn configured_blocked_words(config: &LintConfig) -> Option<Vec<String>> {
                 .map(str::to_string)
                 .collect()
         })
+}
+
+fn configured_blocked_regexes(config: &LintConfig) -> Vec<Regex> {
+    let mut patterns = Vec::new();
+
+    if let Some(list) = config.rule_option_string_list(issue_codes::LINT_CV_009, "blocked_regex") {
+        patterns.extend(list);
+    } else if let Some(pattern) = config.rule_option_str(issue_codes::LINT_CV_009, "blocked_regex")
+    {
+        patterns.push(pattern.to_string());
+    }
+
+    patterns
+        .into_iter()
+        .filter_map(|pattern| {
+            let trimmed = pattern.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                RegexBuilder::new(trimmed)
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+            }
+        })
+        .collect()
 }
 
 fn default_blocked_words() -> Vec<String> {
@@ -183,9 +213,9 @@ fn token_is_blocked(token: &str, config: &ConventionBlockedWords) -> bool {
     let normalized = normalized_token(token);
     config.blocked_words.contains(&normalized)
         || config
-            .blocked_regex
-            .as_ref()
-            .is_some_and(|regex| regex.is_match(&normalized))
+            .blocked_regexes
+            .iter()
+            .any(|regex| regex.is_match(&normalized))
 }
 
 fn normalized_token(token: &str) -> String {
@@ -293,6 +323,54 @@ mod tests {
         };
         let rule = ConventionBlockedWords::from_config(&config);
         let sql = "SELECT tmp_value FROM t";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn blocked_regex_array_matches_identifier() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "LINT_CV_009".to_string(),
+                serde_json::json!({"blocked_words": [], "blocked_regex": ["^TMP_", "^WIP_"]}),
+            )]),
+        };
+        let rule = ConventionBlockedWords::from_config(&config);
+        let sql = "SELECT wip_item FROM t";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn match_source_true_allows_raw_sql_regex_matching() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.blocked_words".to_string(),
+                serde_json::json!({"blocked_words": [], "blocked_regex": "TODO", "match_source": true}),
+            )]),
+        };
+        let rule = ConventionBlockedWords::from_config(&config);
+        let sql = "SELECT 'TODO' AS note FROM t";
         let statements = parse_sql(sql).expect("parse");
         let issues = rule.check(
             &statements[0],

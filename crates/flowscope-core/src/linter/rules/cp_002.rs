@@ -64,7 +64,7 @@ impl LintRule for CapitalisationIdentifiers {
     }
 
     fn description(&self) -> &'static str {
-        "Identifiers should use a consistent case style."
+        "Inconsistent capitalisation of unquoted identifiers."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

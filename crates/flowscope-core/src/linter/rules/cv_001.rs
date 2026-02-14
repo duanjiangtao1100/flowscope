@@ -78,7 +78,7 @@ impl LintRule for ConventionNotEqual {
     }
 
     fn description(&self) -> &'static str {
-        "Use a consistent not-equal operator style."
+        "Consistent usage of '!=' or '<>' for \"not equal to\" operator."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -77,7 +77,7 @@ impl LintRule for ReferencesConsistent {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid mixing qualified and unqualified references."
+        "Column references should be qualified consistently in single table statements."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

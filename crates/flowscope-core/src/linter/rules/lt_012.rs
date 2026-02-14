@@ -20,7 +20,7 @@ impl LintRule for LayoutEndOfFile {
     }
 
     fn description(&self) -> &'static str {
-        "File should end with a single trailing newline."
+        "Files must end with a single trailing newline."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

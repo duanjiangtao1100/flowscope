@@ -90,7 +90,7 @@ impl LintRule for ReferencesQuoting {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid unnecessary identifier quoting."
+        "Unnecessary quoted identifier."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -56,7 +56,7 @@ impl LintRule for CapitalisationTypes {
     }
 
     fn description(&self) -> &'static str {
-        "Type names should use a consistent case style."
+        "Inconsistent capitalisation of datatypes."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

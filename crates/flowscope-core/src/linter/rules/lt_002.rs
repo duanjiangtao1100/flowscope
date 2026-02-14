@@ -73,7 +73,7 @@ impl LintRule for LayoutIndent {
     }
 
     fn description(&self) -> &'static str {
-        "Indentation should use consistent step sizes."
+        "Incorrect Indentation."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

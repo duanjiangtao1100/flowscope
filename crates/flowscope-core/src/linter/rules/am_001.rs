@@ -19,7 +19,7 @@ impl LintRule for DistinctWithGroupBy {
     }
 
     fn description(&self) -> &'static str {
-        "DISTINCT is redundant when GROUP BY is used."
+        "Ambiguous use of 'DISTINCT' in a 'SELECT' statement with 'GROUP BY'."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -78,7 +78,7 @@ impl LintRule for ReferencesFrom {
     }
 
     fn description(&self) -> &'static str {
-        "Qualified references should resolve to known FROM/JOIN sources."
+        "References cannot reference objects not present in 'FROM' clause."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

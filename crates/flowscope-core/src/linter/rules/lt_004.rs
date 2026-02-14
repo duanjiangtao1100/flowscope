@@ -67,7 +67,7 @@ impl LintRule for LayoutCommas {
     }
 
     fn description(&self) -> &'static str {
-        "Comma spacing should be consistent."
+        "Leading/Trailing comma enforcement."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

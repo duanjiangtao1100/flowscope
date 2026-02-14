@@ -63,7 +63,7 @@ impl LintRule for ConventionQuotedLiterals {
     }
 
     fn description(&self) -> &'static str {
-        "Quoted literal style is inconsistent with SQL convention."
+        "Consistent usage of preferred quotes for quoted literals."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

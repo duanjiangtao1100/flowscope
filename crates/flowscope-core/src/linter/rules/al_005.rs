@@ -78,7 +78,7 @@ impl LintRule for UnusedTableAlias {
     }
 
     fn description(&self) -> &'static str {
-        "Table alias defined but never referenced in the query."
+        "Tables should not be aliased if that alias is not used."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

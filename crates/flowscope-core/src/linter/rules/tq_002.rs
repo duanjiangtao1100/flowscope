@@ -19,7 +19,7 @@ impl LintRule for TsqlProcedureBeginEnd {
     }
 
     fn description(&self) -> &'static str {
-        "TSQL procedures should include BEGIN/END block."
+        "Procedure bodies with multiple statements should be wrapped in BEGIN/END."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

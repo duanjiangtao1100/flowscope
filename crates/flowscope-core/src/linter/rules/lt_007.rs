@@ -22,7 +22,7 @@ impl LintRule for LayoutCteBracket {
     }
 
     fn description(&self) -> &'static str {
-        "CTE bodies should be wrapped in brackets."
+        "'WITH' clause closing bracket should be on a new line."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

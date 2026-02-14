@@ -52,7 +52,7 @@ impl LintRule for LayoutNewlines {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid excessive blank lines."
+        "Too many consecutive blank lines."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

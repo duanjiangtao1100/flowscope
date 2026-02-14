@@ -71,7 +71,7 @@ impl LintRule for LayoutLongLines {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid excessively long SQL lines."
+        "Line is too long."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -20,7 +20,7 @@ impl LintRule for BareUnion {
     }
 
     fn description(&self) -> &'static str {
-        "UNION should be explicit about DISTINCT or ALL."
+        "'UNION [DISTINCT|ALL]' is preferred over just 'UNION'."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

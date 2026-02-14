@@ -81,7 +81,7 @@ impl LintRule for ConventionCastingStyle {
     }
 
     fn description(&self) -> &'static str {
-        "Use consistent casting style."
+        "Enforce consistent type casting style."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -611,6 +611,14 @@ mod tests {
                     "LINT_AL_002".to_string(),
                     serde_json::json!({"aliasing": "explicit"}),
                 ),
+                (
+                    "AM06".to_string(),
+                    serde_json::json!({"group_by_and_order_by_style": "explicit"}),
+                ),
+                (
+                    "references.consistent".to_string(),
+                    serde_json::json!({"single_table_references": "qualified"}),
+                ),
             ]),
         };
 
@@ -621,6 +629,14 @@ mod tests {
         assert_eq!(
             config.rule_option_str("aliasing.column", "aliasing"),
             Some("explicit")
+        );
+        assert_eq!(
+            config.rule_option_str("LINT_AM_006", "group_by_and_order_by_style"),
+            Some("explicit")
+        );
+        assert_eq!(
+            config.rule_option_str("RF03", "single_table_references"),
+            Some("qualified")
         );
     }
 

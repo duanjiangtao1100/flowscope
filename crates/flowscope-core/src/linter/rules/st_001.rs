@@ -21,7 +21,7 @@ impl LintRule for UnnecessaryElseNull {
     }
 
     fn description(&self) -> &'static str {
-        "ELSE NULL is redundant in CASE expressions; CASE returns NULL by default when no branch matches."
+        "Do not specify 'else null' in a case when statement (redundant)."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

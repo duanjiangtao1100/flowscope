@@ -19,7 +19,7 @@ impl LintRule for AvoidUsingJoin {
     }
 
     fn description(&self) -> &'static str {
-        "Prefer explicit ON conditions instead of JOIN ... USING (...)."
+        "Prefer specifying join keys instead of using 'USING'."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

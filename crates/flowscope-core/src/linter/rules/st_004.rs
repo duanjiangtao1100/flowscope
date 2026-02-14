@@ -20,7 +20,7 @@ impl LintRule for FlattenableNestedCase {
     }
 
     fn description(&self) -> &'static str {
-        "Nested CASE in ELSE can be flattened into a single CASE expression."
+        "Nested 'CASE' statement in 'ELSE' clause could be flattened."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

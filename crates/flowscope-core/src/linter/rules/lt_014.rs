@@ -21,7 +21,7 @@ impl LintRule for LayoutKeywordNewline {
     }
 
     fn description(&self) -> &'static str {
-        "Major clauses should be consistently line-broken."
+        "Keyword clauses should follow a standard for being before/after newlines."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

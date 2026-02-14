@@ -79,7 +79,8 @@ impl LintRule for AliasingColumnStyle {
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let mut issues = Vec::new();
-        let tokens = tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
+        let tokens =
+            tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
 
         visit_selects_in_statement(statement, &mut |select| {
             for item in &select.projection {
@@ -184,13 +185,9 @@ fn tsql_assignment_after_alias_tokens(
     alias_end: usize,
     item_end: usize,
 ) -> Option<bool> {
-    let token = tokens
-        .iter()
-        .find(|token| {
-            token.start >= alias_end
-                && token.end <= item_end
-                && !is_trivia_token(&token.token)
-        })?;
+    let token = tokens.iter().find(|token| {
+        token.start >= alias_end && token.end <= item_end && !is_trivia_token(&token.token)
+    })?;
     Some(matches!(token.token, Token::Eq | Token::Assignment))
 }
 

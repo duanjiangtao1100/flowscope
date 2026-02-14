@@ -22,7 +22,7 @@ impl LintRule for LayoutFunctions {
     }
 
     fn description(&self) -> &'static str {
-        "Function call spacing should be consistent."
+        "Function name not immediately followed by parenthesis."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

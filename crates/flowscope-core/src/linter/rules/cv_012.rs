@@ -21,7 +21,7 @@ impl LintRule for ConventionJoinCondition {
     }
 
     fn description(&self) -> &'static str {
-        "JOIN clauses should use explicit, meaningful join predicates."
+        "Use `JOIN ... ON ...` instead of `WHERE ...` for join conditions."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

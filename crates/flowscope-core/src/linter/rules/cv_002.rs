@@ -20,7 +20,7 @@ impl LintRule for CoalesceConvention {
     }
 
     fn description(&self) -> &'static str {
-        "Use COALESCE instead of IFNULL or NVL."
+        "Use 'COALESCE' instead of 'IFNULL' or 'NVL'."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

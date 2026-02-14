@@ -71,7 +71,7 @@ impl LintRule for AmbiguousColumnRefs {
     }
 
     fn description(&self) -> &'static str {
-        "Inconsistent column references in GROUP BY/ORDER BY clauses."
+        "Inconsistent column references in 'GROUP BY/ORDER BY' clauses."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

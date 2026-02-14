@@ -78,7 +78,7 @@ impl LintRule for ReferencesSpecialChars {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid unsupported special characters in identifiers."
+        "Do not use special characters in identifiers."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -25,7 +25,7 @@ impl WildcardPolicy {
             .to_ascii_lowercase()
             .as_str()
         {
-            "multiple" => Self::Multiple,
+            "multiple" | "multi" | "allow_multiple" => Self::Multiple,
             _ => Self::Single,
         }
     }
@@ -61,7 +61,7 @@ impl LintRule for LayoutSelectTargets {
     }
 
     fn description(&self) -> &'static str {
-        "Select targets should be on a new line unless there is only one target."
+        "Select targets should be on a new line unless there is only one select target."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
@@ -640,6 +640,12 @@ mod tests {
         let issues = run_with_wildcard_policy("SELECT * FROM t", "multiple");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_009);
+    }
+
+    #[test]
+    fn wildcard_policy_alias_allow_multiple_is_supported() {
+        let issues = run_with_wildcard_policy("SELECT * FROM t", "allow_multiple");
+        assert_eq!(issues.len(), 1);
     }
 
     #[test]

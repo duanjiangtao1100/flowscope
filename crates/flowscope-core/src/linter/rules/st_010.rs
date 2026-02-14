@@ -20,7 +20,7 @@ impl LintRule for StructureConstantExpression {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid constant boolean expressions in predicates."
+        "Redundant constant expression."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

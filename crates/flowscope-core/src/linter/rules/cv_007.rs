@@ -19,7 +19,7 @@ impl LintRule for ConventionStatementBrackets {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid unnecessary wrapping brackets around full statements."
+        "Top-level statements should not be wrapped in brackets."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

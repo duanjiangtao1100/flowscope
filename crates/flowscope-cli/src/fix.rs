@@ -10,10 +10,10 @@ use flowscope_core::{
     analyze, issue_codes, linter::helpers as lint_helpers, parse_sql_with_dialect, AnalysisOptions,
     AnalyzeRequest, Dialect, LintConfig, ParseError,
 };
-use regex::{Captures, Regex};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[must_use]
@@ -64,6 +64,13 @@ pub struct FixOutcome {
 struct RuleFilter {
     disabled: HashSet<String>,
     am005_mode: Am005QualifyMode,
+    cv06_require_final_semicolon: bool,
+    al007_force_enable: bool,
+    al009_case_check: Al009AliasCaseCheck,
+    al001_mode: Al001FixMode,
+    cv010_style: Cv010QuotedLiteralStyle,
+    cv011_style: Cv011CastingStyle,
+    st005_forbid_subquery_in: St005ForbidSubqueryIn,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -74,9 +81,62 @@ enum Am005QualifyMode {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum Al001FixMode {
+    #[default]
+    Explicit,
+    Implicit,
+    PreserveOriginal,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum Al009AliasCaseCheck {
+    #[default]
+    Dialect,
+    CaseInsensitive,
+    QuotedCsNakedUpper,
+    QuotedCsNakedLower,
+    CaseSensitive,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum Cv010QuotedLiteralStyle {
+    #[default]
+    Consistent,
+    SingleQuotes,
+    DoubleQuotes,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum Cv011CastingStyle {
+    #[default]
+    Consistent,
+    Shorthand,
+    Cast,
+    Convert,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum St005ForbidSubqueryIn {
+    Both,
+    #[default]
+    Join,
+    From,
+}
+
+impl St005ForbidSubqueryIn {
+    fn forbid_from(self) -> bool {
+        matches!(self, Self::Both | Self::From)
+    }
+
+    fn forbid_join(self) -> bool {
+        matches!(self, Self::Both | Self::Join)
+    }
+}
+
 impl RuleFilter {
     fn from_lint_config(lint_config: &LintConfig) -> Self {
-        let disabled = lint_config
+        let disabled: HashSet<String> = lint_config
             .disabled_rules
             .iter()
             .filter_map(|rule| {
@@ -99,9 +159,78 @@ impl RuleFilter {
             "both" => Am005QualifyMode::Both,
             _ => Am005QualifyMode::Inner,
         };
+        let cv06_require_final_semicolon = lint_config
+            .rule_option_bool(issue_codes::LINT_CV_006, "require_final_semicolon")
+            .unwrap_or(false);
+        let al007_force_enable = lint_config
+            .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
+            .unwrap_or(false);
+        let al009_case_check = match lint_config
+            .rule_option_str(issue_codes::LINT_AL_009, "alias_case_check")
+            .unwrap_or("dialect")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "case_insensitive" => Al009AliasCaseCheck::CaseInsensitive,
+            "quoted_cs_naked_upper" => Al009AliasCaseCheck::QuotedCsNakedUpper,
+            "quoted_cs_naked_lower" => Al009AliasCaseCheck::QuotedCsNakedLower,
+            "case_sensitive" => Al009AliasCaseCheck::CaseSensitive,
+            _ => Al009AliasCaseCheck::Dialect,
+        };
+        let al001_mode = if disabled.contains(issue_codes::LINT_AL_001) {
+            Al001FixMode::PreserveOriginal
+        } else {
+            match lint_config
+                .rule_option_str(issue_codes::LINT_AL_001, "aliasing")
+                .unwrap_or("explicit")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "implicit" => Al001FixMode::Implicit,
+                _ => Al001FixMode::Explicit,
+            }
+        };
+        let cv010_style = match lint_config
+            .rule_option_str(issue_codes::LINT_CV_010, "preferred_quoted_literal_style")
+            .unwrap_or("consistent")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "single_quotes" | "single" => Cv010QuotedLiteralStyle::SingleQuotes,
+            "double_quotes" | "double" => Cv010QuotedLiteralStyle::DoubleQuotes,
+            _ => Cv010QuotedLiteralStyle::Consistent,
+        };
+        let cv011_style = match lint_config
+            .rule_option_str(issue_codes::LINT_CV_011, "preferred_type_casting_style")
+            .unwrap_or("consistent")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "shorthand" => Cv011CastingStyle::Shorthand,
+            "cast" => Cv011CastingStyle::Cast,
+            "convert" => Cv011CastingStyle::Convert,
+            _ => Cv011CastingStyle::Consistent,
+        };
+        let st005_forbid_subquery_in = match lint_config
+            .rule_option_str(issue_codes::LINT_ST_005, "forbid_subquery_in")
+            .unwrap_or("join")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "from" => St005ForbidSubqueryIn::From,
+            "both" => St005ForbidSubqueryIn::Both,
+            _ => St005ForbidSubqueryIn::Join,
+        };
         Self {
             disabled,
             am005_mode,
+            cv06_require_final_semicolon,
+            al007_force_enable,
+            al009_case_check,
+            al001_mode,
+            cv010_style,
+            cv011_style,
+            st005_forbid_subquery_in,
         }
     }
 
@@ -169,6 +298,7 @@ pub fn apply_lint_fixes_with_lint_config(
     let mut fixed_sql = render_statements(&statements, sql);
     fixed_sql = apply_text_fixes(&fixed_sql, &rule_filter, dialect);
     fixed_sql = apply_am005_full_outer_keyword_fix(&fixed_sql, &rule_filter);
+    fixed_sql = apply_al001_alias_style_fix(sql, &fixed_sql, dialect, &rule_filter);
 
     let after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
     let counts = FixCounts::from_removed(&before_counts, &after_counts);
@@ -374,6 +504,9 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_ST_012) {
         out = fix_consecutive_semicolons(&out, dialect);
     }
+    if rule_filter.allows(issue_codes::LINT_CV_006) {
+        out = fix_statement_terminators(&out, dialect, rule_filter.cv06_require_final_semicolon);
+    }
     if rule_filter.allows(issue_codes::LINT_CV_001) {
         out = fix_not_equal_operator(&out);
     }
@@ -387,40 +520,37 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
         out = fix_excessive_blank_lines(&out);
     }
     if rule_filter.allows(issue_codes::LINT_LT_001) {
-        out = fix_operator_spacing(&out);
+        out = fix_operator_spacing(&out, dialect);
+    }
+    if rule_filter.allows(issue_codes::LINT_LT_003) {
+        out = fix_operator_line_position(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_004) {
-        out = fix_comma_spacing(&out);
+        out = fix_comma_spacing(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_006) {
-        out = fix_function_spacing(&out);
+        out = fix_function_spacing(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
     if rule_filter.allows(issue_codes::LINT_LT_011) {
-        out = fix_set_operator_layout(&out);
+        out = fix_set_operator_layout(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_007) {
-        out = fix_cte_bracket(&out);
+        out = fix_cte_bracket(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_008) {
-        out = fix_cte_newline(&out);
+        out = fix_cte_newline(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_009) {
-        out = fix_select_target_newline(&out);
+        out = fix_select_target_newline(&out, dialect);
+    }
+    if rule_filter.allows(issue_codes::LINT_LT_010) {
+        out = fix_select_modifier_position(&out);
     }
     if rule_filter.allows(issue_codes::LINT_LT_014) {
-        out = fix_keyword_newlines(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_AL_001) {
-        out = fix_missing_table_aliases(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_AL_009) {
-        out = fix_self_aliases(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_AL_007) {
-        out = fix_single_table_aliases(&out);
+        out = fix_keyword_newlines(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_AL_005) {
         out = fix_unused_table_aliases(&out);
@@ -431,13 +561,19 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_ST_005) {
         out = fix_subquery_to_cte(&out);
     }
+    if rule_filter.allows(issue_codes::LINT_CV_010) {
+        out = fix_quoted_literal_style(&out, rule_filter.cv010_style);
+    }
     if rule_filter.allows(issue_codes::LINT_RF_003) {
         out = fix_mixed_reference_qualification(&out);
     }
     if rule_filter.allows(issue_codes::LINT_RF_006) {
         out = fix_references_quoting(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_CP_001) {
+    if rule_filter.allows(issue_codes::LINT_CP_001)
+        || rule_filter.allows(issue_codes::LINT_CP_004)
+        || rule_filter.allows(issue_codes::LINT_CP_005)
+    {
         out = fix_case_style_consistency(&out);
     }
     if rule_filter.allows(issue_codes::LINT_TQ_002) {
@@ -466,6 +602,196 @@ fn apply_am005_full_outer_keyword_fix(sql: &str, rule_filter: &RuleFilter) -> St
     }
 
     replace_full_join_outside_single_quotes(sql)
+}
+
+fn apply_al001_alias_style_fix(
+    original_sql: &str,
+    fixed_sql: &str,
+    dialect: Dialect,
+    rule_filter: &RuleFilter,
+) -> String {
+    match rule_filter.al001_mode {
+        Al001FixMode::Explicit => fixed_sql.to_string(),
+        Al001FixMode::Implicit => rewrite_table_aliases_to_implicit(fixed_sql, dialect),
+        Al001FixMode::PreserveOriginal => {
+            preserve_original_table_alias_style(original_sql, fixed_sql, dialect)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TableAliasOccurrence {
+    alias_key: String,
+    alias_start: usize,
+    explicit_as: bool,
+    as_start: Option<usize>,
+}
+
+fn preserve_original_table_alias_style(
+    original_sql: &str,
+    fixed_sql: &str,
+    dialect: Dialect,
+) -> String {
+    let Some(original_aliases) = table_alias_occurrences(original_sql, dialect) else {
+        return fixed_sql.to_string();
+    };
+    let Some(fixed_aliases) = table_alias_occurrences(fixed_sql, dialect) else {
+        return fixed_sql.to_string();
+    };
+
+    let mut desired_by_alias: HashMap<String, VecDeque<bool>> = HashMap::new();
+    for alias in original_aliases {
+        desired_by_alias
+            .entry(alias.alias_key)
+            .or_default()
+            .push_back(alias.explicit_as);
+    }
+
+    let mut removals = Vec::new();
+    for alias in fixed_aliases {
+        let desired_explicit = desired_by_alias
+            .get_mut(&alias.alias_key)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or(alias.explicit_as);
+
+        if alias.explicit_as && !desired_explicit {
+            if let Some(as_start) = alias.as_start {
+                removals.push((as_start, alias.alias_start));
+            }
+        }
+    }
+
+    apply_byte_removals(fixed_sql, removals)
+}
+
+fn rewrite_table_aliases_to_implicit(sql: &str, dialect: Dialect) -> String {
+    let Some(aliases) = table_alias_occurrences(sql, dialect) else {
+        return sql.to_string();
+    };
+
+    let removals = aliases
+        .into_iter()
+        .filter_map(|alias| {
+            if alias.explicit_as {
+                alias.as_start.map(|as_start| (as_start, alias.alias_start))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    apply_byte_removals(sql, removals)
+}
+
+fn apply_byte_removals(sql: &str, mut removals: Vec<(usize, usize)>) -> String {
+    if removals.is_empty() {
+        return sql.to_string();
+    }
+
+    removals.sort_unstable();
+    removals.dedup();
+
+    let mut out = sql.to_string();
+    for (start, end) in removals.into_iter().rev() {
+        if start < end && end <= out.len() {
+            out.replace_range(start..end, "");
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct SpanEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+impl SpanEdit {
+    fn replace(start: usize, end: usize, replacement: impl Into<String>) -> Self {
+        Self {
+            start,
+            end,
+            replacement: replacement.into(),
+        }
+    }
+}
+
+fn apply_span_edits(sql: &str, mut edits: Vec<SpanEdit>) -> String {
+    if edits.is_empty() {
+        return sql.to_string();
+    }
+
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    edits.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.replacement == b.replacement);
+
+    let mut out = sql.to_string();
+    let mut last_start = usize::MAX;
+    for edit in edits.into_iter().rev() {
+        if edit.start > edit.end || edit.end > out.len() {
+            continue;
+        }
+        if edit.start >= last_start {
+            continue;
+        }
+        out.replace_range(edit.start..edit.end, &edit.replacement);
+        last_start = edit.start;
+    }
+
+    out
+}
+
+fn table_alias_occurrences(sql: &str, dialect: Dialect) -> Option<Vec<TableAliasOccurrence>> {
+    let statements = parse_sql_with_dialect(sql, dialect).ok()?;
+    let tokens = tokenize_with_offsets(sql, dialect)?;
+
+    let mut aliases = Vec::new();
+    for statement in &statements {
+        collect_table_alias_idents_in_statement(statement, &mut |ident| {
+            aliases.push(ident.clone())
+        });
+    }
+
+    let mut occurrences = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let (alias_start, _alias_end) = ident_span_offsets(sql, &alias)?;
+        let previous_token = tokens
+            .iter()
+            .rev()
+            .find(|token| token.end <= alias_start && !is_trivia_token(&token.token));
+
+        let (explicit_as, as_start) = match previous_token {
+            Some(token) if is_as_token(&token.token) => (true, Some(token.start)),
+            _ => (false, None),
+        };
+
+        occurrences.push(TableAliasOccurrence {
+            alias_key: alias.value.to_ascii_lowercase(),
+            alias_start,
+            explicit_as,
+            as_start,
+        });
+    }
+
+    Some(occurrences)
+}
+
+fn ident_span_offsets(sql: &str, ident: &Ident) -> Option<(usize, usize)> {
+    let start = line_col_to_offset(
+        sql,
+        ident.span.start.line as usize,
+        ident.span.start.column as usize,
+    )?;
+    let end = line_col_to_offset(
+        sql,
+        ident.span.end.line as usize,
+        ident.span.end.column as usize,
+    )?;
+    Some((start, end))
+}
+
+fn is_as_token(token: &Token) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("AS"))
 }
 
 fn replace_full_join_outside_single_quotes(sql: &str) -> String {
@@ -524,31 +850,54 @@ fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
     !(ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn regex_replace_all(sql: &str, pattern: &str, replacement: &str) -> String {
-    match Regex::new(pattern) {
-        Ok(re) => re.replace_all(sql, replacement).into_owned(),
-        Err(_) => sql.to_string(),
-    }
-}
-
-fn regex_replace_all_with<F>(sql: &str, pattern: &str, replacement: F) -> String
-where
-    F: FnMut(&Captures<'_>) -> String,
-{
-    match Regex::new(pattern) {
-        Ok(re) => re.replace_all(sql, replacement).into_owned(),
-        Err(_) => sql.to_string(),
-    }
-}
-
 fn fix_jinja_padding(sql: &str) -> String {
-    let out = regex_replace_all(sql, r"\{\{\s*([^{}]+?)\s*\}\}", "{{ $1 }}");
-    regex_replace_all(&out, r"\{%\s*([^%]+?)\s*%\}", "{% $1 %}")
+    let out = normalize_template_tag_padding(sql, b"{{", b"}}", |b| b != b'{' && b != b'}');
+    normalize_template_tag_padding(&out, b"{%", b"%}", |b| b != b'%')
+}
+
+fn normalize_template_tag_padding<F>(sql: &str, open: &[u8], close: &[u8], inner_ok: F) -> String
+where
+    F: Fn(u8) -> bool,
+{
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let mut replaced = false;
+        if i + open.len() <= bytes.len() && &bytes[i..i + open.len()] == open {
+            let mut j = i + open.len();
+            while j + close.len() <= bytes.len() {
+                if &bytes[j..j + close.len()] == close {
+                    let inner = &sql[i + open.len()..j];
+                    if !inner.is_empty() && inner.as_bytes().iter().copied().all(&inner_ok) {
+                        out.push_str(std::str::from_utf8(open).expect("template delimiter ascii"));
+                        out.push(' ');
+                        out.push_str(inner.trim());
+                        out.push(' ');
+                        out.push_str(std::str::from_utf8(close).expect("template delimiter ascii"));
+                        i = j + close.len();
+                        replaced = true;
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if replaced {
+                continue;
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
 }
 
 fn fix_consecutive_semicolons(sql: &str, dialect: Dialect) -> String {
     let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return regex_replace_all(sql, r";\s*;+", ";");
+        return collapse_semicolon_runs_without_tokenizer(sql);
     };
 
     let mut out = String::with_capacity(sql.len());
@@ -601,12 +950,120 @@ fn fix_consecutive_semicolons(sql: &str, dialect: Dialect) -> String {
     out
 }
 
+fn fix_statement_terminators(sql: &str, dialect: Dialect, require_final_semicolon: bool) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut edits = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !matches!(token.token, Token::SemiColon) {
+            continue;
+        }
+        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
+            let gap_start = tokens[prev_idx].end;
+            let gap_end = token.start;
+            if gap_start < gap_end {
+                let gap = &sql[gap_start..gap_end];
+                if !gap.contains('\n') && gap.chars().all(char::is_whitespace) {
+                    edits.push(SpanEdit::replace(gap_start, gap_end, ""));
+                }
+            }
+        }
+    }
+
+    if require_final_semicolon {
+        if let Some(last_idx) = last_non_trivia_token(&tokens) {
+            if !matches!(tokens[last_idx].token, Token::SemiColon) {
+                let insert_at = tokens[last_idx].end;
+                edits.push(SpanEdit::replace(insert_at, insert_at, ";"));
+            }
+        }
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn collapse_semicolon_runs_without_tokenizer(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b';' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        let mut semicolon_count = 1usize;
+        let mut scan = j;
+        while scan < bytes.len() {
+            while scan < bytes.len() && is_ascii_whitespace_byte(bytes[scan]) {
+                scan += 1;
+            }
+            if scan < bytes.len() && bytes[scan] == b';' {
+                semicolon_count += 1;
+                scan += 1;
+                j = scan;
+            } else {
+                break;
+            }
+        }
+
+        if semicolon_count >= 2 {
+            out.push(';');
+            i = j;
+        } else {
+            out.push(';');
+            i += 1;
+        }
+    }
+
+    out
+}
+
 fn fix_not_equal_operator(sql: &str) -> String {
     replace_outside_single_quotes(sql, |segment| segment.replace("<>", "!="))
 }
 
 fn fix_trailing_select_comma(sql: &str) -> String {
-    regex_replace_all(sql, r"(?i),\s*(from\b)", " $1")
+    replace_comma_before_from_keyword(sql)
+}
+
+fn replace_comma_before_from_keyword(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b',' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        while j < bytes.len() && is_ascii_whitespace_byte(bytes[j]) {
+            j += 1;
+        }
+
+        if let Some(from_end) = match_ascii_keyword_at(bytes, j, b"FROM") {
+            out.push(' ');
+            out.push_str(&sql[j..from_end]);
+            i = from_end;
+        } else {
+            out.push(',');
+            i += 1;
+        }
+    }
+
+    out
 }
 
 fn replace_outside_single_quotes<F>(sql: &str, mut transform: F) -> String
@@ -651,217 +1108,198 @@ where
     out
 }
 
-fn replace_outside_quoted_regions_and_comments<F>(sql: &str, mut transform: F) -> String
-where
-    F: FnMut(&str) -> String,
-{
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mode {
-        Outside,
-        SingleQuote,
-        DoubleQuote,
-        BacktickQuote,
-        BracketQuote,
-        LineComment,
-        BlockComment,
-    }
+fn fix_leading_blank_lines(sql: &str) -> String {
+    let first_non_ws = sql
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(sql.len());
+    let leading = &sql[..first_non_ws];
+    let Some(last_newline) = leading.rfind('\n') else {
+        return sql.to_string();
+    };
+    sql[last_newline + 1..].to_string()
+}
 
+fn fix_excessive_blank_lines(sql: &str) -> String {
+    let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
-    let mut outside = String::new();
-    let chars: Vec<char> = sql.chars().collect();
-    let mut mode = Mode::Outside;
-    let mut i = 0;
+    let mut i = 0usize;
 
-    while i < chars.len() {
-        let ch = chars[i];
-        let next = chars.get(i + 1).copied();
+    while i < bytes.len() {
+        if bytes[i] != b'\n' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
 
-        match mode {
-            Mode::Outside => {
-                if ch == '\'' {
-                    if !outside.is_empty() {
-                        out.push_str(&transform(&outside));
-                        outside.clear();
-                    }
-                    out.push(ch);
-                    mode = Mode::SingleQuote;
-                    i += 1;
-                    continue;
-                }
-                if ch == '"' {
-                    if !outside.is_empty() {
-                        out.push_str(&transform(&outside));
-                        outside.clear();
-                    }
-                    out.push(ch);
-                    mode = Mode::DoubleQuote;
-                    i += 1;
-                    continue;
-                }
-                if ch == '`' {
-                    if !outside.is_empty() {
-                        out.push_str(&transform(&outside));
-                        outside.clear();
-                    }
-                    out.push(ch);
-                    mode = Mode::BacktickQuote;
-                    i += 1;
-                    continue;
-                }
-                if ch == '[' {
-                    if !outside.is_empty() {
-                        out.push_str(&transform(&outside));
-                        outside.clear();
-                    }
-                    out.push(ch);
-                    mode = Mode::BracketQuote;
-                    i += 1;
-                    continue;
-                }
-                if ch == '-' && next == Some('-') {
-                    if !outside.is_empty() {
-                        out.push_str(&transform(&outside));
-                        outside.clear();
-                    }
-                    out.push('-');
-                    out.push('-');
-                    mode = Mode::LineComment;
-                    i += 2;
-                    continue;
-                }
-                if ch == '/' && next == Some('*') {
-                    if !outside.is_empty() {
-                        out.push_str(&transform(&outside));
-                        outside.clear();
-                    }
-                    out.push('/');
-                    out.push('*');
-                    mode = Mode::BlockComment;
-                    i += 2;
-                    continue;
-                }
-
-                outside.push(ch);
-                i += 1;
+        let mut j = i + 1;
+        let mut newline_count = 1usize;
+        while j < bytes.len() {
+            let mut k = j;
+            while k < bytes.len() && is_ascii_whitespace_byte(bytes[k]) && bytes[k] != b'\n' {
+                k += 1;
             }
-            Mode::SingleQuote => {
-                out.push(ch);
-                if ch == '\'' {
-                    if next == Some('\'') {
-                        out.push('\'');
-                        i += 2;
-                    } else {
-                        mode = Mode::Outside;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            Mode::DoubleQuote => {
-                out.push(ch);
-                if ch == '"' {
-                    if next == Some('"') {
-                        out.push('"');
-                        i += 2;
-                    } else {
-                        mode = Mode::Outside;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            Mode::BacktickQuote => {
-                out.push(ch);
-                if ch == '`' {
-                    if next == Some('`') {
-                        out.push('`');
-                        i += 2;
-                    } else {
-                        mode = Mode::Outside;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            Mode::BracketQuote => {
-                out.push(ch);
-                if ch == ']' {
-                    if next == Some(']') {
-                        out.push(']');
-                        i += 2;
-                    } else {
-                        mode = Mode::Outside;
-                        i += 1;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            Mode::LineComment => {
-                out.push(ch);
-                i += 1;
-                if ch == '\n' {
-                    mode = Mode::Outside;
-                }
-            }
-            Mode::BlockComment => {
-                out.push(ch);
-                if ch == '*' && next == Some('/') {
-                    out.push('/');
-                    mode = Mode::Outside;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+            if k < bytes.len() && bytes[k] == b'\n' {
+                newline_count += 1;
+                j = k + 1;
+            } else {
+                break;
             }
         }
-    }
 
-    if !outside.is_empty() {
-        out.push_str(&transform(&outside));
+        if newline_count >= 3 {
+            out.push_str("\n\n");
+            i = j;
+        } else {
+            out.push('\n');
+            i += 1;
+        }
     }
 
     out
 }
 
-fn fix_leading_blank_lines(sql: &str) -> String {
-    regex_replace_all(sql, r"^\s*\n+", "")
-}
+fn fix_operator_spacing(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
 
-fn fix_excessive_blank_lines(sql: &str) -> String {
-    regex_replace_all(sql, r"\n\s*\n\s*\n+", "\n\n")
-}
-
-fn fix_operator_spacing(sql: &str) -> String {
-    replace_outside_single_quotes(sql, |segment| {
-        let out = regex_replace_all(segment, r"(?i)([A-Za-z0-9_])=([A-Za-z0-9_'])", "$1 = $2");
-        let out = regex_replace_all(&out, r"(?i)([A-Za-z0-9_])!=([A-Za-z0-9_'])", "$1 != $2");
-        let out = regex_replace_all(&out, r"(?i)([A-Za-z0-9_])<([A-Za-z0-9_'])", "$1 < $2");
-        let out = regex_replace_all(&out, r"(?i)([A-Za-z0-9_])>([A-Za-z0-9_'])", "$1 > $2");
-        let out = regex_replace_all(&out, r"(?i)([A-Za-z0-9_])\+([A-Za-z0-9_'])", "$1 + $2");
-        regex_replace_all(&out, r"(?i)([A-Za-z0-9_])-([A-Za-z0-9_'])", "$1 - $2")
-    })
-}
-
-fn fix_comma_spacing(sql: &str) -> String {
-    replace_outside_single_quotes(sql, |segment| {
-        let out = regex_replace_all(segment, r"\s+,", ",");
-        regex_replace_all(&out, r",\s*", ", ")
-    })
-}
-
-fn fix_function_spacing(sql: &str) -> String {
-    regex_replace_all_with(sql, r"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\s+\(", |caps| {
-        let token = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        if is_sql_keyword(token) {
-            caps[0].to_string()
-        } else {
-            format!("{token}(")
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_spacing_operator_token(&token.token) {
+            continue;
         }
-    })
+        let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) else {
+            continue;
+        };
+        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
+            continue;
+        };
+
+        let before_start = tokens[prev_idx].end;
+        let before_end = token.start;
+        if before_start <= before_end {
+            let gap = &sql[before_start..before_end];
+            if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
+                edits.push(SpanEdit::replace(before_start, before_end, " "));
+            }
+        }
+
+        let after_start = token.end;
+        let after_end = tokens[next_idx].start;
+        if after_start <= after_end {
+            let gap = &sql[after_start..after_end];
+            if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
+                edits.push(SpanEdit::replace(after_start, after_end, " "));
+            }
+        }
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_operator_line_position(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_spacing_operator_token(&token.token) {
+            continue;
+        }
+        let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) else {
+            continue;
+        };
+        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
+            continue;
+        };
+
+        let before_start = tokens[prev_idx].end;
+        let before_end = token.start;
+        let after_start = token.end;
+        let after_end = tokens[next_idx].start;
+        if before_start >= before_end || after_start >= after_end {
+            continue;
+        }
+
+        let before_gap = &sql[before_start..before_end];
+        let after_gap = &sql[after_start..after_end];
+        if !before_gap.contains('\n') && after_gap.contains('\n') {
+            edits.push(SpanEdit::replace(before_start, before_end, "\n"));
+            edits.push(SpanEdit::replace(after_start, after_end, " "));
+        }
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_comma_spacing(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !matches!(token.token, Token::Comma) {
+            continue;
+        }
+
+        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
+            let gap_start = tokens[prev_idx].end;
+            let gap_end = token.start;
+            if gap_start < gap_end {
+                let gap = &sql[gap_start..gap_end];
+                if !gap.contains('\n') && !gap.contains('\r') && !gap.is_empty() {
+                    edits.push(SpanEdit::replace(gap_start, gap_end, ""));
+                }
+            }
+        }
+
+        if let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) {
+            let gap_start = token.end;
+            let gap_end = tokens[next_idx].start;
+            if gap_start <= gap_end {
+                let gap = &sql[gap_start..gap_end];
+                if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
+                    edits.push(SpanEdit::replace(gap_start, gap_end, " "));
+                }
+            }
+        }
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_function_spacing(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
+            continue;
+        };
+        if !matches!(tokens[next_idx].token, Token::LParen) {
+            continue;
+        }
+        if is_sql_keyword(&word.value) {
+            continue;
+        }
+
+        let gap_start = token.end;
+        let gap_end = tokens[next_idx].start;
+        if gap_start < gap_end {
+            edits.push(SpanEdit::replace(gap_start, gap_end, ""));
+        }
+    }
+
+    apply_span_edits(sql, edits)
 }
 
 /// Maximum line length before `fix_long_lines` will attempt to split.
@@ -903,143 +1341,665 @@ fn fix_long_lines(sql: &str) -> String {
     out
 }
 
-fn fix_set_operator_layout(sql: &str) -> String {
-    regex_replace_all(
-        sql,
-        r"(?i)\s+(UNION(?:\s+ALL)?|INTERSECT|EXCEPT)\s+",
-        "\n$1\n",
-    )
-}
-
-fn fix_cte_bracket(sql: &str) -> String {
-    regex_replace_all(
-        sql,
-        r"(?i)\bwith\s+([A-Za-z_][A-Za-z0-9_]*)\s+as\s+select\b",
-        "WITH $1 AS (SELECT",
-    )
-}
-
-fn fix_cte_newline(sql: &str) -> String {
-    regex_replace_all(sql, r"(?i)\)\s+(SELECT\s+\*)", ")\n$1")
-}
-
-fn fix_select_target_newline(sql: &str) -> String {
-    let re = Regex::new(r"(?is)\bselect\b(.*?)\bfrom\b").expect("valid fix regex");
-    if let Some(caps) = re.captures(sql) {
-        let clause = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let comma_count = clause.matches(',').count();
-        if comma_count >= 4 {
-            return regex_replace_all(sql, r"(?i)\s+from\b", "\nFROM");
-        }
-    }
-    sql.to_string()
-}
-
-fn fix_keyword_newlines(sql: &str) -> String {
-    replace_outside_quoted_regions_and_comments(sql, |segment| {
-        let out = regex_replace_all(segment, r"(?i)\s+(FROM)\b", "\n$1");
-        let out = regex_replace_all(&out, r"(?i)\s+(WHERE)\b", "\n$1");
-        let out = regex_replace_all(&out, r"(?i)\s+(GROUP BY)\b", "\n$1");
-        regex_replace_all(&out, r"(?i)\s+(ORDER BY)\b", "\n$1")
-    })
-}
-
-fn fix_self_aliases(sql: &str) -> String {
-    regex_replace_all_with(
-        sql,
-        r"(?i)\b([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)\b",
-        |caps| {
-            if caps[1].eq_ignore_ascii_case(&caps[2]) {
-                caps[1].to_string()
-            } else {
-                caps[0].to_string()
-            }
-        },
-    )
-}
-
-fn fix_missing_table_aliases(sql: &str) -> String {
-    let mut alias_idx = 1usize;
-    let out = regex_replace_all_with(
-        sql,
-        r"(?i)\bfrom\s+([A-Za-z_][A-Za-z0-9_\.]*)(\s+(?:join|where|group\s+by|order\s+by|having|limit|offset|$))",
-        |caps| {
-            let alias = format!("t{}", alias_idx);
-            alias_idx += 1;
-            format!("FROM {} AS {}{}", &caps[1], alias, &caps[2])
-        },
-    );
-    regex_replace_all_with(
-        &out,
-        r"(?i)\bjoin\s+([A-Za-z_][A-Za-z0-9_\.]*)(\s+(?:on|using|join|where|group\s+by|order\s+by|having|limit|offset|$))",
-        |caps| {
-            let alias = format!("t{}", alias_idx);
-            alias_idx += 1;
-            format!("JOIN {} AS {}{}", &caps[1], alias, &caps[2])
-        },
-    )
-}
-
-fn fix_single_table_aliases(sql: &str) -> String {
-    let table_refs = Regex::new(r"(?i)\b(?:from|join)\s+[A-Za-z_][A-Za-z0-9_\.]*\b")
-        .expect("valid fix regex")
-        .find_iter(sql)
-        .count();
-    if table_refs != 1 {
-        return sql.to_string();
-    }
-
-    let re = Regex::new(
-        r"(?i)\bfrom\s+([A-Za-z_][A-Za-z0-9_\.]*)\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*)\b",
-    )
-    .expect("valid fix regex");
-    let Some(caps) = re.captures(sql) else {
+fn fix_set_operator_layout(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
         return sql.to_string();
     };
-    let table = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-    let alias = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
-    if is_sql_keyword(alias) {
-        return sql.to_string();
+    let mut edits = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        if !token_matches_keyword(&tokens[idx].token, "UNION")
+            && !token_matches_keyword(&tokens[idx].token, "INTERSECT")
+            && !token_matches_keyword(&tokens[idx].token, "EXCEPT")
+        {
+            idx += 1;
+            continue;
+        }
+
+        let op_start = tokens[idx].start;
+        let mut op_end = tokens[idx].end;
+        if token_matches_keyword(&tokens[idx].token, "UNION") {
+            if let Some(all_idx) = next_non_trivia_token(&tokens, idx + 1) {
+                if token_matches_keyword(&tokens[all_idx].token, "ALL") {
+                    op_end = tokens[all_idx].end;
+                }
+            }
+        }
+
+        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
+            let gap_start = tokens[prev_idx].end;
+            if gap_start < op_start {
+                edits.push(SpanEdit::replace(gap_start, op_start, "\n"));
+            }
+        }
+        if let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) {
+            let gap_end = tokens[next_idx].start;
+            if op_end < gap_end {
+                edits.push(SpanEdit::replace(op_end, gap_end, "\n"));
+            }
+        }
+        idx += 1;
     }
-    let out = re.replace(sql, format!("FROM {table}")).into_owned();
-    regex_replace_all(
-        &out,
-        &format!(r"(?i)\b{}\.", regex::escape(alias)),
-        &format!("{table}."),
-    )
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_cte_bracket(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+
+    for idx in 0..tokens.len() {
+        if !token_matches_keyword(&tokens[idx].token, "AS") {
+            continue;
+        }
+        let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) else {
+            continue;
+        };
+        if token_simple_identifier(&tokens[prev_idx].token).is_none() {
+            continue;
+        }
+        let Some(before_prev_idx) = prev_non_trivia_token(&tokens, prev_idx) else {
+            continue;
+        };
+        if !token_matches_keyword(&tokens[before_prev_idx].token, "WITH")
+            && !matches!(tokens[before_prev_idx].token, Token::Comma)
+        {
+            continue;
+        }
+        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
+            continue;
+        };
+        if !token_matches_keyword(&tokens[next_idx].token, "SELECT") {
+            continue;
+        }
+        edits.push(SpanEdit::replace(
+            tokens[next_idx].start,
+            tokens[next_idx].start,
+            "(",
+        ));
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_cte_newline(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !matches!(token.token, Token::RParen) {
+            continue;
+        }
+        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
+            continue;
+        };
+        if !token_matches_keyword(&tokens[next_idx].token, "SELECT") {
+            continue;
+        }
+        let gap_start = token.end;
+        let gap_end = tokens[next_idx].start;
+        if gap_start < gap_end {
+            let gap = &sql[gap_start..gap_end];
+            if !gap.contains('\n') && !gap.contains('\r') {
+                edits.push(SpanEdit::replace(gap_start, gap_end, "\n"));
+            }
+        }
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_select_target_newline(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        if !token_matches_keyword(&tokens[i].token, "SELECT") {
+            i += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut comma_count = 0usize;
+        let mut from_idx = None;
+        let mut j = i + 1;
+        while j < tokens.len() {
+            if is_trivia_token(&tokens[j].token) {
+                j += 1;
+                continue;
+            }
+            match tokens[j].token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth = depth.saturating_sub(1),
+                Token::Comma if depth == 0 => comma_count += 1,
+                Token::SemiColon if depth == 0 => break,
+                _ => {}
+            }
+            if depth == 0 && token_matches_keyword(&tokens[j].token, "FROM") {
+                from_idx = Some(j);
+                break;
+            }
+            j += 1;
+        }
+
+        if comma_count >= 4 {
+            if let Some(from_idx) = from_idx {
+                if let Some(prev_idx) = prev_non_trivia_token(&tokens, from_idx) {
+                    let gap_start = tokens[prev_idx].end;
+                    let gap_end = tokens[from_idx].start;
+                    if gap_start < gap_end {
+                        edits.push(SpanEdit::replace(gap_start, gap_end, "\n"));
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_keyword_newlines(sql: &str, dialect: Dialect) -> String {
+    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
+        return sql.to_string();
+    };
+    let mut edits = Vec::new();
+
+    for idx in 0..tokens.len() {
+        let is_major_keyword = token_matches_keyword(&tokens[idx].token, "FROM")
+            || token_matches_keyword(&tokens[idx].token, "WHERE");
+        let is_major_phrase = (token_matches_keyword(&tokens[idx].token, "GROUP")
+            || token_matches_keyword(&tokens[idx].token, "ORDER"))
+            && next_non_trivia_token(&tokens, idx + 1)
+                .is_some_and(|next_idx| token_matches_keyword(&tokens[next_idx].token, "BY"));
+
+        if !(is_major_keyword || is_major_phrase) {
+            continue;
+        }
+
+        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
+            let gap_start = tokens[prev_idx].end;
+            let gap_end = tokens[idx].start;
+            if gap_start < gap_end {
+                edits.push(SpanEdit::replace(gap_start, gap_end, "\n"));
+            }
+        }
+    }
+
+    apply_span_edits(sql, edits)
+}
+
+fn fix_select_modifier_position(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let Some(select_end) = match_ascii_keyword_at(bytes, i, b"SELECT") else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+
+        let mut j = select_end;
+        let mut saw_newline = false;
+        while j < bytes.len() && is_ascii_whitespace_byte(bytes[j]) {
+            if bytes[j] == b'\n' {
+                saw_newline = true;
+            }
+            j += 1;
+        }
+
+        if saw_newline {
+            let modifier_end = match_ascii_keyword_at(bytes, j, b"DISTINCT")
+                .or_else(|| match_ascii_keyword_at(bytes, j, b"ALL"));
+            if let Some(modifier_end) = modifier_end {
+                out.push_str(&sql[i..select_end]);
+                out.push(' ');
+                out.push_str(&sql[j..modifier_end]);
+                i = modifier_end;
+                continue;
+            }
+        }
+
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+
+    out
 }
 
 fn fix_unused_table_aliases(sql: &str) -> String {
-    let alias_re = Regex::new(
-        r"(?i)\b(?:from|join)\s+[A-Za-z_][A-Za-z0-9_\.]*\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*)\b",
+    let Some(decls) = collect_simple_table_alias_declarations(sql, Dialect::Generic) else {
+        return sql.to_string();
+    };
+    if decls.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut seen_aliases = HashSet::new();
+    let mut removals = Vec::new();
+    for decl in &decls {
+        let alias_key = decl.alias.to_ascii_lowercase();
+        if !seen_aliases.insert(alias_key.clone()) {
+            continue;
+        }
+        if is_sql_keyword(&decl.alias) || is_generated_alias_identifier(&decl.alias) {
+            continue;
+        }
+        if contains_alias_qualifier(sql, &decl.alias) {
+            continue;
+        }
+
+        removals.extend(
+            decls
+                .iter()
+                .filter(|candidate| candidate.alias.eq_ignore_ascii_case(&alias_key))
+                .map(|candidate| (candidate.table_end, candidate.alias_end)),
+        );
+    }
+
+    apply_byte_removals(sql, removals)
+}
+
+fn is_ascii_whitespace_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c)
+}
+
+fn is_ascii_whitespace_non_newline_byte(byte: u8) -> bool {
+    is_ascii_whitespace_byte(byte) && byte != b'\n'
+}
+
+fn is_ascii_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ascii_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_simple_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !is_ascii_ident_start(bytes[0]) {
+        return false;
+    }
+    bytes[1..].iter().copied().all(is_ascii_ident_continue)
+}
+
+fn is_simple_qualified_identifier(value: &str) -> bool {
+    let mut parts = value.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(left), Some(right), None) => {
+            is_simple_identifier(left) && is_simple_identifier(right)
+        }
+        _ => false,
+    }
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() && is_ascii_whitespace_byte(bytes[idx]) {
+        idx += 1;
+    }
+    idx
+}
+
+fn consume_ascii_identifier(bytes: &[u8], start: usize) -> Option<usize> {
+    if start >= bytes.len() || !is_ascii_ident_start(bytes[start]) {
+        return None;
+    }
+    let mut idx = start + 1;
+    while idx < bytes.len() && is_ascii_ident_continue(bytes[idx]) {
+        idx += 1;
+    }
+    Some(idx)
+}
+
+fn is_word_boundary_for_keyword(bytes: &[u8], idx: usize) -> bool {
+    idx == 0 || idx >= bytes.len() || !is_ascii_ident_continue(bytes[idx])
+}
+
+fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> Option<usize> {
+    let end = start.checked_add(keyword_upper.len())?;
+    if end > bytes.len() {
+        return None;
+    }
+    if !is_word_boundary_for_keyword(bytes, start.saturating_sub(1))
+        || !is_word_boundary_for_keyword(bytes, end)
+    {
+        return None;
+    }
+    let matches = bytes[start..end]
+        .iter()
+        .zip(keyword_upper.iter())
+        .all(|(actual, expected)| actual.to_ascii_uppercase() == *expected);
+    if matches {
+        Some(end)
+    } else {
+        None
+    }
+}
+
+fn find_ascii_keyword(bytes: &[u8], keyword_upper: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + keyword_upper.len() <= bytes.len() {
+        if match_ascii_keyword_at(bytes, i, keyword_upper).is_some() {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+struct SimpleTableAliasDecl {
+    keyword_start: usize,
+    keyword_end: usize,
+    table_start: usize,
+    table_end: usize,
+    alias_end: usize,
+    alias: String,
+    explicit_as: bool,
+}
+
+fn collect_simple_table_alias_declarations(
+    sql: &str,
+    dialect: Dialect,
+) -> Option<Vec<SimpleTableAliasDecl>> {
+    let tokens = tokenize_with_offsets(sql, dialect)?;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        if !token_matches_keyword(&tokens[i].token, "FROM")
+            && !token_matches_keyword(&tokens[i].token, "JOIN")
+        {
+            i += 1;
+            continue;
+        }
+
+        let keyword_start = tokens[i].start;
+        let keyword_end = tokens[i].end;
+
+        let Some(mut cursor) = next_non_trivia_token(&tokens, i + 1) else {
+            i += 1;
+            continue;
+        };
+        let Some(_) = token_simple_identifier(&tokens[cursor].token) else {
+            i += 1;
+            continue;
+        };
+        let table_start = tokens[cursor].start;
+        let mut table_end = tokens[cursor].end;
+        cursor += 1;
+
+        loop {
+            let Some(dot_idx) = next_non_trivia_token(&tokens, cursor) else {
+                break;
+            };
+            if !matches!(tokens[dot_idx].token, Token::Period) {
+                break;
+            }
+            let Some(next_idx) = next_non_trivia_token(&tokens, dot_idx + 1) else {
+                break;
+            };
+            if token_simple_identifier(&tokens[next_idx].token).is_none() {
+                break;
+            }
+            table_end = tokens[next_idx].end;
+            cursor = next_idx + 1;
+        }
+
+        let Some(mut alias_idx) = next_non_trivia_token(&tokens, cursor) else {
+            i += 1;
+            continue;
+        };
+        let mut explicit_as = false;
+        if token_matches_keyword(&tokens[alias_idx].token, "AS") {
+            explicit_as = true;
+            let Some(next_idx) = next_non_trivia_token(&tokens, alias_idx + 1) else {
+                i += 1;
+                continue;
+            };
+            alias_idx = next_idx;
+        }
+
+        let Some(alias_value) = token_simple_identifier(&tokens[alias_idx].token) else {
+            i += 1;
+            continue;
+        };
+
+        out.push(SimpleTableAliasDecl {
+            keyword_start,
+            keyword_end,
+            table_start,
+            table_end,
+            alias_end: tokens[alias_idx].end,
+            alias: alias_value.to_string(),
+            explicit_as,
+        });
+        i = alias_idx + 1;
+    }
+
+    Some(out)
+}
+
+fn next_non_trivia_token(tokens: &[LocatedToken], mut start: usize) -> Option<usize> {
+    while start < tokens.len() {
+        if !is_trivia_token(&tokens[start].token) {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
+fn prev_non_trivia_token(tokens: &[LocatedToken], start: usize) -> Option<usize> {
+    if start == 0 {
+        return None;
+    }
+    let mut idx = start - 1;
+    loop {
+        if !is_trivia_token(&tokens[idx].token) {
+            return Some(idx);
+        }
+        if idx == 0 {
+            return None;
+        }
+        idx -= 1;
+    }
+}
+
+fn last_non_trivia_token(tokens: &[LocatedToken]) -> Option<usize> {
+    (0..tokens.len())
+        .rev()
+        .find(|idx| !is_trivia_token(&tokens[*idx].token))
+}
+
+fn token_matches_keyword(token: &Token, keyword: &str) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(keyword))
+}
+
+fn token_simple_identifier(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(word) if is_simple_identifier(&word.value) => Some(&word.value),
+        _ => None,
+    }
+}
+
+fn contains_alias_qualifier(sql: &str, alias: &str) -> bool {
+    let alias_bytes = alias.as_bytes();
+    if alias_bytes.is_empty() {
+        return false;
+    }
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i + alias_bytes.len() < bytes.len() {
+        if !is_word_boundary_for_keyword(bytes, i.saturating_sub(1)) {
+            i += 1;
+            continue;
+        }
+
+        let end = i + alias_bytes.len();
+        if end < bytes.len()
+            && bytes[end] == b'.'
+            && bytes[i..end]
+                .iter()
+                .zip(alias_bytes.iter())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_generated_alias_identifier(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    match chars.next() {
+        Some('t') => {}
+        _ => return false,
+    }
+    let mut saw_digit = false;
+    for ch in chars {
+        if !ch.is_ascii_digit() {
+            return false;
+        }
+        saw_digit = true;
+    }
+    saw_digit
+}
+
+fn is_alias_keyword_token(alias: &str) -> bool {
+    matches!(
+        alias.to_ascii_uppercase().as_str(),
+        "SELECT" | "FROM" | "WHERE" | "GROUP" | "ORDER" | "JOIN" | "ON"
     )
-    .expect("valid fix regex");
-    let aliases: Vec<String> = alias_re
-        .captures_iter(sql)
-        .filter_map(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-        .collect();
+}
+
+fn apply_byte_replacements(sql: &str, mut replacements: Vec<(usize, usize, String)>) -> String {
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+    replacements.sort_by_key(|(start, _, _)| *start);
+    replacements.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
     let mut out = sql.to_string();
-    let generated_alias_re = Regex::new(r"^t\d+$").expect("valid fix regex");
-    for alias in aliases {
-        if is_sql_keyword(&alias) {
-            continue;
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        if start < end && end <= out.len() {
+            out.replace_range(start..end, &replacement);
         }
-        if generated_alias_re.is_match(&alias) {
-            continue;
-        }
-        let usage =
-            Regex::new(&format!(r"(?i)\b{}\.", regex::escape(&alias))).expect("valid fix regex");
-        if usage.is_match(&out) {
-            continue;
-        }
-        let alias_decl = Regex::new(&format!(
-            r"(?i)\b(from|join)\s+([A-Za-z_][A-Za-z0-9_\.]*)\s+(?:as\s+)?{}\b",
-            regex::escape(&alias)
-        ))
-        .expect("valid fix regex");
-        out = alias_decl.replace_all(&out, "$1 $2").into_owned();
     }
+    out
+}
+
+fn parse_subquery_alias_suffix(suffix: &str) -> Option<String> {
+    let bytes = suffix.as_bytes();
+    let mut i = skip_ascii_whitespace(bytes, 0);
+    if let Some(as_end) = match_ascii_keyword_at(bytes, i, b"AS") {
+        let after_as = skip_ascii_whitespace(bytes, as_end);
+        if after_as == as_end {
+            return None;
+        }
+        i = after_as;
+    }
+
+    let alias_start = i;
+    let alias_end = consume_ascii_identifier(bytes, alias_start)?;
+    i = skip_ascii_whitespace(bytes, alias_end);
+    if i < bytes.len() && bytes[i] == b';' {
+        i += 1;
+        i = skip_ascii_whitespace(bytes, i);
+    }
+    if i != bytes.len() {
+        return None;
+    }
+    Some(suffix[alias_start..alias_end].to_string())
+}
+
+fn extract_from_table_and_alias(sql: &str) -> Option<(String, String)> {
+    let bytes = sql.as_bytes();
+    let from_start = find_ascii_keyword(bytes, b"FROM", 0)?;
+    let mut i = skip_ascii_whitespace(bytes, from_start + b"FROM".len());
+    let table_start = i;
+    i = consume_ascii_identifier(bytes, i)?;
+    while i < bytes.len() && bytes[i] == b'.' {
+        let next = consume_ascii_identifier(bytes, i + 1)?;
+        i = next;
+    }
+    let table_name = sql[table_start..i].to_string();
+
+    let mut alias = String::new();
+    let after_table = skip_ascii_whitespace(bytes, i);
+    if after_table > i {
+        if let Some(as_end) = match_ascii_keyword_at(bytes, after_table, b"AS") {
+            let alias_start = skip_ascii_whitespace(bytes, as_end);
+            if alias_start > as_end {
+                if let Some(alias_end) = consume_ascii_identifier(bytes, alias_start) {
+                    alias = sql[alias_start..alias_end].to_string();
+                }
+            }
+        } else if let Some(alias_end) = consume_ascii_identifier(bytes, after_table) {
+            alias = sql[after_table..alias_end].to_string();
+        }
+    }
+
+    Some((table_name, alias))
+}
+
+fn rewrite_double_quoted_identifiers(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = String::with_capacity(segment.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        let mut escaped = false;
+        while j < bytes.len() {
+            if bytes[j] == b'"' {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
+                    escaped = true;
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            out.push('"');
+            i += 1;
+            continue;
+        }
+
+        if !escaped {
+            let ident = &segment[i + 1..j];
+            if is_simple_identifier(ident) && can_unquote_identifier_safely(ident) {
+                out.push_str(ident);
+                i = j + 1;
+                continue;
+            }
+        }
+
+        out.push_str(&segment[i..j + 1]);
+        i = j + 1;
+    }
+
     out
 }
 
@@ -1128,26 +2088,54 @@ fn is_sql_keyword(token: &str) -> bool {
 }
 
 fn fix_table_alias_keywords(sql: &str) -> String {
-    regex_replace_all_with(
-        sql,
-        r"(?i)\b(from|join)\s+([A-Za-z_][A-Za-z0-9_\.]*)\s+as\s+(select|from|where|group|order|join|on)\b",
-        |caps| {
+    let Some(decls) = collect_simple_table_alias_declarations(sql, Dialect::Generic) else {
+        return sql.to_string();
+    };
+
+    let mut replacements = Vec::new();
+    for decl in decls {
+        if !decl.explicit_as || !is_alias_keyword_token(&decl.alias) {
+            continue;
+        }
+        let clause = &sql[decl.keyword_start..decl.keyword_end];
+        let table = &sql[decl.table_start..decl.table_end];
+        replacements.push((
+            decl.keyword_start,
+            decl.alias_end,
             format!(
-                "{} {} AS alias_{}",
-                &caps[1],
-                &caps[2],
-                &caps[3].to_ascii_lowercase()
-            )
-        },
-    )
+                "{clause} {table} AS alias_{}",
+                decl.alias.to_ascii_lowercase()
+            ),
+        ));
+    }
+
+    apply_byte_replacements(sql, replacements)
 }
 
 fn fix_subquery_to_cte(sql: &str) -> String {
-    let prefix = Regex::new(r"(?is)^\s*select\s+\*\s+from\s+\(").expect("valid fix regex");
-    let Some(prefix_match) = prefix.find(sql) else {
+    let bytes = sql.as_bytes();
+    let mut i = skip_ascii_whitespace(bytes, 0);
+    let Some(select_end) = match_ascii_keyword_at(bytes, i, b"SELECT") else {
         return sql.to_string();
     };
-    let open_paren_idx = prefix_match.end() - 1;
+    i = skip_ascii_whitespace(bytes, select_end);
+    if i == select_end || i >= bytes.len() || bytes[i] != b'*' {
+        return sql.to_string();
+    }
+    i += 1;
+    let from_start = skip_ascii_whitespace(bytes, i);
+    if from_start == i {
+        return sql.to_string();
+    }
+    let Some(from_end) = match_ascii_keyword_at(bytes, from_start, b"FROM") else {
+        return sql.to_string();
+    };
+    let open_paren_idx = skip_ascii_whitespace(bytes, from_end);
+    if open_paren_idx == from_end || open_paren_idx >= bytes.len() || bytes[open_paren_idx] != b'('
+    {
+        return sql.to_string();
+    };
+
     let Some(close_paren_idx) = find_matching_parenthesis_outside_quotes(sql, open_paren_idx)
     else {
         return sql.to_string();
@@ -1159,19 +2147,9 @@ fn fix_subquery_to_cte(sql: &str) -> String {
     }
 
     let suffix = &sql[close_paren_idx + 1..];
-    let alias_re = Regex::new(r"(?is)^\s*(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*;?\s*$")
-        .expect("valid fix regex");
-    let Some(alias_caps) = alias_re.captures(suffix) else {
+    let Some(alias) = parse_subquery_alias_suffix(suffix) else {
         return sql.to_string();
     };
-    let alias = alias_caps
-        .get(1)
-        .map(|m| m.as_str())
-        .unwrap_or_default()
-        .trim();
-    if alias.is_empty() {
-        return sql.to_string();
-    }
 
     let mut rewritten = format!("WITH {alias} AS ({subquery}) SELECT * FROM {alias}");
     if suffix.trim_end().ends_with(';') {
@@ -1293,43 +2271,36 @@ fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_idx: usize) ->
 }
 
 fn fix_mixed_reference_qualification(sql: &str) -> String {
-    let from_re = Regex::new(
-        r"(?i)\bfrom\s+([A-Za-z_][A-Za-z0-9_\.]*)(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
-    )
-    .expect("valid fix regex");
-    let Some(from_caps) = from_re.captures(sql) else {
+    let Some((table_name, alias)) = extract_from_table_and_alias(sql) else {
         return sql.to_string();
     };
-    let table_name = from_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-    let alias = from_caps.get(2).map(|m| m.as_str()).unwrap_or_default();
     let prefix = if alias.is_empty() {
-        table_name.rsplit('.').next().unwrap_or(table_name)
+        table_name.rsplit('.').next().unwrap_or(&table_name)
     } else {
-        alias
+        alias.as_str()
     };
     if prefix.is_empty() {
         return sql.to_string();
     }
 
-    let select_re = Regex::new(r"(?is)\bselect\s+(.*?)\bfrom\b").expect("valid fix regex");
-    let Some(select_caps) = select_re.captures(sql) else {
+    let bytes = sql.as_bytes();
+    let Some(select_start) = find_ascii_keyword(bytes, b"SELECT", 0) else {
         return sql.to_string();
     };
-    let select_clause = select_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
+    let select_end = select_start + b"SELECT".len();
+    let Some(from_start) = find_ascii_keyword(bytes, b"FROM", select_end) else {
+        return sql.to_string();
+    };
+
+    let select_clause = &sql[select_end..from_start];
     let items: Vec<String> = select_clause
         .split(',')
         .map(|item| item.trim().to_string())
         .collect();
-    let has_qualified = items.iter().any(|item| {
-        Regex::new(r"(?i)^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
-            .expect("valid fix regex")
-            .is_match(item)
-    });
-    let has_unqualified = items.iter().any(|item| {
-        Regex::new(r"(?i)^[A-Za-z_][A-Za-z0-9_]*$")
-            .expect("valid fix regex")
-            .is_match(item)
-    });
+    let has_qualified = items
+        .iter()
+        .any(|item| is_simple_qualified_identifier(item));
+    let has_unqualified = items.iter().any(|item| is_simple_identifier(item));
     if !(has_qualified && has_unqualified) {
         return sql.to_string();
     }
@@ -1337,10 +2308,7 @@ fn fix_mixed_reference_qualification(sql: &str) -> String {
     let rewritten_items: Vec<String> = items
         .into_iter()
         .map(|item| {
-            if Regex::new(r"(?i)^[A-Za-z_][A-Za-z0-9_]*$")
-                .expect("valid fix regex")
-                .is_match(&item)
-            {
+            if is_simple_identifier(&item) {
                 format!("{prefix}.{item}")
             } else {
                 item
@@ -1348,22 +2316,30 @@ fn fix_mixed_reference_qualification(sql: &str) -> String {
         })
         .collect();
     let rewritten_clause = rewritten_items.join(", ");
-    select_re
-        .replace(sql, format!("SELECT {rewritten_clause} FROM"))
-        .into_owned()
+    format!(
+        "{}SELECT {rewritten_clause} FROM{}",
+        &sql[..select_start],
+        &sql[from_start + b"FROM".len()..]
+    )
+}
+
+fn fix_quoted_literal_style(sql: &str, preferred_style: Cv010QuotedLiteralStyle) -> String {
+    match preferred_style {
+        Cv010QuotedLiteralStyle::DoubleQuotes => {
+            // In most supported dialects, rewriting `'value'` -> `"value"` changes
+            // semantics (string literal vs quoted identifier), so keep this no-op.
+            sql.to_string()
+        }
+        Cv010QuotedLiteralStyle::Consistent | Cv010QuotedLiteralStyle::SingleQuotes => {
+            // Safely reduce mixed quote-style findings by removing identifier quotes
+            // only when unquoting preserves meaning.
+            fix_references_quoting(sql)
+        }
+    }
 }
 
 fn fix_references_quoting(sql: &str) -> String {
-    replace_outside_single_quotes(sql, |segment| {
-        regex_replace_all_with(segment, r#""([A-Za-z_][A-Za-z0-9_]*)""#, |caps| {
-            let ident = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-            if can_unquote_identifier_safely(ident) {
-                ident.to_string()
-            } else {
-                caps[0].to_string()
-            }
-        })
-    })
+    replace_outside_single_quotes(sql, rewrite_double_quoted_identifiers)
 }
 
 fn can_unquote_identifier_safely(identifier: &str) -> bool {
@@ -1454,15 +2430,102 @@ fn fix_case_style_consistency(sql: &str) -> String {
 }
 
 fn fix_tsql_procedure_begin_end(sql: &str) -> String {
-    regex_replace_all_with(
-        sql,
-        r"(?i)create\s+(?:proc|procedure)\s+([A-Za-z_][A-Za-z0-9_]*)(\s*')",
-        |caps| format!("CREATE PROCEDURE {} BEGIN END{}", &caps[1], &caps[2]),
-    )
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let Some(create_end) = match_ascii_keyword_at(bytes, i, b"CREATE") else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+        let proc_start = skip_ascii_whitespace(bytes, create_end);
+        if proc_start == create_end {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let Some(proc_end) = match_ascii_keyword_at(bytes, proc_start, b"PROC")
+            .or_else(|| match_ascii_keyword_at(bytes, proc_start, b"PROCEDURE"))
+        else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+
+        let ident_start = skip_ascii_whitespace(bytes, proc_end);
+        if ident_start == proc_end {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let Some(ident_end) = consume_ascii_identifier(bytes, ident_start) else {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        };
+
+        let mut quote_start = ident_end;
+        while quote_start < bytes.len() && is_ascii_whitespace_byte(bytes[quote_start]) {
+            quote_start += 1;
+        }
+        if quote_start >= bytes.len() || bytes[quote_start] != b'\'' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        out.push_str("CREATE PROCEDURE ");
+        out.push_str(&sql[ident_start..ident_end]);
+        out.push_str(" BEGIN END");
+        out.push_str(&sql[ident_end..quote_start + 1]);
+        i = quote_start + 1;
+    }
+
+    out
 }
 
 fn fix_tsql_empty_batches(sql: &str) -> String {
-    regex_replace_all(sql, r"(?im)(\n\s*GO\s*){2,}", "\nGO\n")
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'\n' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        let mut cursor = i;
+        let mut batch_count = 0usize;
+        while cursor < bytes.len() && bytes[cursor] == b'\n' {
+            let mut go_start = cursor + 1;
+            while go_start < bytes.len() && is_ascii_whitespace_non_newline_byte(bytes[go_start]) {
+                go_start += 1;
+            }
+            let Some(go_end) = match_ascii_keyword_at(bytes, go_start, b"GO") else {
+                break;
+            };
+            let mut after_go = go_end;
+            while after_go < bytes.len() && is_ascii_whitespace_non_newline_byte(bytes[after_go]) {
+                after_go += 1;
+            }
+            batch_count += 1;
+            cursor = after_go;
+        }
+
+        if batch_count >= 2 {
+            out.push_str("\nGO\n");
+            i = cursor;
+        } else {
+            out.push('\n');
+            i += 1;
+        }
+    }
+
+    out
 }
 
 fn fix_trailing_newline(sql: &str) -> String {
@@ -1553,6 +2616,110 @@ fn is_trivia_token(token: &Token) -> bool {
     )
 }
 
+fn is_spacing_operator_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Eq
+            | Token::Neq
+            | Token::Lt
+            | Token::Gt
+            | Token::LtEq
+            | Token::GtEq
+            | Token::Plus
+            | Token::Minus
+            | Token::DoubleEq
+    )
+}
+
+fn collect_table_alias_idents_in_statement<F: FnMut(&Ident)>(
+    statement: &Statement,
+    visitor: &mut F,
+) {
+    match statement {
+        Statement::Query(query) => collect_table_alias_idents_in_query(query, visitor),
+        Statement::Insert(insert) => {
+            if let Some(source) = &insert.source {
+                collect_table_alias_idents_in_query(source, visitor);
+            }
+        }
+        Statement::CreateView { query, .. } => collect_table_alias_idents_in_query(query, visitor),
+        Statement::CreateTable(create) => {
+            if let Some(query) = &create.query {
+                collect_table_alias_idents_in_query(query, visitor);
+            }
+        }
+        Statement::Merge { table, source, .. } => {
+            collect_table_alias_idents_in_table_factor(table, visitor);
+            collect_table_alias_idents_in_table_factor(source, visitor);
+        }
+        _ => {}
+    }
+}
+
+fn collect_table_alias_idents_in_query<F: FnMut(&Ident)>(query: &Query, visitor: &mut F) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_table_alias_idents_in_query(&cte.query, visitor);
+        }
+    }
+
+    collect_table_alias_idents_in_set_expr(&query.body, visitor);
+}
+
+fn collect_table_alias_idents_in_set_expr<F: FnMut(&Ident)>(set_expr: &SetExpr, visitor: &mut F) {
+    match set_expr {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                collect_table_alias_idents_in_table_with_joins(table, visitor);
+            }
+        }
+        SetExpr::Query(query) => collect_table_alias_idents_in_query(query, visitor),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_table_alias_idents_in_set_expr(left, visitor);
+            collect_table_alias_idents_in_set_expr(right, visitor);
+        }
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => collect_table_alias_idents_in_statement(statement, visitor),
+        _ => {}
+    }
+}
+
+fn collect_table_alias_idents_in_table_with_joins<F: FnMut(&Ident)>(
+    table_with_joins: &TableWithJoins,
+    visitor: &mut F,
+) {
+    collect_table_alias_idents_in_table_factor(&table_with_joins.relation, visitor);
+    for join in &table_with_joins.joins {
+        collect_table_alias_idents_in_table_factor(&join.relation, visitor);
+    }
+}
+
+fn collect_table_alias_idents_in_table_factor<F: FnMut(&Ident)>(
+    table_factor: &TableFactor,
+    visitor: &mut F,
+) {
+    if let Some(alias) = table_factor_alias_ident(table_factor) {
+        visitor(alias);
+    }
+
+    match table_factor {
+        TableFactor::Derived { subquery, .. } => {
+            collect_table_alias_idents_in_query(subquery, visitor);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_table_alias_idents_in_table_with_joins(table_with_joins, visitor);
+        }
+        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
+            collect_table_alias_idents_in_table_factor(table, visitor);
+        }
+        _ => {}
+    }
+}
+
 fn fix_statement(stmt: &mut Statement, rule_filter: &RuleFilter) {
     match stmt {
         Statement::Query(query) => {
@@ -1606,7 +2773,32 @@ fn fix_query(query: &mut Query, rule_filter: &RuleFilter) {
         }
     }
 
+    let al07_rewrite =
+        if rule_filter.allows(issue_codes::LINT_AL_007) && rule_filter.al007_force_enable {
+            match query.body.as_ref() {
+                SetExpr::Select(select) => single_table_alias_rewrite_plan(select),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
     fix_set_expr(query.body.as_mut(), rule_filter);
+    rewrite_simple_derived_subqueries_to_ctes(query, rule_filter);
+
+    if let Some(rewrite) = al07_rewrite.as_ref() {
+        if let Some(order_by) = query.order_by.as_mut() {
+            rewrite_alias_references_in_order_by(order_by, rewrite);
+        }
+        if let Some(limit_clause) = query.limit_clause.as_mut() {
+            rewrite_alias_references_in_limit_clause(limit_clause, rewrite);
+        }
+        if let Some(fetch) = query.fetch.as_mut() {
+            if let Some(quantity) = fetch.quantity.as_mut() {
+                rewrite_expr_alias_qualifier(quantity, rewrite);
+            }
+        }
+    }
 
     if let Some(order_by) = query.order_by.as_mut() {
         fix_order_by(order_by, rule_filter);
@@ -1671,9 +2863,24 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
         rewrite_distinct_parenthesized_projection(select);
     }
 
+    if rule_filter.allows(issue_codes::LINT_AL_007) && rule_filter.al007_force_enable {
+        let _ = apply_single_table_alias_rewrite(select);
+    }
+
     for item in &mut select.projection {
         match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            SelectItem::UnnamedExpr(expr) => {
+                fix_expr(expr, rule_filter);
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                fix_expr(expr, rule_filter);
+                let remove_self_alias = rule_filter.allows(issue_codes::LINT_AL_009)
+                    && expression_aliases_to_itself(expr, alias, rule_filter.al009_case_check);
+                if remove_self_alias {
+                    *item = SelectItem::UnnamedExpr(expr.clone());
+                }
+            }
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(expr), _) => {
                 fix_expr(expr, rule_filter);
             }
             _ => {}
@@ -1780,6 +2987,523 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
     }
 }
 
+#[derive(Clone, Debug)]
+struct TableAliasRewrite {
+    alias: String,
+    replacement_prefix: Vec<Ident>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NameRef<'a> {
+    name: &'a str,
+    quoted: bool,
+}
+
+fn single_table_alias_rewrite_plan(select: &Select) -> Option<TableAliasRewrite> {
+    if select.from.len() != 1 || select_contains_subquery_expr(select) {
+        return None;
+    }
+
+    let table_with_joins = select.from.first()?;
+    if !table_with_joins.joins.is_empty() {
+        return None;
+    }
+
+    let TableFactor::Table { name, alias, .. } = &table_with_joins.relation else {
+        return None;
+    };
+    let alias = alias.as_ref()?;
+    if !alias.columns.is_empty() {
+        return None;
+    }
+
+    let alias_ident = &alias.name;
+    if !is_simple_unquoted_identifier(alias_ident) || is_sql_keyword(&alias_ident.value) {
+        return None;
+    }
+
+    let mut replacement_prefix = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        let ident = part.as_ident()?;
+        if !is_simple_unquoted_identifier(ident) {
+            return None;
+        }
+        replacement_prefix.push(ident.clone());
+    }
+    if replacement_prefix.is_empty() {
+        return None;
+    }
+
+    Some(TableAliasRewrite {
+        alias: alias_ident.value.clone(),
+        replacement_prefix,
+    })
+}
+
+fn apply_single_table_alias_rewrite(select: &mut Select) -> Option<TableAliasRewrite> {
+    let rewrite = single_table_alias_rewrite_plan(select)?;
+
+    let table_with_joins = select.from.first_mut()?;
+    let TableFactor::Table { alias, .. } = &mut table_with_joins.relation else {
+        return None;
+    };
+    *alias = None;
+
+    rewrite_alias_references_in_select(select, &rewrite);
+    Some(rewrite)
+}
+
+fn is_simple_unquoted_identifier(ident: &Ident) -> bool {
+    ident.quote_style.is_none()
+        && ident.value.chars().enumerate().all(|(idx, ch)| {
+            if idx == 0 {
+                ch.is_ascii_alphabetic() || ch == '_'
+            } else {
+                ch.is_ascii_alphanumeric() || ch == '_'
+            }
+        })
+}
+
+fn select_contains_subquery_expr(select: &Select) -> bool {
+    let projection_has_subquery = select.projection.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            expr_contains_subquery(expr)
+        }
+        SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(expr), _) => {
+            expr_contains_subquery(expr)
+        }
+        _ => false,
+    });
+    if projection_has_subquery {
+        return true;
+    }
+
+    for expr in [
+        select.prewhere.as_ref(),
+        select.selection.as_ref(),
+        select.having.as_ref(),
+        select.qualify.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if expr_contains_subquery(expr) {
+            return true;
+        }
+    }
+
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        if exprs.iter().any(expr_contains_subquery) {
+            return true;
+        }
+    }
+
+    if select.cluster_by.iter().any(expr_contains_subquery)
+        || select.distribute_by.iter().any(expr_contains_subquery)
+        || select
+            .sort_by
+            .iter()
+            .any(|expr| expr_contains_subquery(&expr.expr))
+        || select
+            .lateral_views
+            .iter()
+            .any(|lateral_view| expr_contains_subquery(&lateral_view.lateral_view))
+    {
+        return true;
+    }
+
+    if let Some(connect_by) = &select.connect_by {
+        if expr_contains_subquery(&connect_by.condition)
+            || connect_by.relationships.iter().any(expr_contains_subquery)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) | Expr::Exists { .. } => true,
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
+            let _ = subquery;
+            expr_contains_subquery(inner)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner)
+        | Expr::Cast { expr: inner, .. } => expr_contains_subquery(inner),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_subquery)
+                || conditions.iter().any(|case_when| {
+                    expr_contains_subquery(&case_when.condition)
+                        || expr_contains_subquery(&case_when.result)
+                })
+                || else_result.as_deref().is_some_and(expr_contains_subquery)
+        }
+        Expr::InList {
+            expr: target, list, ..
+        } => expr_contains_subquery(target) || list.iter().any(expr_contains_subquery),
+        Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            expr_contains_subquery(target)
+                || expr_contains_subquery(low)
+                || expr_contains_subquery(high)
+        }
+        Expr::Tuple(items) => items.iter().any(expr_contains_subquery),
+        Expr::Function(func) => function_contains_subquery(func),
+        _ => false,
+    }
+}
+
+fn function_contains_subquery(func: &Function) -> bool {
+    let FunctionArguments::List(arg_list) = &func.args else {
+        return false;
+    };
+
+    arg_list.args.iter().any(|arg| match arg {
+        FunctionArg::Named { arg, .. }
+        | FunctionArg::ExprNamed { arg, .. }
+        | FunctionArg::Unnamed(arg) => match arg {
+            FunctionArgExpr::Expr(expr) => expr_contains_subquery(expr),
+            _ => false,
+        },
+    }) || arg_list.clauses.iter().any(|clause| match clause {
+        FunctionArgumentClause::OrderBy(order_by_exprs) => order_by_exprs
+            .iter()
+            .any(|order_expr| expr_contains_subquery(&order_expr.expr)),
+        FunctionArgumentClause::Limit(expr) => expr_contains_subquery(expr),
+        _ => false,
+    })
+}
+
+fn rewrite_alias_references_in_select(select: &mut Select, rewrite: &TableAliasRewrite) {
+    for item in &mut select.projection {
+        match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                rewrite_expr_alias_qualifier(expr, rewrite);
+            }
+            SelectItem::QualifiedWildcard(kind, _) => match kind {
+                SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                    rewrite_object_name_alias_qualifier(name, rewrite);
+                }
+                SelectItemQualifiedWildcardKind::Expr(expr) => {
+                    rewrite_expr_alias_qualifier(expr, rewrite);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    if let Some(prewhere) = select.prewhere.as_mut() {
+        rewrite_expr_alias_qualifier(prewhere, rewrite);
+    }
+    if let Some(selection) = select.selection.as_mut() {
+        rewrite_expr_alias_qualifier(selection, rewrite);
+    }
+    if let Some(having) = select.having.as_mut() {
+        rewrite_expr_alias_qualifier(having, rewrite);
+    }
+    if let Some(qualify) = select.qualify.as_mut() {
+        rewrite_expr_alias_qualifier(qualify, rewrite);
+    }
+
+    if let GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
+        for expr in exprs {
+            rewrite_expr_alias_qualifier(expr, rewrite);
+        }
+    }
+
+    for expr in &mut select.cluster_by {
+        rewrite_expr_alias_qualifier(expr, rewrite);
+    }
+    for expr in &mut select.distribute_by {
+        rewrite_expr_alias_qualifier(expr, rewrite);
+    }
+    for expr in &mut select.sort_by {
+        rewrite_expr_alias_qualifier(&mut expr.expr, rewrite);
+    }
+    for lateral_view in &mut select.lateral_views {
+        rewrite_expr_alias_qualifier(&mut lateral_view.lateral_view, rewrite);
+    }
+    if let Some(connect_by) = select.connect_by.as_mut() {
+        rewrite_expr_alias_qualifier(&mut connect_by.condition, rewrite);
+        for relationship in &mut connect_by.relationships {
+            rewrite_expr_alias_qualifier(relationship, rewrite);
+        }
+    }
+}
+
+fn rewrite_alias_references_in_order_by(order_by: &mut OrderBy, rewrite: &TableAliasRewrite) {
+    if let OrderByKind::Expressions(exprs) = &mut order_by.kind {
+        for order_expr in exprs {
+            rewrite_expr_alias_qualifier(&mut order_expr.expr, rewrite);
+        }
+    }
+
+    if let Some(interpolate) = order_by.interpolate.as_mut() {
+        if let Some(exprs) = interpolate.exprs.as_mut() {
+            for expr in exprs {
+                if let Some(inner) = expr.expr.as_mut() {
+                    rewrite_expr_alias_qualifier(inner, rewrite);
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_alias_references_in_limit_clause(
+    limit_clause: &mut LimitClause,
+    rewrite: &TableAliasRewrite,
+) {
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if let Some(limit) = limit {
+                rewrite_expr_alias_qualifier(limit, rewrite);
+            }
+            if let Some(offset) = offset {
+                rewrite_expr_alias_qualifier(&mut offset.value, rewrite);
+            }
+            for expr in limit_by {
+                rewrite_expr_alias_qualifier(expr, rewrite);
+            }
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            rewrite_expr_alias_qualifier(offset, rewrite);
+            rewrite_expr_alias_qualifier(limit, rewrite);
+        }
+    }
+}
+
+fn rewrite_expr_alias_qualifier(expr: &mut Expr, rewrite: &TableAliasRewrite) {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            if ident_matches_alias(&parts[0], &rewrite.alias) {
+                let mut rewritten = rewrite.replacement_prefix.clone();
+                rewritten.extend(parts.iter().skip(1).cloned());
+                *parts = rewritten;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            rewrite_expr_alias_qualifier(left, rewrite);
+            rewrite_expr_alias_qualifier(right, rewrite);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner)
+        | Expr::Cast { expr: inner, .. } => rewrite_expr_alias_qualifier(inner, rewrite),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                rewrite_expr_alias_qualifier(operand, rewrite);
+            }
+            for case_when in conditions {
+                rewrite_expr_alias_qualifier(&mut case_when.condition, rewrite);
+                rewrite_expr_alias_qualifier(&mut case_when.result, rewrite);
+            }
+            if let Some(else_result) = else_result {
+                rewrite_expr_alias_qualifier(else_result, rewrite);
+            }
+        }
+        Expr::Function(func) => rewrite_function_alias_qualifier(func, rewrite),
+        Expr::InSubquery {
+            expr: target,
+            subquery,
+            ..
+        } => {
+            rewrite_expr_alias_qualifier(target, rewrite);
+            let _ = subquery;
+        }
+        Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            rewrite_expr_alias_qualifier(target, rewrite);
+            rewrite_expr_alias_qualifier(low, rewrite);
+            rewrite_expr_alias_qualifier(high, rewrite);
+        }
+        Expr::InList {
+            expr: target, list, ..
+        } => {
+            rewrite_expr_alias_qualifier(target, rewrite);
+            for item in list {
+                rewrite_expr_alias_qualifier(item, rewrite);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                rewrite_expr_alias_qualifier(item, rewrite);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_function_alias_qualifier(func: &mut Function, rewrite: &TableAliasRewrite) {
+    if let FunctionArguments::List(arg_list) = &mut func.args {
+        for arg in &mut arg_list.args {
+            rewrite_function_arg_alias_qualifier(arg, rewrite);
+        }
+        for clause in &mut arg_list.clauses {
+            match clause {
+                FunctionArgumentClause::OrderBy(order_by_exprs) => {
+                    for order_by_expr in order_by_exprs {
+                        rewrite_expr_alias_qualifier(&mut order_by_expr.expr, rewrite);
+                    }
+                }
+                FunctionArgumentClause::Limit(expr) => rewrite_expr_alias_qualifier(expr, rewrite),
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(filter) = func.filter.as_mut() {
+        rewrite_expr_alias_qualifier(filter, rewrite);
+    }
+
+    for order_expr in &mut func.within_group {
+        rewrite_expr_alias_qualifier(&mut order_expr.expr, rewrite);
+    }
+}
+
+fn rewrite_function_arg_alias_qualifier(arg: &mut FunctionArg, rewrite: &TableAliasRewrite) {
+    match arg {
+        FunctionArg::Named { arg, .. }
+        | FunctionArg::ExprNamed { arg, .. }
+        | FunctionArg::Unnamed(arg) => {
+            if let FunctionArgExpr::Expr(expr) = arg {
+                rewrite_expr_alias_qualifier(expr, rewrite);
+            }
+        }
+    }
+}
+
+fn rewrite_object_name_alias_qualifier(object_name: &mut ObjectName, rewrite: &TableAliasRewrite) {
+    let Some(first_ident) = object_name.0.first().and_then(|part| part.as_ident()) else {
+        return;
+    };
+    if !ident_matches_alias(first_ident, &rewrite.alias) {
+        return;
+    }
+
+    let mut rewritten = rewrite
+        .replacement_prefix
+        .iter()
+        .cloned()
+        .map(ObjectNamePart::Identifier)
+        .collect::<Vec<_>>();
+    rewritten.extend(object_name.0.iter().skip(1).cloned());
+    object_name.0 = rewritten;
+}
+
+fn ident_matches_alias(ident: &Ident, alias: &str) -> bool {
+    ident.value.eq_ignore_ascii_case(alias)
+}
+
+fn expression_aliases_to_itself(expr: &Expr, alias: &Ident, mode: Al009AliasCaseCheck) -> bool {
+    let Some(source_name) = expression_name(expr) else {
+        return false;
+    };
+    let alias_name = NameRef {
+        name: alias.value.as_str(),
+        quoted: alias.quote_style.is_some(),
+    };
+    names_match(source_name, alias_name, mode)
+}
+
+fn expression_name(expr: &Expr) -> Option<NameRef<'_>> {
+    match expr {
+        Expr::Identifier(identifier) => Some(NameRef {
+            name: identifier.value.as_str(),
+            quoted: identifier.quote_style.is_some(),
+        }),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|part| NameRef {
+            name: part.value.as_str(),
+            quoted: part.quote_style.is_some(),
+        }),
+        Expr::Nested(inner) => expression_name(inner),
+        _ => None,
+    }
+}
+
+fn names_match(left: NameRef<'_>, right: NameRef<'_>, mode: Al009AliasCaseCheck) -> bool {
+    match mode {
+        Al009AliasCaseCheck::CaseInsensitive => left.name.eq_ignore_ascii_case(right.name),
+        Al009AliasCaseCheck::CaseSensitive => left.name == right.name,
+        Al009AliasCaseCheck::Dialect => {
+            if left.quoted || right.quoted {
+                left.name == right.name
+            } else {
+                left.name.eq_ignore_ascii_case(right.name)
+            }
+        }
+        Al009AliasCaseCheck::QuotedCsNakedUpper | Al009AliasCaseCheck::QuotedCsNakedLower => {
+            normalize_name_for_mode(left, mode) == normalize_name_for_mode(right, mode)
+        }
+    }
+}
+
+fn normalize_name_for_mode(name_ref: NameRef<'_>, mode: Al009AliasCaseCheck) -> String {
+    match mode {
+        Al009AliasCaseCheck::QuotedCsNakedUpper => {
+            if name_ref.quoted {
+                name_ref.name.to_string()
+            } else {
+                name_ref.name.to_ascii_uppercase()
+            }
+        }
+        Al009AliasCaseCheck::QuotedCsNakedLower => {
+            if name_ref.quoted {
+                name_ref.name.to_string()
+            } else {
+                name_ref.name.to_ascii_lowercase()
+            }
+        }
+        _ => name_ref.name.to_string(),
+    }
+}
+
 fn rewrite_distinct_parenthesized_projection(select: &mut Select) {
     if !matches!(select.distinct, Some(Distinct::Distinct)) {
         return;
@@ -1806,6 +3530,187 @@ fn has_distinct_and_group_by(select: &Select) -> bool {
         GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
     };
     has_distinct && has_group_by
+}
+
+fn rewrite_simple_derived_subqueries_to_ctes(query: &mut Query, rule_filter: &RuleFilter) {
+    if !rule_filter.allows(issue_codes::LINT_ST_005) {
+        return;
+    }
+
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return;
+    };
+
+    let outer_source_names = select_source_names_upper(select);
+    let mut used_cte_names: HashSet<String> = query
+        .with
+        .as_ref()
+        .map(|with| {
+            with.cte_tables
+                .iter()
+                .map(|cte| cte.alias.name.value.to_ascii_uppercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    used_cte_names.extend(outer_source_names.iter().cloned());
+
+    let mut new_ctes = Vec::new();
+
+    for table_with_joins in &mut select.from {
+        if rule_filter.st005_forbid_subquery_in.forbid_from() {
+            if let Some(cte) = rewrite_derived_table_factor_to_cte(
+                &mut table_with_joins.relation,
+                &outer_source_names,
+                &mut used_cte_names,
+            ) {
+                new_ctes.push(cte);
+            }
+        }
+
+        if rule_filter.st005_forbid_subquery_in.forbid_join() {
+            for join in &mut table_with_joins.joins {
+                if let Some(cte) = rewrite_derived_table_factor_to_cte(
+                    &mut join.relation,
+                    &outer_source_names,
+                    &mut used_cte_names,
+                ) {
+                    new_ctes.push(cte);
+                }
+            }
+        }
+    }
+
+    if new_ctes.is_empty() {
+        return;
+    }
+
+    let with = query.with.get_or_insert_with(|| With {
+        with_token: AttachedToken::empty(),
+        recursive: false,
+        cte_tables: Vec::new(),
+    });
+    with.cte_tables.extend(new_ctes);
+}
+
+fn rewrite_derived_table_factor_to_cte(
+    relation: &mut TableFactor,
+    outer_source_names: &HashSet<String>,
+    used_cte_names: &mut HashSet<String>,
+) -> Option<Cte> {
+    let (lateral, subquery, alias) = match relation {
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+        } => (lateral, subquery, alias),
+        _ => return None,
+    };
+
+    if *lateral {
+        return None;
+    }
+
+    // Keep this rewrite conservative: only SELECT subqueries that do not
+    // appear to reference outer sources.
+    if !matches!(subquery.body.as_ref(), SetExpr::Select(_))
+        || query_text_references_outer_sources(subquery, outer_source_names)
+    {
+        return None;
+    }
+
+    let cte_alias = alias.clone().unwrap_or_else(|| TableAlias {
+        name: Ident::new(next_generated_cte_name(used_cte_names)),
+        columns: Vec::new(),
+    });
+    let cte_name_ident = cte_alias.name.clone();
+    let cte_name_upper = cte_name_ident.value.to_ascii_uppercase();
+    used_cte_names.insert(cte_name_upper);
+
+    let cte = Cte {
+        alias: cte_alias,
+        query: subquery.clone(),
+        from: None,
+        materialized: None,
+        closing_paren_token: AttachedToken::empty(),
+    };
+
+    *relation = TableFactor::Table {
+        name: vec![cte_name_ident].into(),
+        alias: None,
+        args: None,
+        with_hints: Vec::new(),
+        version: None,
+        with_ordinality: false,
+        partitions: Vec::new(),
+        json_path: None,
+        sample: None,
+        index_hints: Vec::new(),
+    };
+
+    Some(cte)
+}
+
+fn next_generated_cte_name(used_cte_names: &HashSet<String>) -> String {
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("cte_subquery_{index}");
+        if !used_cte_names.contains(&candidate.to_ascii_uppercase()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn query_text_references_outer_sources(
+    query: &Query,
+    outer_source_names: &HashSet<String>,
+) -> bool {
+    if outer_source_names.is_empty() {
+        return false;
+    }
+
+    let rendered_upper = query.to_string().to_ascii_uppercase();
+    outer_source_names
+        .iter()
+        .any(|name| rendered_upper.contains(&format!("{name}.")))
+}
+
+fn select_source_names_upper(select: &Select) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for table in &select.from {
+        collect_source_names_from_table_factor(&table.relation, &mut names);
+        for join in &table.joins {
+            collect_source_names_from_table_factor(&join.relation, &mut names);
+        }
+    }
+    names
+}
+
+fn collect_source_names_from_table_factor(relation: &TableFactor, names: &mut HashSet<String>) {
+    match relation {
+        TableFactor::Table { name, alias, .. } => {
+            if let Some(last) = name.0.last().and_then(|part| part.as_ident()) {
+                names.insert(last.value.to_ascii_uppercase());
+            }
+            if let Some(alias) = alias {
+                names.insert(alias.name.value.to_ascii_uppercase());
+            }
+        }
+        TableFactor::Derived { alias, .. }
+        | TableFactor::TableFunction { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::JsonTable { alias, .. }
+        | TableFactor::OpenJsonTable { alias, .. }
+        | TableFactor::NestedJoin { alias, .. }
+        | TableFactor::Pivot { alias, .. }
+        | TableFactor::Unpivot { alias, .. } => {
+            if let Some(alias) = alias {
+                names.insert(alias.name.value.to_ascii_uppercase());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn rewrite_right_join_to_left(table_with_joins: &mut TableWithJoins) {
@@ -1881,6 +3786,24 @@ fn is_simple_projection_item(item: &SelectItem) -> bool {
         }
         _ => false,
     }
+}
+
+fn table_factor_alias_ident(relation: &TableFactor) -> Option<&Ident> {
+    let alias = match relation {
+        TableFactor::Table { alias, .. }
+        | TableFactor::Derived { alias, .. }
+        | TableFactor::TableFunction { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::JsonTable { alias, .. }
+        | TableFactor::OpenJsonTable { alias, .. }
+        | TableFactor::NestedJoin { alias, .. }
+        | TableFactor::Pivot { alias, .. }
+        | TableFactor::Unpivot { alias, .. } => alias.as_ref(),
+        _ => None,
+    }?;
+
+    Some(&alias.name)
 }
 
 fn table_factor_reference_name(relation: &TableFactor) -> Option<String> {
@@ -2448,6 +4371,10 @@ fn fix_expr(expr: &mut Expr, rule_filter: &RuleFilter) {
         }
     }
 
+    if rule_filter.allows(issue_codes::LINT_CV_011) {
+        rewrite_cast_style(expr, rule_filter.cv011_style);
+    }
+
     if rule_filter.allows(issue_codes::LINT_ST_004) {
         if let Some(rewritten) = nested_case_rewrite(expr) {
             *expr = rewritten;
@@ -2471,6 +4398,48 @@ fn fix_expr(expr: &mut Expr, rule_filter: &RuleFilter) {
             }
         }
     }
+}
+
+fn rewrite_cast_style(expr: &mut Expr, preferred_style: Cv011CastingStyle) {
+    let Expr::Cast {
+        kind,
+        expr: inner,
+        format,
+        ..
+    } = expr
+    else {
+        return;
+    };
+
+    match preferred_style {
+        Cv011CastingStyle::Cast | Cv011CastingStyle::Consistent => {
+            if *kind == CastKind::DoubleColon {
+                *kind = CastKind::Cast;
+            }
+        }
+        Cv011CastingStyle::Shorthand => {
+            if *kind == CastKind::Cast
+                && format.is_none()
+                && cast_expr_can_use_shorthand(inner.as_ref())
+            {
+                *kind = CastKind::DoubleColon;
+            }
+        }
+        Cv011CastingStyle::Convert => {}
+    }
+}
+
+fn cast_expr_can_use_shorthand(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Value(_)
+            | Expr::Function(_)
+            | Expr::Cast { .. }
+            | Expr::Nested(_)
+            | Expr::TypedString { .. }
+    )
 }
 
 fn fix_function(func: &mut Function, rule_filter: &RuleFilter) {
@@ -2547,8 +4516,15 @@ fn is_count_rowcount_numeric_literal(func: &Function) -> bool {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
             value: Value::Number(n, _),
             ..
-        }))) if n == "1" || n == "0"
+        }))) if numeric_literal_matches(n, 1) || numeric_literal_matches(n, 0)
     )
+}
+
+fn numeric_literal_matches(raw: &str, expected: u8) -> bool {
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|value| value == expected as u64)
 }
 
 fn null_comparison_rewrite(expr: &Expr) -> Option<Expr> {
@@ -3256,6 +5232,83 @@ mod tests {
     }
 
     #[test]
+    fn sqlfluff_al007_force_enabled_single_table_alias_is_fixed() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "aliasing.forbid".to_string(),
+                serde_json::json!({"force_enable": true}),
+            )]),
+        };
+        let sql = "SELECT u.id FROM users u";
+        assert_rule_case_with_config(sql, issue_codes::LINT_AL_007, 1, 0, 1, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        let fixed_upper = out.sql.to_ascii_uppercase();
+        assert!(
+            fixed_upper.contains("FROM USERS"),
+            "expected table alias to be removed: {}",
+            out.sql
+        );
+        assert!(
+            !fixed_upper.contains("FROM USERS U"),
+            "expected unnecessary table alias to be removed: {}",
+            out.sql
+        );
+        assert!(
+            fixed_upper.contains("USERS.ID"),
+            "expected references to use table name after alias removal: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn sqlfluff_al009_fix_respects_case_sensitive_mode() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "aliasing.self_alias.column".to_string(),
+                serde_json::json!({"alias_case_check": "case_sensitive"}),
+            )]),
+        };
+        let sql = "SELECT a AS A FROM t";
+        assert_rule_case_with_config(sql, issue_codes::LINT_AL_009, 0, 0, 0, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        assert!(
+            out.sql.contains("AS A"),
+            "case-sensitive mode should keep case-mismatched alias: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn sqlfluff_al009_ast_fix_keeps_table_aliases() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_AL_007.to_string()],
+            rule_configs: std::collections::BTreeMap::new(),
+        };
+        let sql = "SELECT t.a AS a FROM t AS t";
+        assert_rule_case_with_config(sql, issue_codes::LINT_AL_009, 1, 0, 1, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        let fixed_upper = out.sql.to_ascii_uppercase();
+        assert!(
+            fixed_upper.contains("FROM T AS T"),
+            "AL09 fix should not remove table alias declarations: {}",
+            out.sql
+        );
+        assert!(
+            !fixed_upper.contains("T.A AS A"),
+            "expected only column self-alias to be removed: {}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn sqlfluff_st005_cases_are_fixed_or_unchanged() {
         let cases = [
             (
@@ -3673,10 +5726,82 @@ mod tests {
     #[test]
     fn cv007_fix_respects_disabled_rules() {
         let sql = "(SELECT 1)";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[issue_codes::LINT_CV_007.to_string()])
-            .expect("fix result");
+        let out = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_CV_007.to_string()],
+        )
+        .expect("fix result");
         assert_eq!(out.sql, sql);
         assert_eq!(out.counts.get(issue_codes::LINT_CV_007), 0);
+    }
+
+    #[test]
+    fn cv010_fix_respects_single_quote_preference_without_rf006() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_RF_006.to_string()],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.quoted_literals".to_string(),
+                serde_json::json!({"preferred_quoted_literal_style": "single_quotes"}),
+            )]),
+        };
+        let sql = "SELECT 'abc' AS a, \"good_name\" AS b FROM t";
+        assert_rule_case_with_config(sql, issue_codes::LINT_CV_010, 1, 0, 1, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        assert!(
+            out.sql.contains("good_name"),
+            "expected safe identifier unquoting for CV_010 fix: {}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("\"good_name\""),
+            "expected double-quoted identifier to be rewritten: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn cv011_cast_preference_rewrites_double_colon_style() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.casting_style".to_string(),
+                serde_json::json!({"preferred_type_casting_style": "cast"}),
+            )]),
+        };
+        let sql = "SELECT amount::INT FROM t";
+        assert_rule_case_with_config(sql, issue_codes::LINT_CV_011, 1, 0, 1, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        assert!(
+            out.sql.to_ascii_uppercase().contains("CAST(AMOUNT AS INT)"),
+            "expected CAST(...) rewrite for CV_011 fix: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn cv011_shorthand_preference_rewrites_cast_style_when_safe() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "LINT_CV_011".to_string(),
+                serde_json::json!({"preferred_type_casting_style": "shorthand"}),
+            )]),
+        };
+        let sql = "SELECT CAST(amount AS INT) FROM t";
+        assert_rule_case_with_config(sql, issue_codes::LINT_CV_011, 1, 0, 1, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        assert!(
+            out.sql.to_ascii_uppercase().contains("AMOUNT::INT"),
+            "expected :: rewrite for CV_011 fix: {}",
+            out.sql
+        );
     }
 
     #[test]
@@ -3767,6 +5892,7 @@ mod tests {
             ("SELECT COUNT(*) FROM t", 0, 0, 0),
             ("SELECT COUNT(id) FROM t", 0, 0, 0),
             ("SELECT COUNT(0) FROM t", 1, 0, 1),
+            ("SELECT COUNT(01) FROM t", 1, 0, 1),
             ("SELECT COUNT(DISTINCT id) FROM t", 0, 0, 0),
         ];
 
@@ -3865,6 +5991,40 @@ mod tests {
     }
 
     #[test]
+    fn st005_ast_fix_rewrites_simple_join_derived_subquery_to_cte() {
+        let sql = "SELECT t.id FROM t JOIN (SELECT id FROM u) sub ON t.id = sub.id";
+        assert_rule_case(sql, issue_codes::LINT_ST_005, 1, 0, 1);
+
+        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        assert!(
+            out.sql.to_ascii_uppercase().contains("WITH SUB AS"),
+            "expected AST ST_005 rewrite to emit CTE: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn st005_ast_fix_rewrites_simple_from_derived_subquery_with_config() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "structure.subquery".to_string(),
+                serde_json::json!({"forbid_subquery_in": "from"}),
+            )]),
+        };
+        let sql = "SELECT sub.id FROM (SELECT id FROM u) sub";
+        assert_rule_case_with_config(sql, issue_codes::LINT_ST_005, 1, 0, 1, &lint_config);
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        assert!(
+            out.sql.to_ascii_uppercase().contains("WITH SUB AS"),
+            "expected FROM-derived ST_005 rewrite to emit CTE: {}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn consecutive_semicolon_fix_ignores_string_literal_content() {
         let sql = "SELECT 'a;;b' AS txt;;";
         let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
@@ -3941,7 +6101,7 @@ mod tests {
 
     #[test]
     fn spacing_fixes_do_not_rewrite_single_quoted_literals() {
-        let operator_fixed = fix_operator_spacing("SELECT a=1, 'x=y' FROM t");
+        let operator_fixed = fix_operator_spacing("SELECT a=1, 'x=y' FROM t", Dialect::Generic);
         assert!(
             operator_fixed.contains("'x=y'"),
             "operator spacing must not mutate literals: {operator_fixed}"
@@ -3951,7 +6111,7 @@ mod tests {
             "operator spacing should still apply: {operator_fixed}"
         );
 
-        let comma_fixed = fix_comma_spacing("SELECT a,b, 'x,y' FROM t");
+        let comma_fixed = fix_comma_spacing("SELECT a,b, 'x,y' FROM t", Dialect::Generic);
         assert!(
             comma_fixed.contains("'x,y'"),
             "comma spacing must not mutate literals: {comma_fixed}"
@@ -3965,7 +6125,7 @@ mod tests {
     #[test]
     fn keyword_newline_fix_does_not_rewrite_literals_or_quoted_identifiers() {
         let sql = "SELECT COUNT(1), 'hello FROM world', \"x WHERE y\" FROM t WHERE a = 1";
-        let fixed = fix_keyword_newlines(sql);
+        let fixed = fix_keyword_newlines(sql, Dialect::Generic);
         assert!(
             fixed.contains("'hello FROM world'"),
             "single-quoted literal should remain unchanged: {fixed}"
@@ -3986,6 +6146,38 @@ mod tests {
             fixed.contains("\nWHERE a = 1"),
             "WHERE clause should still be normalized: {fixed}"
         );
+    }
+
+    #[test]
+    fn cp04_fix_reduces_literal_capitalisation_violations() {
+        assert_rule_case(
+            "SELECT NULL, true, False FROM t",
+            issue_codes::LINT_CP_004,
+            1,
+            0,
+            1,
+        );
+    }
+
+    #[test]
+    fn cp05_fix_reduces_type_capitalisation_violations() {
+        assert_rule_case(
+            "CREATE TABLE t (a INT, b VarChar(10));",
+            issue_codes::LINT_CP_005,
+            1,
+            0,
+            1,
+        );
+    }
+
+    #[test]
+    fn cv06_fix_adds_missing_final_terminator() {
+        assert_rule_case("SELECT 1 ;", issue_codes::LINT_CV_006, 1, 0, 1);
+    }
+
+    #[test]
+    fn lt03_fix_moves_trailing_operator_to_leading_position() {
+        assert_rule_case("SELECT a +\n b FROM t", issue_codes::LINT_LT_003, 1, 0, 1);
     }
 
     #[test]
@@ -4010,6 +6202,116 @@ mod tests {
         assert!(
             out_al_disabled.contains("alias_select"),
             "excluding AL_005 must not block RF_004 rewrite: {out_al_disabled}"
+        );
+    }
+
+    #[test]
+    fn al001_fix_still_improves_with_fix_mode() {
+        let sql = "SELECT * FROM a x JOIN b y ON x.id = y.id";
+        assert_rule_case(sql, issue_codes::LINT_AL_001, 2, 0, 2);
+
+        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let upper = out.sql.to_ascii_uppercase();
+        assert!(
+            upper.contains("FROM A AS X"),
+            "expected explicit alias in fixed SQL, got: {}",
+            out.sql
+        );
+        assert!(
+            upper.contains("JOIN B AS Y"),
+            "expected explicit alias in fixed SQL, got: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn al001_fix_does_not_synthesize_missing_aliases() {
+        let sql = "SELECT COUNT(1) FROM users";
+        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "expected non-AL001 fix to apply: {}",
+            out.sql
+        );
+        assert!(
+            !out.sql.to_ascii_uppercase().contains(" AS T"),
+            "AL001 fixer must not generate synthetic aliases: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn al001_disabled_preserves_implicit_aliases_when_other_rules_fix() {
+        let sql = "select count(1) from a x join b y on x.id = y.id";
+        let out = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_AL_001.to_string()],
+        )
+        .expect("fix result");
+
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "expected non-AL001 fix to apply: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.to_ascii_uppercase().contains("FROM A X"),
+            "implicit alias should be preserved when AL001 is disabled: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.to_ascii_uppercase().contains("JOIN B Y"),
+            "implicit alias should be preserved when AL001 is disabled: {}",
+            out.sql
+        );
+        assert!(
+            lint_rule_count(&out.sql, issue_codes::LINT_AL_001) > 0,
+            "AL001 violations should remain when the rule is disabled: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn al001_implicit_config_rewrites_explicit_aliases() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                issue_codes::LINT_AL_001.to_string(),
+                serde_json::json!({"aliasing": "implicit"}),
+            )]),
+        };
+
+        let sql = "SELECT COUNT(1) FROM a AS x JOIN b AS y ON x.id = y.id";
+        assert_eq!(
+            lint_rule_count_with_config(sql, issue_codes::LINT_AL_001, &lint_config),
+            2,
+            "explicit aliases should violate AL001 under implicit mode"
+        );
+
+        let out = apply_fix_with_config(sql, &lint_config);
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "expected non-AL001 fix to apply: {}",
+            out.sql
+        );
+        assert!(
+            !out.sql.to_ascii_uppercase().contains(" AS X"),
+            "implicit-mode AL001 should remove explicit aliases: {}",
+            out.sql
+        );
+        assert!(
+            !out.sql.to_ascii_uppercase().contains(" AS Y"),
+            "implicit-mode AL001 should remove explicit aliases: {}",
+            out.sql
+        );
+        assert_eq!(
+            lint_rule_count_with_config(&out.sql, issue_codes::LINT_AL_001, &lint_config),
+            0,
+            "AL001 should be resolved under implicit mode: {}",
+            out.sql
         );
     }
 
@@ -4042,11 +6344,6 @@ mod tests {
         assert!(
             out.sql.contains("\"FROM\""),
             "reserved identifier must remain quoted: {}",
-            out.sql
-        );
-        assert!(
-            out.sql.to_ascii_uppercase().contains("DISTINCT SELECT"),
-            "expected another fix to persist output: {}",
             out.sql
         );
     }
@@ -4109,6 +6406,7 @@ mod tests {
             (issue_codes::LINT_CV_003, "SELECT a, FROM t"),
             (issue_codes::LINT_CV_004, "SELECT COUNT(1) FROM t"),
             (issue_codes::LINT_CV_005, "SELECT * FROM t WHERE a = NULL"),
+            (issue_codes::LINT_CV_006, "SELECT 1 ;"),
             (issue_codes::LINT_CV_007, "(SELECT 1)"),
             (issue_codes::LINT_JJ_001, "SELECT '{{foo}}' AS templated"),
             (issue_codes::LINT_LT_001, "SELECT payload->>'id' FROM t"),

@@ -79,7 +79,7 @@ impl LintRule for StructureJoinConditionOrder {
     }
 
     fn description(&self) -> &'static str {
-        "Join condition ordering appears reversed."
+        "Joins should list the table referenced earlier/later first."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

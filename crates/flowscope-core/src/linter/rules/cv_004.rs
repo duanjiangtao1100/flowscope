@@ -89,7 +89,7 @@ impl LintRule for CountStyle {
     }
 
     fn description(&self) -> &'static str {
-        "Prefer COUNT(*) over COUNT(1) for clarity."
+        "Use consistent syntax to express \"count number of rows\"."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {
@@ -124,13 +124,20 @@ fn count_argument_kind(args: &FunctionArguments) -> CountArgKind {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
             value: Value::Number(n, _),
             ..
-        }))) if n == "1" => CountArgKind::One,
+        }))) if numeric_literal_matches(n, 1) => CountArgKind::One,
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
             value: Value::Number(n, _),
             ..
-        }))) if n == "0" => CountArgKind::Zero,
+        }))) if numeric_literal_matches(n, 0) => CountArgKind::Zero,
         _ => CountArgKind::Other,
     }
+}
+
+fn numeric_literal_matches(raw: &str, expected: u8) -> bool {
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|value| value == expected as u64)
 }
 
 #[cfg(test)]
@@ -158,6 +165,12 @@ mod tests {
         let issues = check_sql("SELECT COUNT(1) FROM t");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "LINT_CV_004");
+    }
+
+    #[test]
+    fn test_count_leading_zero_numeric_literals_are_detected() {
+        let issues = check_sql("SELECT COUNT(01), COUNT(00) FROM t");
+        assert_eq!(issues.len(), 2);
     }
 
     #[test]

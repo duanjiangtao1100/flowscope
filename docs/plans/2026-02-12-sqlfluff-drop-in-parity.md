@@ -24,7 +24,7 @@ This plan covers three axes:
 - 60 rules are "partial" (narrower scope, missing config, or regex-based).
 - **27 rule codes are misnumbered** relative to SQLFluff (see Appendix A).
 - Rule names use human-readable labels; SQLFluff uses dotted identifiers.
-- Fix coverage: 66/72 (6 rules lack `--fix` support).
+- Fix coverage (from `docs/sqlfluff-gap-matrix.md`): 32/72 (40 rules lack `--fix` support), with 30/52 SQLFluff-fixable rules currently covered.
 
 ## Progress Snapshot (2026-02-13)
 
@@ -45,9 +45,27 @@ This plan covers three axes:
   - Supports canonical/shorthand/dotted rule references via canonicalization.
   - Supports SQLFluff-style `noqa: disable=all` / `noqa: enable=all` range directives, including block-comment forms with SQLFluff-compatible guardrails for valid marker placement.
 - API schema snapshot updated to include lint output changes (`sqlfluffName`).
-- Phase 4 fix-gap items from this plan are implemented:
+- Initial Phase 4 targeted fix-gap items from this plan are implemented:
   - `AL_005` fixer path is wired to canonical code gating.
   - `CV_008` fixer rewrites simple `RIGHT JOIN` patterns to `LEFT JOIN` with table reorder.
+  - CLI fixer migrated additional aliasing paths from regex to AST/token rewrites:
+    - `AL_007` (`aliasing.forbid`) now removes unnecessary single-table aliases in AST and rewrites alias-qualified references.
+    - `AL_009` (`aliasing.self_alias.column`) now removes self-alias projections in AST with `alias_case_check` parity behavior.
+    - `AL_001` alias-style fix path no longer uses regex alias injection and now applies token-span alias-style rewrites (including preserve-original-style behavior when AL01 is disabled).
+  - Additional convention/structure fixer coverage:
+    - `CV_010` now has config-aware fixer support for `preferred_quoted_literal_style` (`single_quotes`/`double_quotes`) in CLI `--fix`.
+    - `CV_011` now has safe AST cast-style fixer support for `preferred_type_casting_style` (`cast`/`shorthand`) and representable consistency rewrites.
+    - `ST_005` fixer now includes AST-derived-subquery-to-CTE rewrites for safe `FROM`/`JOIN` cases without regex fallback.
+  - CLI fixer regex migration:
+    - `crates/flowscope-cli/src/fix.rs` now removes runtime regex matching/replacement paths in favor of AST/token/span and deterministic string-scanning rewrites.
+    - `crates/flowscope-cli/Cargo.toml` no longer depends on `regex`.
+  - Additional fixer parity upgrades:
+    - `CP_004` / `CP_005` fixer support is now enabled in CLI `--fix` via token-safe case normalization for literal/type tokens.
+    - `CV_006` fixer now applies token/span-aware terminator normalization (including semicolon-spacing cleanup and config-aware final-semicolon insertion via `require_final_semicolon`).
+    - `LT_003` fixer now applies token/span operator-line rewrites for default leading-operator parity cases.
+    - `LT_001` / `LT_004` / `LT_006` / `LT_007` / `LT_008` / `LT_009` / `LT_011` / `LT_014` CLI fixer paths now run through token/span edit application rather than text-regex transforms.
+  - Analyzer span helper migration:
+    - `crates/flowscope-core/src/analyzer/helpers/span.rs` now resolves identifier/qualified-name spans via non-regex matching (word-boundary + quote-aware part matching), removing regex dependency from this module.
 - Phase 1 docs cleanup is implemented:
   - `docs/sqlfluff-gap-matrix.md` mapping rows now use canonical SQLFluff-aligned FlowScope rule codes and updated module references.
 - Phase 3 Tier 1 progress:
@@ -188,9 +206,9 @@ This plan covers three axes:
   - `JJ_001` now consumes the shared document token stream for statement tokenization before fallback tokenization.
   - `AM_002` bare-`UNION` issue spans now use active-dialect tokenized `UNION` keyword spans aligned to AST set-operation traversal order, replacing SQL-text keyword searching.
   - `AM_002` now consumes the shared document token stream for statement tokenization before fallback tokenization.
-  - `LT_010` moved from parity handling to a dedicated core rule module (`lt_010.rs`).
-  - `LT_010` was further upgraded from regex scanning to active-dialect tokenizer line-aware SELECT modifier checks.
-  - `LT_010` now consumes the shared document token stream for statement tokenization before fallback tokenization.
+- `LT_010` moved from parity handling to a dedicated core rule module (`lt_010.rs`).
+- `LT_010` was further upgraded from regex scanning to active-dialect tokenizer line-aware SELECT modifier checks.
+- `LT_010` now consumes the shared document token stream for statement tokenization before fallback tokenization.
   - `LT_011` moved from parity handling to a dedicated core rule module (`lt_011.rs`).
   - `LT_011` was further upgraded from regex scanning to active-dialect tokenizer line-aware set-operator placement checks.
   - `LT_011` now supports `line_position` (`alone:strict`/`leading`/`trailing`) through `lint.ruleConfigs`.
@@ -659,32 +677,14 @@ plan (Phase 2 of `linter-architecture.md`), but are lower priority because:
 
 ## Phase 4: Fix Coverage Gaps
 
-6 rules currently lack `--fix` support. Priority order by user impact:
+Current matrix-derived coverage snapshot (`docs/sqlfluff-gap-matrix.md`):
 
-### High Priority (semantic fixers)
+- FlowScope `--fix` support: 32/72 rules.
+- Rules without FlowScope `--fix`: 45.
+- SQLFluff-fixable subset (`SQLFluff Fix = Yes`): 30/52 covered, 22 remaining.
+- Recently closed aliasing fixer gaps: `AL01`, `AL07`, and `AL09` are now marked `FlowScope Fix = Yes`.
 
-| Rule | SQLFluff Fix | Fix Strategy |
-|---|---|---|
-| AM_001 (ambiguous.distinct) | No (SQLFluff also lacks fix) | Skip — no SQLFluff parity needed |
-| AM_009 (ambiguous.order_by_limit) | No (SQLFluff also lacks fix) | Skip — no SQLFluff parity needed |
-| AL_005 (aliasing.unused) | Yes | AST rewrite: remove unused alias from table factor |
-| RF_001 (references.from) | No (SQLFluff also lacks fix) | Skip |
-| RF_002 (references.qualification) | No (SQLFluff also lacks fix) | Skip |
-
-### Medium Priority (style fixers)
-
-| Rule | Fix Strategy |
-|---|---|
-| CV_008 (convention.left_join) | AST rewrite: swap RIGHT JOIN → LEFT JOIN with table reorder |
-| AM_004 (ambiguous.column_count) | No fix (SQLFluff also lacks fix) |
-| AM_006 (ambiguous.column_references) | No fix (SQLFluff also lacks fix) |
-| AM_007 (ambiguous.set_columns) | No fix (SQLFluff also lacks fix) |
-| ST_003 (structure.unused_cte) | No fix (SQLFluff also lacks fix) |
-
-After filtering out rules where SQLFluff itself lacks fix support, there are
-currently no remaining fix gaps for SQLFluff-fixable rules in this plan.
-
-All remaining no-fix rules match SQLFluff behavior (also unfixable).
+- `CP01`, `CP02`, `CP03`, `CV12`, `JJ01`, `LT01`, `LT02`, `LT04`, `LT05`, `LT06`, `LT07`, `LT08`, `LT09`, `LT11`, `LT12`, `LT13`, `LT14`, `LT15`, `RF03`, `RF06`, `TQ02`, `TQ03`.
 
 ---
 

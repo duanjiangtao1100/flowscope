@@ -19,7 +19,7 @@ impl LintRule for LeftJoinOverRightJoin {
     }
 
     fn description(&self) -> &'static str {
-        "Prefer LEFT JOIN over RIGHT JOIN for consistent query style."
+        "Use 'LEFT JOIN' instead of 'RIGHT JOIN'."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

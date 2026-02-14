@@ -5,7 +5,6 @@
 //! we use text search to find approximate positions.
 
 use crate::types::Span;
-use regex::Regex;
 
 /// Finds the byte offset span of an identifier in SQL text.
 ///
@@ -33,20 +32,14 @@ pub fn find_identifier_span(sql: &str, identifier: &str, search_start: usize) ->
     let search_text = &sql[search_start..];
 
     // Try exact match first (case-insensitive, word boundary)
-    if let Some(pos) = find_word_boundary_match(search_text, identifier) {
-        return Some(Span::new(
-            search_start + pos,
-            search_start + pos + identifier.len(),
-        ));
+    if let Some((start, end)) = find_word_boundary_match(search_text, identifier) {
+        return Some(Span::new(search_start + start, search_start + end));
     }
 
     // For qualified names like "schema.table", try to find the full pattern
     if identifier.contains('.') {
-        if let Some(pos) = find_qualified_name(search_text, identifier) {
-            return Some(Span::new(
-                search_start + pos,
-                search_start + pos + identifier.len(),
-            ));
+        if let Some((start, end)) = find_qualified_name(search_text, identifier) {
+            return Some(Span::new(search_start + start, search_start + end));
         }
     }
 
@@ -289,50 +282,124 @@ fn match_identifier_at(text: &str, pos: usize, identifier: &str) -> Option<(usiz
 
 /// Finds an identifier at a word boundary (not part of another word).
 /// Word boundaries consider underscores as part of identifiers (SQL convention).
-fn find_word_boundary_match(text: &str, identifier: &str) -> Option<usize> {
-    // For simple identifiers, use word boundary matching
-    // Note: \b in regex considers underscore as a word character, which is correct for SQL
-    let pattern = format!(r"(?i)\b{}\b", regex::escape(identifier));
+fn find_word_boundary_match(text: &str, identifier: &str) -> Option<(usize, usize)> {
+    if identifier.is_empty() {
+        return None;
+    }
 
-    // Try to compile the pattern
-    if let Ok(re) = Regex::new(&pattern) {
-        if let Some(m) = re.find(text) {
-            return Some(m.start());
+    let text_bytes = text.as_bytes();
+    let ident_bytes = identifier.as_bytes();
+    if ident_bytes.len() > text_bytes.len() {
+        return None;
+    }
+
+    for start in 0..=text_bytes.len() - ident_bytes.len() {
+        if !starts_with_ascii_case_insensitive(text_bytes, start, ident_bytes) {
+            continue;
+        }
+
+        let before_ok = start == 0 || !is_identifier_char(text_bytes[start - 1]);
+        let end = start + ident_bytes.len();
+        let after_ok = end == text_bytes.len() || !is_identifier_char(text_bytes[end]);
+
+        if before_ok && after_ok {
+            return Some((start, end));
         }
     }
 
-    // No fallback to simple substring search - we need word boundaries
-    // to avoid matching "users" inside "users_table"
     None
 }
 
 /// Finds a qualified identifier (e.g., "schema.table") in text.
-fn find_qualified_name(text: &str, qualified_name: &str) -> Option<usize> {
-    // Split the qualified name and search for the pattern
+fn find_qualified_name(text: &str, qualified_name: &str) -> Option<(usize, usize)> {
     let parts: Vec<&str> = qualified_name.split('.').collect();
-    if parts.is_empty() {
+    if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
         return None;
     }
 
-    // Build a pattern that matches the qualified name with optional quotes
-    // e.g., "public.users" should match: public.users, "public"."users", public."users", etc.
-    let pattern_parts: Vec<String> = parts
-        .iter()
-        .map(|part| {
-            // Match the part with optional surrounding quotes
-            format!(r#"(?:"?{}\"?)"#, regex::escape(part))
-        })
-        .collect();
+    let text_bytes = text.as_bytes();
+    for start in 0..text_bytes.len() {
+        let before_ok = start == 0 || !is_identifier_char(text_bytes[start - 1]);
+        if !before_ok {
+            continue;
+        }
 
-    let pattern = format!(r"(?i){}", pattern_parts.join(r"\."));
+        let mut current = start;
+        let mut matched = true;
 
-    if let Ok(re) = Regex::new(&pattern) {
-        if let Some(m) = re.find(text) {
-            return Some(m.start());
+        for (idx, part) in parts.iter().enumerate() {
+            let Some(next) = match_qualified_part_at(text_bytes, current, part.as_bytes()) else {
+                matched = false;
+                break;
+            };
+
+            current = next;
+            if idx < parts.len() - 1 {
+                if current >= text_bytes.len() || text_bytes[current] != b'.' {
+                    matched = false;
+                    break;
+                }
+                current += 1;
+            }
+        }
+
+        if !matched {
+            continue;
+        }
+
+        let after_ok = current == text_bytes.len() || !is_identifier_char(text_bytes[current]);
+        if after_ok {
+            return Some((start, current));
         }
     }
 
     None
+}
+
+fn is_identifier_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
+    if start + needle.len() > haystack.len() {
+        return false;
+    }
+
+    for (idx, needle_byte) in needle.iter().enumerate() {
+        if !haystack[start + idx].eq_ignore_ascii_case(needle_byte) {
+            return false;
+        }
+    }
+    true
+}
+
+fn match_qualified_part_at(text: &[u8], start: usize, part: &[u8]) -> Option<usize> {
+    if part.is_empty() || start >= text.len() {
+        return None;
+    }
+
+    let (content_start, close_quote) = match text[start] {
+        b'"' => (start + 1, Some(b'"')),
+        b'`' => (start + 1, Some(b'`')),
+        b'[' => (start + 1, Some(b']')),
+        _ => (start, None),
+    };
+
+    if !starts_with_ascii_case_insensitive(text, content_start, part) {
+        return None;
+    }
+
+    let end = content_start + part.len();
+    match close_quote {
+        Some(quote) => {
+            if end < text.len() && text[end] == quote {
+                Some(end + 1)
+            } else {
+                None
+            }
+        }
+        None => Some(end),
+    }
 }
 
 /// Calculates the byte offset for a given line and column in SQL text.
@@ -411,6 +478,15 @@ mod tests {
         let sql = "SELECT * FROM public.users";
         let span = find_identifier_span(sql, "public.users", 0);
         assert_eq!(span, Some(Span::new(14, 26)));
+    }
+
+    #[test]
+    fn test_find_identifier_span_qualified_with_quotes() {
+        let sql = r#"SELECT * FROM "Public"."Users""#;
+        let span = find_identifier_span(sql, "public.users", 0);
+        assert_eq!(span, Some(Span::new(14, 30)));
+        let span = span.expect("quoted qualified span");
+        assert_eq!(&sql[span.start..span.end], r#""Public"."Users""#);
     }
 
     #[test]

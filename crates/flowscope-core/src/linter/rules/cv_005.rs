@@ -20,7 +20,7 @@ impl LintRule for NullComparison {
     }
 
     fn description(&self) -> &'static str {
-        "Use IS NULL / IS NOT NULL instead of = NULL or <> NULL."
+        "Comparisons with NULL should use \"IS\" or \"IS NOT\"."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

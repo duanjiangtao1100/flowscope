@@ -21,7 +21,7 @@ impl LintRule for AmbiguousJoinCondition {
     }
 
     fn description(&self) -> &'static str {
-        "Implicit cross joins should be written as CROSS JOIN."
+        "Implicit cross join detected."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

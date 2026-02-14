@@ -20,7 +20,7 @@ impl LintRule for StructureConsecutiveSemicolons {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid consecutive semicolons."
+        "Consecutive semicolons detected."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -21,7 +21,7 @@ impl LintRule for LayoutSelectModifiers {
     }
 
     fn description(&self) -> &'static str {
-        "SELECT modifiers should be placed consistently."
+        "'SELECT' modifiers (e.g. 'DISTINCT') must be on the same line as 'SELECT'."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

@@ -66,7 +66,7 @@ impl LintRule for LayoutOperators {
     }
 
     fn description(&self) -> &'static str {
-        "Operator line placement should be consistent."
+        "Operators should follow a standard for being before/after newlines."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

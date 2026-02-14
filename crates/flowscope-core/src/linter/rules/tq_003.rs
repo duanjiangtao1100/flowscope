@@ -21,7 +21,7 @@ impl LintRule for TsqlEmptyBatch {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid empty TSQL batches between GO separators."
+        "Remove empty batches."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

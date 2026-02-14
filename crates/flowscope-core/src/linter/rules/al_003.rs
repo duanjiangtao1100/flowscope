@@ -39,7 +39,7 @@ impl LintRule for ImplicitAlias {
     }
 
     fn description(&self) -> &'static str {
-        "Computed expressions should have explicit AS aliases for clarity."
+        "Column expression without alias. Use explicit `AS` clause."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

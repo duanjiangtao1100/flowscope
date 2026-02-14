@@ -23,7 +23,7 @@ impl LintRule for AmbiguousOrderBy {
     }
 
     fn description(&self) -> &'static str {
-        "ORDER BY direction should be either explicit for all items or omitted for all items."
+        "Ambiguous ordering directions for columns in order by clause."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

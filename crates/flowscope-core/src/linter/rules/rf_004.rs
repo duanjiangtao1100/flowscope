@@ -75,7 +75,7 @@ impl LintRule for ReferencesKeywords {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid keywords as identifiers."
+        "Keywords should not be used as identifiers."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

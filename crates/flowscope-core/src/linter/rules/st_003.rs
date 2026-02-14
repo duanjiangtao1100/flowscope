@@ -20,7 +20,7 @@ impl LintRule for UnusedCte {
     }
 
     fn description(&self) -> &'static str {
-        "CTE defined in WITH clause but never referenced."
+        "Query defines a CTE (common-table expression) but does not use it."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

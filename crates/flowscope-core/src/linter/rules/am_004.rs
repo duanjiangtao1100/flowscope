@@ -22,7 +22,7 @@ impl LintRule for AmbiguousColumnCount {
     }
 
     fn description(&self) -> &'static str {
-        "Query should produce a known number of result columns."
+        "Query produces an unknown number of result columns."
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {

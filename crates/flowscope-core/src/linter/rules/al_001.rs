@@ -77,7 +77,8 @@ impl LintRule for AliasingTableStyle {
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let mut issues = Vec::new();
-        let tokens = tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
+        let tokens =
+            tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
 
         collect_table_aliases_in_statement(statement, &mut |alias| {
             let Some(occurrence) = alias_occurrence_in_statement(alias, ctx, tokens.as_deref())

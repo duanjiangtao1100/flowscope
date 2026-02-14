@@ -21,7 +21,7 @@ impl LintRule for StructureDistinct {
     }
 
     fn description(&self) -> &'static str {
-        "`DISTINCT` used with parentheses."
+        "'DISTINCT' used with parentheses."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

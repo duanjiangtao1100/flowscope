@@ -56,7 +56,7 @@ impl LintRule for CapitalisationKeywords {
     }
 
     fn description(&self) -> &'static str {
-        "SQL keywords should use a consistent case style."
+        "Inconsistent capitalisation of keywords."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

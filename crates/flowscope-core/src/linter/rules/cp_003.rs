@@ -58,7 +58,7 @@ impl LintRule for CapitalisationFunctions {
     }
 
     fn description(&self) -> &'static str {
-        "Functions should use a consistent case style."
+        "Inconsistent capitalisation of function names."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

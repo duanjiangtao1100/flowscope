@@ -43,7 +43,7 @@ impl LintRule for AliasingForbidSingleTable {
     }
 
     fn description(&self) -> &'static str {
-        "Avoid unnecessary table aliases."
+        "Avoid table aliases in from clauses and join conditions."
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {

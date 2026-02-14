@@ -21,7 +21,7 @@ impl LintRule for LayoutSpacing {
     }
 
     fn description(&self) -> &'static str {
-        "Operator spacing should be consistent."
+        "Inappropriate Spacing."
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
