@@ -734,9 +734,6 @@ fn try_core_only_fix_plan(
 fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
     let mut out = sql.to_string();
 
-    if rule_filter.allows(issue_codes::LINT_LT_015) {
-        out = fix_excessive_blank_lines(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_002) {
         out = fix_indentation(&out);
     }
@@ -988,6 +985,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_013)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
     {
@@ -1703,45 +1701,6 @@ where
 
     if !outside.is_empty() {
         out.push_str(&transform(&outside));
-    }
-
-    out
-}
-
-fn fix_excessive_blank_lines(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if bytes[i] != b'\n' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-
-        let mut j = i + 1;
-        let mut newline_count = 1usize;
-        while j < bytes.len() {
-            let mut k = j;
-            while k < bytes.len() && is_ascii_whitespace_byte(bytes[k]) && bytes[k] != b'\n' {
-                k += 1;
-            }
-            if k < bytes.len() && bytes[k] == b'\n' {
-                newline_count += 1;
-                j = k + 1;
-            } else {
-                break;
-            }
-        }
-
-        if newline_count >= 3 {
-            out.push_str("\n\n");
-            i = j;
-        } else {
-            out.push('\n');
-            i += 1;
-        }
     }
 
     out

@@ -574,6 +574,29 @@ async fn lint_fix_applies_lt014_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt015_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1\n\n\nFROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1\n\nFROM t\n",
+        "expected LT015 core autofix to collapse excessive blank lines"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_jj001_core_autofix_only_in_unsafe_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

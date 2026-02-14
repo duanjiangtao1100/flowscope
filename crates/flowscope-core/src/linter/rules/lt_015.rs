@@ -4,9 +4,11 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
-use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{
+    Location, Span as TokenSpan, Token, TokenWithSpan, Tokenizer, Whitespace,
+};
 use std::ops::Range;
 
 pub struct LayoutNewlines {
@@ -57,15 +59,17 @@ impl LintRule for LayoutNewlines {
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let (inside_range, statement_sql) = trimmed_statement_range_and_sql(ctx);
-        let inside_tokens = tokenized_for_range(ctx, inside_range);
+        let inside_tokens = tokenized_for_range(ctx, inside_range.clone());
         let excessive_inside =
             max_consecutive_blank_lines(statement_sql, ctx.dialect(), inside_tokens.as_deref())
                 > self.maximum_empty_lines_inside_statements;
 
+        let mut gap_range = None;
         let excessive_between = if ctx.statement_index > 0 {
-            let gap_range = inter_statement_gap_range(ctx.sql, ctx.statement_range.start);
-            let gap_sql = &ctx.sql[gap_range.clone()];
-            let gap_tokens = tokenized_for_range(ctx, gap_range);
+            let range = inter_statement_gap_range(ctx.sql, ctx.statement_range.start);
+            let gap_sql = &ctx.sql[range.clone()];
+            let gap_tokens = tokenized_for_range(ctx, range.clone());
+            gap_range = Some(range);
             max_consecutive_blank_lines(gap_sql, ctx.dialect(), gap_tokens.as_deref())
                 > self.maximum_empty_lines_between_statements
         } else {
@@ -73,11 +77,36 @@ impl LintRule for LayoutNewlines {
         };
 
         if excessive_inside || excessive_between {
-            vec![Issue::info(
+            let mut edits = Vec::new();
+            if excessive_inside {
+                edits.extend(excessive_blank_line_edits_for_range(
+                    ctx.sql,
+                    inside_range.clone(),
+                    self.maximum_empty_lines_inside_statements,
+                ));
+            }
+            if excessive_between {
+                if let Some(range) = gap_range {
+                    edits.extend(excessive_blank_line_edits_for_range(
+                        ctx.sql,
+                        range,
+                        self.maximum_empty_lines_between_statements,
+                    ));
+                }
+            }
+
+            let mut issue = Issue::info(
                 issue_codes::LINT_LT_015,
                 "SQL contains excessive blank lines.",
             )
-            .with_statement(ctx.statement_index)]
+            .with_statement(ctx.statement_index);
+            if let Some(first_edit) = edits.first() {
+                issue = issue.with_span(first_edit.span);
+            }
+            if !edits.is_empty() {
+                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            }
+            vec![issue]
         } else {
             Vec::new()
         }
@@ -263,6 +292,55 @@ fn inter_statement_gap_range(sql: &str, statement_start: usize) -> Range<usize> 
     boundary..statement_start
 }
 
+fn excessive_blank_line_edits_for_range(
+    sql: &str,
+    range: Range<usize>,
+    max_empty_lines: usize,
+) -> Vec<IssuePatchEdit> {
+    if range.is_empty() || range.end > sql.len() {
+        return Vec::new();
+    }
+
+    let bytes = sql.as_bytes();
+    let allowed_newlines = max_empty_lines.saturating_add(1);
+    let replacement = "\n".repeat(allowed_newlines);
+    let mut edits = Vec::new();
+
+    let mut i = range.start;
+    while i < range.end {
+        if bytes[i] != b'\n' {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        let mut newline_count = 1usize;
+        while j < range.end {
+            let mut k = j;
+            while k < range.end && is_ascii_whitespace_byte(bytes[k]) && bytes[k] != b'\n' {
+                k += 1;
+            }
+            if k < range.end && bytes[k] == b'\n' {
+                newline_count += 1;
+                j = k + 1;
+            } else {
+                break;
+            }
+        }
+
+        if newline_count > allowed_newlines {
+            edits.push(IssuePatchEdit::new(Span::new(i, j), replacement.clone()));
+        }
+        i = j;
+    }
+
+    edits
+}
+
+fn is_ascii_whitespace_byte(byte: u8) -> bool {
+    (byte as char).is_ascii_whitespace()
+}
+
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
     let dialect = dialect.to_sqlparser_dialect();
     let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
@@ -302,7 +380,7 @@ fn tokenized_for_range(ctx: &LintContext, range: Range<usize>) -> Option<Vec<Tok
 
             out.push(TokenWithSpan::new(
                 token.token.clone(),
-                Span::new(start_loc, end_loc),
+                TokenSpan::new(start_loc, end_loc),
             ));
         }
 
@@ -416,6 +494,7 @@ mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run_with_rule(sql: &str, rule: &LayoutNewlines) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -469,11 +548,26 @@ mod tests {
         run_with_rule(sql, &LayoutNewlines::default())
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_excessive_blank_lines() {
         let issues = run("SELECT 1\n\n\nFROM t");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_015);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix("SELECT 1\n\n\nFROM t", &issues[0]).expect("apply fix");
+        assert_eq!(fixed, "SELECT 1\n\nFROM t");
     }
 
     #[test]
@@ -521,6 +615,8 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_015);
+        let fixed = apply_issue_autofix("SELECT 1;\n\n\nSELECT 2", &issues[0]).expect("apply fix");
+        assert_eq!(fixed, "SELECT 1;\n\nSELECT 2");
     }
 
     #[test]
@@ -532,9 +628,16 @@ mod tests {
 
     #[test]
     fn flags_blank_lines_between_statements_with_comment_gap() {
-        let issues = run("SELECT 1;\n-- there was a comment\n\n\nSELECT 2");
+        let sql = "SELECT 1;\n-- there was a comment\n\n\nSELECT 2";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_015);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply fix");
+        assert!(
+            fixed.contains("-- there was a comment"),
+            "comment should remain after LT015 autofix: {fixed}"
+        );
+        assert_eq!(fixed, "SELECT 1;\n-- there was a comment\n\nSELECT 2");
     }
 
     #[test]
