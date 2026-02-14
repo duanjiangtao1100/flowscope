@@ -739,9 +739,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_003) {
         out = fix_operator_line_position(&out, dialect);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_004) {
-        out = fix_comma_spacing(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
@@ -1860,43 +1857,6 @@ fn fix_operator_line_position(sql: &str, dialect: Dialect) -> String {
         if !before_gap.contains('\n') && after_gap.contains('\n') {
             edits.push(SpanEdit::replace(before_start, before_end, "\n"));
             edits.push(SpanEdit::replace(after_start, after_end, " "));
-        }
-    }
-
-    apply_span_edits(sql, edits)
-}
-
-fn fix_comma_spacing(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for (idx, token) in tokens.iter().enumerate() {
-        if !matches!(token.token, Token::Comma) {
-            continue;
-        }
-
-        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
-            let gap_start = tokens[prev_idx].end;
-            let gap_end = token.start;
-            if gap_start < gap_end {
-                let gap = &sql[gap_start..gap_end];
-                if !gap.contains('\n') && !gap.contains('\r') && !gap.is_empty() {
-                    edits.push(SpanEdit::replace(gap_start, gap_end, ""));
-                }
-            }
-        }
-
-        if let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) {
-            let gap_start = token.end;
-            let gap_end = tokens[next_idx].start;
-            if gap_start <= gap_end {
-                let gap = &sql[gap_start..gap_end];
-                if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
-                    edits.push(SpanEdit::replace(gap_start, gap_end, " "));
-                }
-            }
         }
     }
 
@@ -7101,7 +7061,9 @@ mod tests {
             "operator spacing should still apply: {operator_fixed}"
         );
 
-        let comma_fixed = fix_comma_spacing("SELECT a,b, 'x,y' FROM t", Dialect::Generic);
+        let comma_fixed = apply_lint_fixes("SELECT a,b, 'x,y' FROM t", Dialect::Generic, &[])
+            .expect("comma spacing fix result")
+            .sql;
         assert!(
             comma_fixed.contains("'x,y'"),
             "comma spacing must not mutate literals: {comma_fixed}"

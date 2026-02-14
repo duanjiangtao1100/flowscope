@@ -5,7 +5,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -71,24 +71,44 @@ impl LintRule for LayoutCommas {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if has_inconsistent_comma_spacing(ctx, self.line_position) {
-            vec![Issue::info(
+        if let Some(((start, end), edits)) = comma_spacing_violation(ctx, self.line_position) {
+            let mut issue = Issue::info(
                 issue_codes::LINT_LT_004,
                 "Comma spacing appears inconsistent.",
             )
-            .with_statement(ctx.statement_index)]
+            .with_statement(ctx.statement_index)
+            .with_span(ctx.span_from_statement_offset(start, end));
+            if !edits.is_empty() {
+                let edits = edits
+                    .into_iter()
+                    .map(|(edit_start, edit_end, replacement)| {
+                        IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(edit_start, edit_end),
+                            replacement,
+                        )
+                    })
+                    .collect();
+                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            }
+            vec![issue]
         } else {
             Vec::new()
         }
     }
 }
 
-fn has_inconsistent_comma_spacing(ctx: &LintContext, line_position: CommaLinePosition) -> bool {
+type Lt04Span = (usize, usize);
+type Lt04AutofixEdit = (usize, usize, &'static str);
+type Lt04Violation = (Lt04Span, Vec<Lt04AutofixEdit>);
+
+fn comma_spacing_violation(
+    ctx: &LintContext,
+    line_position: CommaLinePosition,
+) -> Option<Lt04Violation> {
     let tokens =
         tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
-    let Some(tokens) = tokens else {
-        return false;
-    };
+    let tokens = tokens?;
+    let sql = ctx.statement_sql();
 
     for (index, token) in tokens.iter().enumerate() {
         if !matches!(token.token, Token::Comma) {
@@ -110,6 +130,9 @@ fn has_inconsistent_comma_spacing(ctx: &LintContext, line_position: CommaLinePos
         let Some(next_sig_idx) = next_sig_idx else {
             continue;
         };
+        let Some((comma_start, comma_end)) = token_with_span_offsets(sql, token) else {
+            continue;
+        };
 
         let comma_line = token.span.start.line;
         let prev_line = tokens[prev_sig_idx].span.end.line;
@@ -122,29 +145,67 @@ fn has_inconsistent_comma_spacing(ctx: &LintContext, line_position: CommaLinePos
             CommaLinePosition::Leading => line_break_after && !line_break_before,
         };
         if line_position_violation {
-            return true;
+            return Some(((comma_start, comma_end), Vec::new()));
         }
 
+        let mut edits = Vec::new();
+        let mut violation = false;
+
         // Inline comma cases should have no pre-comma spacing.
-        if prev_line == comma_line
+        let has_pre_inline_space = prev_line == comma_line
             && tokens[prev_sig_idx + 1..index]
                 .iter()
-                .any(|candidate| is_inline_space_token(&candidate.token))
-        {
-            return true;
+                .any(|candidate| is_inline_space_token(&candidate.token));
+        if has_pre_inline_space {
+            violation = true;
+            if let Some((gap_start, gap_end)) =
+                safe_inline_gap_between(sql, &tokens[prev_sig_idx], token)
+            {
+                if gap_start < gap_end {
+                    edits.push((gap_start, gap_end, ""));
+                }
+            }
         }
 
         // Inline comma cases should have spacing after comma.
-        if next_line == comma_line
+        let missing_post_inline_space = next_line == comma_line
             && !tokens[index + 1..next_sig_idx]
                 .iter()
-                .any(|candidate| is_inline_space_token(&candidate.token))
-        {
-            return true;
+                .any(|candidate| is_inline_space_token(&candidate.token));
+        if missing_post_inline_space {
+            violation = true;
+            if let Some((gap_start, gap_end)) =
+                safe_inline_gap_between(sql, token, &tokens[next_sig_idx])
+            {
+                edits.push((gap_start, gap_end, " "));
+            }
+        }
+
+        if violation {
+            return Some(((comma_start, comma_end), edits));
         }
     }
 
-    false
+    None
+}
+
+fn safe_inline_gap_between(
+    sql: &str,
+    left: &TokenWithSpan,
+    right: &TokenWithSpan,
+) -> Option<(usize, usize)> {
+    let (_, start) = token_with_span_offsets(sql, left)?;
+    let (end, _) = token_with_span_offsets(sql, right)?;
+    if start > end || end > sql.len() {
+        return None;
+    }
+
+    let gap = &sql[start..end];
+    if gap.chars().all(char::is_whitespace) && !gap.contains('\n') && !gap.contains('\r') {
+        Some((start, end))
+    } else {
+        None
+    }
 }
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
@@ -323,6 +384,7 @@ mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run_with_rule(sql: &str, rule: &LayoutCommas) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -346,11 +408,27 @@ mod tests {
         run_with_rule(sql, &LayoutCommas::default())
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_tight_comma_spacing() {
-        let issues = run("SELECT a,b FROM t");
+        let sql = "SELECT a,b FROM t";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_004);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a, b FROM t");
     }
 
     #[test]
@@ -361,6 +439,17 @@ mod tests {
     #[test]
     fn does_not_flag_comma_inside_string_literal() {
         assert!(run("SELECT 'a,b' AS txt, b FROM t").is_empty());
+    }
+
+    #[test]
+    fn comma_with_inline_comment_gap_is_report_only() {
+        let sql = "SELECT a,/* comment */b FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_none(),
+            "comment-bearing comma spacing remains report-only in conservative LT004 migration"
+        );
     }
 
     #[test]
