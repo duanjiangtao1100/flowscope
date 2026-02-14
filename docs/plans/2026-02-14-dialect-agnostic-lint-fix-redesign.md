@@ -12,7 +12,7 @@ Replace AST round-trip auto-fix as the default with a patch-based fix engine tha
 
 Status (2026-02-14): implemented in `flowscope-cli` with safe/unsafe applicability, deterministic patch planning, protected ranges, CLI flags (`--unsafe-fixes`, `--show-fixes`), and a serve-mode `/api/lint-fix` endpoint.
 
-Status update (2026-02-14, later): core lint diagnostics now carry first-class autofix metadata (`Issue.autofix`), CV001/CV002/CV003/CV004/CV005/CV006/CV007/ST012/LT006/LT010/LT012/LT013/LT014/LT015/JJ001 emit precise safe patch edits, CLI fix planning consumes core autofix candidates (with core-first conflict priority), and fallback planning applies core-only fixes when mixed rewrite candidates regress.
+Status update (2026-02-14, later): core lint diagnostics now carry first-class autofix metadata (`Issue.autofix`), CV001/CV002/CV003/CV004/CV005/CV006/CV007/ST012/LT006/LT010/LT011/LT012/LT013/LT014/LT015/JJ001 emit precise safe patch edits, CLI fix planning consumes core autofix candidates (with core-first conflict priority), and fallback planning applies core-only fixes when mixed rewrite candidates regress.
 
 Status update (2026-02-14, latest): CLI/API default fix path is patch-only; legacy AST rewrite candidates are opt-in via `--legacy-ast-fixes` (CLI) and `legacy_ast_fixes` (`/api/lint-fix`).
 
@@ -138,7 +138,7 @@ LSP:
 Current completion snapshot:
 
 - Phase 0: complete in CLI (`fix_engine` module, applicability model, deterministic planner, protected ranges).
-- Phase 1: actively migrated with core-emitted patch edits for CV001/CV002/CV003/CV004/CV005/CV006/CV007/ST012/LT006/LT010/LT012/LT013/LT014/LT015/JJ001 and CLI ingestion; CV001/CV002/CV003/CV004/CV005/CV006/CV007/ST012/LT006/LT010/LT012/LT013/LT014/LT015/JJ001 legacy AST/text rewrite paths removed in favor of core patch metadata.
+- Phase 1: actively migrated with core-emitted patch edits for CV001/CV002/CV003/CV004/CV005/CV006/CV007/ST012/LT006/LT010/LT011/LT012/LT013/LT014/LT015/JJ001 and CLI ingestion; CV001/CV002/CV003/CV004/CV005/CV006/CV007/ST012/LT006/LT010/LT011/LT012/LT013/LT014/LT015/JJ001 legacy AST/text rewrite paths removed in favor of core patch metadata.
 - Phase 2: complete for applicability plumbing (`Safe`/`Unsafe`/`DisplayOnly`) and CLI reporting of skipped/blocked counts.
 - Phase 3: validated on existing multi-dialect core fixture matrix (`cargo test -p flowscope-core`), with migrated rules exercised through parser/token adapters.
 - Phase 4: protected template/comment/string ranges enforced in planner; safe mode blocks unstable template edits.

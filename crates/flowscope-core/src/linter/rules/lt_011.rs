@@ -5,10 +5,12 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::keywords::Keyword;
-use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{
+    Location, Span as TokenSpan, Token, TokenWithSpan, Tokenizer, Whitespace,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SetOperatorLinePosition {
@@ -66,27 +68,46 @@ impl LintRule for LayoutSetOperators {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if has_inconsistent_set_operator_layout(ctx, self.line_position) {
-            vec![Issue::info(
+        let (has_violation, edit_spans) =
+            set_operator_layout_violation_and_fixable_spans(ctx, self.line_position);
+        if has_violation {
+            let mut issue = Issue::info(
                 issue_codes::LINT_LT_011,
                 "Set operator line placement appears inconsistent.",
             )
-            .with_statement(ctx.statement_index)]
+            .with_statement(ctx.statement_index);
+
+            if let Some((start, end)) = edit_spans.first().copied() {
+                issue = issue.with_span(ctx.span_from_statement_offset(start, end));
+                let edits = edit_spans
+                    .into_iter()
+                    .map(|(edit_start, edit_end)| {
+                        IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(edit_start, edit_end),
+                            "\n",
+                        )
+                    })
+                    .collect();
+                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            }
+
+            vec![issue]
         } else {
             Vec::new()
         }
     }
 }
 
-fn has_inconsistent_set_operator_layout(
+fn set_operator_layout_violation_and_fixable_spans(
     ctx: &LintContext,
     line_position: SetOperatorLinePosition,
-) -> bool {
+) -> (bool, Vec<(usize, usize)>) {
     let tokens =
         tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
     let Some(tokens) = tokens else {
-        return false;
+        return (false, Vec::new());
     };
+    let sql = ctx.statement_sql();
 
     let significant_tokens: Vec<(usize, &TokenWithSpan)> = tokens
         .iter()
@@ -98,8 +119,10 @@ fn has_inconsistent_set_operator_layout(
         .iter()
         .any(|(_, token)| set_operator_keyword(&token.token).is_some());
     if !has_set_operator {
-        return false;
+        return (false, Vec::new());
     }
+    let mut has_violation = false;
+    let mut edit_spans = Vec::new();
 
     for (position, (_, token)) in significant_tokens.iter().enumerate() {
         let Some(keyword) = set_operator_keyword(&token.token) else {
@@ -137,11 +160,46 @@ fn has_inconsistent_set_operator_layout(
         };
 
         if placement_violation {
-            return true;
+            has_violation = true;
+        } else {
+            continue;
+        }
+
+        if !matches!(line_position, SetOperatorLinePosition::AloneStrict) {
+            continue;
+        }
+
+        if !line_break_before {
+            let Some(gap_start) = token_end_offset(sql, prev_token) else {
+                continue;
+            };
+            let Some(gap_end) = token_start_offset(sql, token) else {
+                continue;
+            };
+            if gap_start <= gap_end && gap_is_whitespace_only(sql, gap_start, gap_end) {
+                edit_spans.push((gap_start, gap_end));
+            }
+        }
+
+        if !line_break_after {
+            let Some((_, operator_end_token)) = significant_tokens.get(operator_end) else {
+                continue;
+            };
+            let Some(gap_start) = token_end_offset(sql, operator_end_token) else {
+                continue;
+            };
+            let Some(gap_end) = token_start_offset(sql, next_token) else {
+                continue;
+            };
+            if gap_start <= gap_end && gap_is_whitespace_only(sql, gap_start, gap_end) {
+                edit_spans.push((gap_start, gap_end));
+            }
         }
     }
 
-    false
+    edit_spans.sort_unstable();
+    edit_spans.dedup();
+    (has_violation, edit_spans)
 }
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
@@ -183,7 +241,7 @@ fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<TokenWithSpan>> {
 
             out.push(TokenWithSpan::new(
                 token.token.clone(),
-                Span::new(start_loc, end_loc),
+                TokenSpan::new(start_loc, end_loc),
             ));
         }
 
@@ -241,6 +299,30 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
     }
 
     None
+}
+
+fn token_start_offset(sql: &str, token: &TokenWithSpan) -> Option<usize> {
+    line_col_to_offset(
+        sql,
+        token.span.start.line as usize,
+        token.span.start.column as usize,
+    )
+}
+
+fn token_end_offset(sql: &str, token: &TokenWithSpan) -> Option<usize> {
+    line_col_to_offset(
+        sql,
+        token.span.end.line as usize,
+        token.span.end.column as usize,
+    )
+}
+
+fn gap_is_whitespace_only(sql: &str, start: usize, end: usize) -> bool {
+    if start > end || end > sql.len() {
+        return false;
+    }
+
+    sql[start..end].chars().all(char::is_whitespace)
 }
 
 fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
@@ -324,6 +406,7 @@ mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run_with_rule(sql: &str, rule: &LayoutSetOperators) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -347,11 +430,27 @@ mod tests {
         run_with_rule(sql, &LayoutSetOperators::default())
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_inline_set_operator_in_multiline_statement() {
-        let issues = run("SELECT 1 UNION SELECT 2\nUNION SELECT 3");
+        let sql = "SELECT 1 UNION SELECT 2\nUNION SELECT 3";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_011);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT 1\nUNION\nSELECT 2\nUNION\nSELECT 3");
     }
 
     #[test]
@@ -406,5 +505,18 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_011);
+    }
+
+    #[test]
+    fn inline_set_operator_with_comment_gap_preserves_comment() {
+        let sql = "SELECT 1 /* keep */ UNION SELECT 2";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_011);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert!(
+            fixed.contains("/* keep */"),
+            "LT011 autofix should preserve comment trivia: {fixed}"
+        );
     }
 }

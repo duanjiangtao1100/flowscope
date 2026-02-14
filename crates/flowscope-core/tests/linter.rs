@@ -126,8 +126,11 @@ fn lint_issues_appear_in_analyze_result() {
         .collect();
 
     assert!(!lint_issues.is_empty(), "expected lint issues in result");
-    assert_eq!(lint_issues[0].code, issue_codes::LINT_AM_002);
-    assert_eq!(lint_issues[0].severity, Severity::Warning);
+    let am002 = lint_issues
+        .iter()
+        .find(|issue| issue.code == issue_codes::LINT_AM_002)
+        .expect("expected AM002 lint issue in result");
+    assert_eq!(am002.severity, Severity::Warning);
 }
 
 #[test]

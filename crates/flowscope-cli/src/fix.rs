@@ -749,9 +749,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_011) {
-        out = fix_set_operator_layout(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_007) {
         out = fix_cte_bracket(&out, dialect);
     }
@@ -1967,50 +1964,6 @@ fn fix_long_lines(sql: &str) -> String {
         out.push_str(remaining);
     }
     out
-}
-
-fn fix_set_operator_layout(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-    let mut idx = 0usize;
-
-    while idx < tokens.len() {
-        if !token_matches_keyword(&tokens[idx].token, "UNION")
-            && !token_matches_keyword(&tokens[idx].token, "INTERSECT")
-            && !token_matches_keyword(&tokens[idx].token, "EXCEPT")
-        {
-            idx += 1;
-            continue;
-        }
-
-        let op_start = tokens[idx].start;
-        let mut op_end = tokens[idx].end;
-        if token_matches_keyword(&tokens[idx].token, "UNION") {
-            if let Some(all_idx) = next_non_trivia_token(&tokens, idx + 1) {
-                if token_matches_keyword(&tokens[all_idx].token, "ALL") {
-                    op_end = tokens[all_idx].end;
-                }
-            }
-        }
-
-        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
-            let gap_start = tokens[prev_idx].end;
-            if gap_start < op_start {
-                edits.push(SpanEdit::replace(gap_start, op_start, "\n"));
-            }
-        }
-        if let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) {
-            let gap_end = tokens[next_idx].start;
-            if op_end < gap_end {
-                edits.push(SpanEdit::replace(op_end, gap_end, "\n"));
-            }
-        }
-        idx += 1;
-    }
-
-    apply_span_edits(sql, edits)
 }
 
 fn fix_cte_bracket(sql: &str, dialect: Dialect) -> String {

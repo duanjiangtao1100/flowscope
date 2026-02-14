@@ -895,6 +895,31 @@ fn test_lint_fix_applies_lt010_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_lt011_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("set_operator_layout_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT 1 UNION SELECT 2\nUNION SELECT 3").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT 1\nUNION\nSELECT 2\nUNION\nSELECT 3\n",
+        "Expected LT011 core autofix to put set operators on their own line: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_lt015_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("layout_newlines_patch_fix.sql");

@@ -597,6 +597,29 @@ async fn lint_fix_applies_lt010_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt011_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1 UNION SELECT 2\nUNION SELECT 3"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1\nUNION\nSELECT 2\nUNION\nSELECT 3\n",
+        "expected LT011 core autofix to put set operators on their own line"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_lt015_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
