@@ -920,6 +920,62 @@ fn test_lint_fix_applies_lt011_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_lt007_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("cte_bracket_patch_fix.sql");
+    std::fs::write(&sql_path, "WITH cte AS (\n  SELECT 1)\nSELECT * FROM cte").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "WITH cte AS (\n  SELECT 1\n)\nSELECT * FROM cte\n",
+        "Expected LT007 core autofix to place CTE close bracket on its own line: {after:?}"
+    );
+}
+
+#[test]
+fn test_lint_fix_applies_lt009_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("select_target_layout_patch_fix.sql");
+    std::fs::write(&sql_path, "select\n  a,\n  b,\n  c from x").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--exclude-rules",
+            "LINT_LT_014",
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "select\n  a,\n  b,\n  c\nfrom x\n",
+        "Expected LT009 core autofix to place FROM on a new line after final target: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_lt008_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("cte_newline_patch_fix.sql");

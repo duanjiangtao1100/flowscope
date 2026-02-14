@@ -356,9 +356,6 @@ pub fn apply_lint_fixes_with_options(
         rewritten_sql = apply_am005_full_outer_keyword_fix(&rewritten_sql, &safe_rule_filter);
         rewritten_sql =
             apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
-        if fix_options.include_unsafe_fixes {
-            rewritten_sql = apply_post_cte_layout_fixes(&rewritten_sql, &safe_rule_filter, dialect);
-        }
 
         let mut rewrite_candidates = build_fix_candidates_from_rewrite(
             sql,
@@ -375,7 +372,6 @@ pub fn apply_lint_fixes_with_options(
             unsafe_sql = apply_text_fixes(&unsafe_sql, &rule_filter, dialect);
             unsafe_sql = apply_am005_full_outer_keyword_fix(&unsafe_sql, &rule_filter);
             unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
-            unsafe_sql = apply_post_cte_layout_fixes(&unsafe_sql, &rule_filter, dialect);
             if unsafe_sql != rewritten_sql {
                 rewrite_candidates.extend(build_fix_candidates_from_rewrite(
                     sql,
@@ -749,12 +745,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_007) {
-        out = fix_cte_bracket(&out, dialect);
-    }
-    if rule_filter.allows(issue_codes::LINT_LT_009) {
-        out = fix_select_target_newline(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_AL_005) {
         out = fix_unused_table_aliases(&out);
     }
@@ -823,14 +813,6 @@ fn apply_al001_alias_style_fix(
             preserve_original_table_alias_style(original_sql, fixed_sql, dialect)
         }
     }
-}
-
-fn apply_post_cte_layout_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
-    let mut out = sql.to_string();
-    if rule_filter.allows(issue_codes::LINT_LT_007) {
-        out = fix_cte_bracket(&out, dialect);
-    }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -1958,100 +1940,6 @@ fn fix_long_lines(sql: &str) -> String {
         out.push_str(remaining);
     }
     out
-}
-
-fn fix_cte_bracket(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for idx in 0..tokens.len() {
-        if !token_matches_keyword(&tokens[idx].token, "AS") {
-            continue;
-        }
-        let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) else {
-            continue;
-        };
-        if token_simple_identifier(&tokens[prev_idx].token).is_none() {
-            continue;
-        }
-        let Some(before_prev_idx) = prev_non_trivia_token(&tokens, prev_idx) else {
-            continue;
-        };
-        if !token_matches_keyword(&tokens[before_prev_idx].token, "WITH")
-            && !matches!(tokens[before_prev_idx].token, Token::Comma)
-        {
-            continue;
-        }
-        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
-            continue;
-        };
-        if !token_matches_keyword(&tokens[next_idx].token, "SELECT") {
-            continue;
-        }
-        edits.push(SpanEdit::replace(
-            tokens[next_idx].start,
-            tokens[next_idx].start,
-            "(",
-        ));
-    }
-
-    apply_span_edits(sql, edits)
-}
-
-fn fix_select_target_newline(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-    let mut i = 0usize;
-
-    while i < tokens.len() {
-        if !token_matches_keyword(&tokens[i].token, "SELECT") {
-            i += 1;
-            continue;
-        }
-
-        let mut depth = 0usize;
-        let mut comma_count = 0usize;
-        let mut from_idx = None;
-        let mut j = i + 1;
-        while j < tokens.len() {
-            if is_trivia_token(&tokens[j].token) {
-                j += 1;
-                continue;
-            }
-            match tokens[j].token {
-                Token::LParen => depth += 1,
-                Token::RParen => depth = depth.saturating_sub(1),
-                Token::Comma if depth == 0 => comma_count += 1,
-                Token::SemiColon if depth == 0 => break,
-                _ => {}
-            }
-            if depth == 0 && token_matches_keyword(&tokens[j].token, "FROM") {
-                from_idx = Some(j);
-                break;
-            }
-            j += 1;
-        }
-
-        if comma_count >= 4 {
-            if let Some(from_idx) = from_idx {
-                if let Some(prev_idx) = prev_non_trivia_token(&tokens, from_idx) {
-                    let gap_start = tokens[prev_idx].end;
-                    let gap_end = tokens[from_idx].start;
-                    if gap_start < gap_end {
-                        edits.push(SpanEdit::replace(gap_start, gap_end, "\n"));
-                    }
-                }
-            }
-        }
-
-        i += 1;
-    }
-
-    apply_span_edits(sql, edits)
 }
 
 fn fix_unused_table_aliases(sql: &str) -> String {

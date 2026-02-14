@@ -4,7 +4,7 @@
 //! bracket should appear on its own line.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{Query, Statement};
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
@@ -27,22 +27,32 @@ impl LintRule for LayoutCteBracket {
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let tokens = tokenize_with_offsets_for_context(ctx);
-        let has_violation =
-            has_misplaced_cte_closing_bracket_for_statement(statement, ctx, tokens.as_deref())
-                .unwrap_or_else(|| {
-                    has_misplaced_cte_closing_bracket(
-                        ctx.statement_sql(),
-                        ctx.dialect(),
-                        tokens.as_deref(),
-                    )
-                });
+        let violation = misplaced_cte_closing_bracket_for_statement(
+            statement,
+            ctx,
+            tokens.as_deref(),
+        )
+        .or_else(|| {
+            misplaced_cte_closing_bracket(ctx.statement_sql(), ctx.dialect(), tokens.as_deref())
+        });
 
-        if has_violation {
-            vec![Issue::warning(
+        if let Some(((start, end), fix_span)) = violation {
+            let mut issue = Issue::warning(
                 issue_codes::LINT_LT_007,
                 "CTE AS clause appears to be missing surrounding brackets.",
             )
-            .with_statement(ctx.statement_index)]
+            .with_statement(ctx.statement_index)
+            .with_span(ctx.span_from_statement_offset(start, end));
+            if let Some((fix_start, fix_end)) = fix_span {
+                issue = issue.with_autofix_edits(
+                    IssueAutofixApplicability::Safe,
+                    vec![IssuePatchEdit::new(
+                        ctx.span_from_statement_offset(fix_start, fix_end),
+                        "\n",
+                    )],
+                );
+            }
+            vec![issue]
         } else {
             Vec::new()
         }
@@ -58,25 +68,29 @@ struct LocatedToken {
     end_line: usize,
 }
 
-fn has_misplaced_cte_closing_bracket_for_statement(
+type Lt07Span = (usize, usize);
+type Lt07AutofixSpan = (usize, usize);
+type Lt07Violation = (Lt07Span, Option<Lt07AutofixSpan>);
+
+fn misplaced_cte_closing_bracket_for_statement(
     statement: &Statement,
     ctx: &LintContext,
     tokens: Option<&[LocatedToken]>,
-) -> Option<bool> {
+) -> Option<Lt07Violation> {
     let query = match statement {
         Statement::Query(query) => query.as_ref(),
         Statement::CreateView { query, .. } => query.as_ref(),
         _ => return None,
     };
 
-    has_misplaced_cte_closing_bracket_in_query(query, ctx, tokens)
+    misplaced_cte_closing_bracket_in_query(query, ctx, tokens)
 }
 
-fn has_misplaced_cte_closing_bracket_in_query(
+fn misplaced_cte_closing_bracket_in_query(
     query: &Query,
     ctx: &LintContext,
     tokens: Option<&[LocatedToken]>,
-) -> Option<bool> {
+) -> Option<Lt07Violation> {
     let with = query.with.as_ref()?;
     let sql = ctx.statement_sql();
     let owned_tokens;
@@ -86,8 +100,6 @@ fn has_misplaced_cte_closing_bracket_in_query(
         owned_tokens = tokenize_with_offsets(sql, ctx.dialect())?;
         &owned_tokens
     };
-
-    let mut evaluated_any = false;
 
     for cte in &with.cte_tables {
         let Some(close_abs) = token_start_offset(ctx.sql, &cte.closing_paren_token.0) else {
@@ -107,24 +119,23 @@ fn has_misplaced_cte_closing_bracket_in_query(
             continue;
         };
 
-        evaluated_any = true;
-
         let body_end = tokens[close_idx].start;
         if body_end > sql.len() {
             continue;
         }
-        if cte_body_has_line_break(tokens, sql, open_idx, close_idx)
-            && has_non_spacing_tokens_before_on_same_line(tokens, close_idx)
-        {
-            return Some(true);
+        if !cte_body_has_line_break(tokens, sql, open_idx, close_idx) {
+            continue;
         }
+        let Some(prev_idx) = last_non_spacing_token_before_on_same_line(tokens, close_idx) else {
+            continue;
+        };
+
+        let report_span = (tokens[close_idx].start, tokens[close_idx].end);
+        let fix_span = safe_newline_fix_span(sql, tokens, prev_idx, close_idx);
+        return Some((report_span, fix_span));
     }
 
-    if evaluated_any {
-        Some(false)
-    } else {
-        None
-    }
+    None
 }
 
 fn matching_open_paren_index(tokens: &[LocatedToken], close_idx: usize) -> Option<usize> {
@@ -334,31 +345,28 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
     None
 }
 
-fn has_misplaced_cte_closing_bracket(
+fn misplaced_cte_closing_bracket(
     sql: &str,
     dialect: Dialect,
     tokens: Option<&[LocatedToken]>,
-) -> bool {
+) -> Option<Lt07Violation> {
     let owned_tokens;
     let tokens = if let Some(tokens) = tokens {
         tokens
     } else {
-        owned_tokens = match tokenize_with_offsets(sql, dialect) {
-            Some(tokens) => tokens,
-            None => return false,
-        };
+        owned_tokens = tokenize_with_offsets(sql, dialect)?;
         &owned_tokens
     };
 
     if tokens.is_empty() {
-        return false;
+        return None;
     }
 
     let has_with = tokens
         .iter()
         .any(|token| matches!(token.token, Token::Word(ref word) if word.keyword == Keyword::WITH));
     if !has_with {
-        return false;
+        return None;
     }
 
     let mut index = 0usize;
@@ -382,15 +390,18 @@ fn has_misplaced_cte_closing_bracket(
         if body_start < body_end
             && body_end <= sql.len()
             && cte_body_has_line_break(tokens, sql, open_idx, close_idx)
-            && has_non_spacing_tokens_before_on_same_line(tokens, close_idx)
         {
-            return true;
+            if let Some(prev_idx) = last_non_spacing_token_before_on_same_line(tokens, close_idx) {
+                let report_span = (tokens[close_idx].start, tokens[close_idx].end);
+                let fix_span = safe_newline_fix_span(sql, tokens, prev_idx, close_idx);
+                return Some((report_span, fix_span));
+            }
         }
 
         index = close_idx + 1;
     }
 
-    false
+    None
 }
 
 fn cte_body_has_line_break(
@@ -410,13 +421,14 @@ fn cte_body_has_line_break(
         .any(|token| token.end <= sql.len() && count_line_breaks(&sql[token.start..token.end]) > 0)
 }
 
-fn has_non_spacing_tokens_before_on_same_line(tokens: &[LocatedToken], close_idx: usize) -> bool {
-    let Some(close) = tokens.get(close_idx) else {
-        return false;
-    };
+fn last_non_spacing_token_before_on_same_line(
+    tokens: &[LocatedToken],
+    close_idx: usize,
+) -> Option<usize> {
+    let close = tokens.get(close_idx)?;
     let line = close.start_line;
 
-    for token in tokens[..close_idx].iter().rev() {
+    for (index, token) in tokens[..close_idx].iter().enumerate().rev() {
         if token.end_line < line {
             break;
         }
@@ -426,10 +438,35 @@ fn has_non_spacing_tokens_before_on_same_line(tokens: &[LocatedToken], close_idx
         if is_spacing_whitespace(&token.token) {
             continue;
         }
-        return true;
+        return Some(index);
     }
 
-    false
+    None
+}
+
+fn safe_newline_fix_span(
+    sql: &str,
+    tokens: &[LocatedToken],
+    prev_idx: usize,
+    close_idx: usize,
+) -> Option<Lt07AutofixSpan> {
+    let gap_start = tokens.get(prev_idx)?.end;
+    let gap_end = tokens.get(close_idx)?.start;
+    if gap_start > gap_end || gap_end > sql.len() {
+        return None;
+    }
+
+    let gap = &sql[gap_start..gap_end];
+    if gap.chars().all(char::is_whitespace) && !gap.contains('\n') && !gap.contains('\r') {
+        Some((gap_start, gap_end))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn has_misplaced_cte_closing_bracket(sql: &str, dialect: Dialect) -> bool {
+    misplaced_cte_closing_bracket(sql, dialect, None).is_some()
 }
 
 fn find_next_as_keyword(tokens: &[LocatedToken], mut index: usize) -> Option<usize> {
@@ -515,6 +552,7 @@ fn count_line_breaks(text: &str) -> usize {
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -535,11 +573,30 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_closing_paren_after_sql_code_in_multiline_cte() {
-        let issues = run("with cte_1 as (\n    select foo\n    from tbl_1) select * from cte_1");
+        let sql = "with cte_1 as (\n    select foo\n    from tbl_1)\nselect * from cte_1";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_007);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "with cte_1 as (\n    select foo\n    from tbl_1\n)\nselect * from cte_1"
+        );
     }
 
     #[test]
@@ -557,11 +614,7 @@ mod tests {
     fn flags_templated_close_paren_on_same_line_as_cte_body_code() {
         let sql =
             "with\n{% if true %}\n  cte as (\n      select 1)\n{% endif %}\nselect * from cte";
-        assert!(has_misplaced_cte_closing_bracket(
-            sql,
-            Dialect::Generic,
-            None
-        ));
+        assert!(has_misplaced_cte_closing_bracket(sql, Dialect::Generic));
     }
 
     #[test]
@@ -570,5 +623,10 @@ mod tests {
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_007);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "WITH cte AS (\n  SELECT 1 /* trailing comment */\n)\nSELECT * FROM cte"
+        );
     }
 }

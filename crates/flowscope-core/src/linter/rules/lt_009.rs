@@ -6,7 +6,7 @@
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::rules::semantic_helpers::visit_selects_in_statement;
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{SelectItem, Statement};
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer};
@@ -67,13 +67,23 @@ impl LintRule for LayoutSelectTargets {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         lt09_violation_spans(statement, ctx, self.wildcard_policy)
             .into_iter()
-            .map(|(start, end)| {
-                Issue::info(
+            .map(|((start, end), fix_span)| {
+                let mut issue = Issue::info(
                     issue_codes::LINT_LT_009,
                     "Select targets should be on a new line unless there is only one target.",
                 )
                 .with_statement(ctx.statement_index)
-                .with_span(ctx.span_from_statement_offset(start, end))
+                .with_span(ctx.span_from_statement_offset(start, end));
+                if let Some((fix_start, fix_end)) = fix_span {
+                    issue = issue.with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        vec![IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(fix_start, fix_end),
+                            "\n",
+                        )],
+                    );
+                }
+                issue
             })
             .collect()
     }
@@ -92,11 +102,15 @@ struct SelectClauseLayout {
     target_ranges: Vec<(usize, usize)>,
 }
 
+type Lt09Span = (usize, usize);
+type Lt09AutofixSpan = (usize, usize);
+type Lt09Violation = (Lt09Span, Option<Lt09AutofixSpan>);
+
 fn lt09_violation_spans(
     statement: &Statement,
     ctx: &LintContext,
     wildcard_policy: WildcardPolicy,
-) -> Vec<(usize, usize)> {
+) -> Vec<Lt09Violation> {
     let sql = ctx.statement_sql();
     let tokens = tokenized_for_context(ctx).or_else(|| tokenized(sql, ctx.dialect()));
     let Some(tokens) = tokens else {
@@ -141,22 +155,16 @@ fn lt09_violation_spans(
         }
 
         let token = &tokens[layout.select_idx];
-        let Some(start) = line_col_to_offset(
-            sql,
-            token.span.start.line as usize,
-            token.span.start.column as usize,
-        ) else {
+        let Some((start, end)) = token_with_span_offsets(sql, token) else {
             continue;
         };
-        let Some(end) = line_col_to_offset(
-            sql,
-            token.span.end.line as usize,
-            token.span.end.column as usize,
-        ) else {
-            continue;
+        let fix_span = if is_single_target {
+            None
+        } else {
+            safe_from_newline_fix_span(sql, &tokens, layout)
         };
 
-        spans.push((start, end));
+        spans.push(((start, end), fix_span));
     }
 
     spans
@@ -463,6 +471,64 @@ fn multiple_target_layout_violation(layout: &SelectClauseLayout, tokens: &[Token
     false
 }
 
+fn safe_from_newline_fix_span(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    layout: &SelectClauseLayout,
+) -> Option<Lt09AutofixSpan> {
+    let from_idx = layout.from_idx?;
+    if !only_from_shares_last_target_line_violation(layout, tokens) {
+        return None;
+    }
+
+    let (_, last_target_end_idx) = *layout.target_ranges.last()?;
+    if last_target_end_idx == 0 {
+        return None;
+    }
+    let last_token_idx = last_target_end_idx - 1;
+
+    let (_, gap_start) = token_with_span_offsets(sql, &tokens[last_token_idx])?;
+    let (gap_end, _) = token_with_span_offsets(sql, &tokens[from_idx])?;
+    if gap_start > gap_end || gap_end > sql.len() {
+        return None;
+    }
+
+    let gap = &sql[gap_start..gap_end];
+    if gap.chars().all(char::is_whitespace) && !gap.contains('\n') && !gap.contains('\r') {
+        Some((gap_start, gap_end))
+    } else {
+        None
+    }
+}
+
+fn only_from_shares_last_target_line_violation(
+    layout: &SelectClauseLayout,
+    tokens: &[TokenWithSpan],
+) -> bool {
+    let Some(from_idx) = layout.from_idx else {
+        return false;
+    };
+    let Some((last_start_idx, _)) = layout.target_ranges.last().copied() else {
+        return false;
+    };
+
+    let last_target_line = tokens[last_start_idx].span.start.line;
+    if tokens[from_idx].span.start.line != last_target_line {
+        return false;
+    }
+
+    for (target_start, _) in &layout.target_ranges {
+        let target_line = tokens[*target_start].span.start.line;
+        if last_code_line_before(tokens, layout.select_idx, *target_start)
+            .is_some_and(|prev_line| prev_line == target_line)
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
     if line == 0 || column == 0 {
         return None;
@@ -572,6 +638,7 @@ mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run_with_rule(sql: &str, rule: &LayoutSelectTargets) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -606,6 +673,17 @@ mod tests {
         };
         let rule = LayoutSelectTargets::from_config(&config);
         run_with_rule(sql, &rule)
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -675,7 +753,23 @@ mod tests {
     #[test]
     fn flags_last_multi_target_sharing_line_with_from() {
         let sql = "select\n  a,\n  b,\n  c from x";
-        assert!(!run(sql).is_empty());
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "select\n  a,\n  b,\n  c\nfrom x");
+    }
+
+    #[test]
+    fn dense_multi_target_layout_violation_remains_report_only() {
+        let sql = "SELECT a,b,c,d,e FROM t";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        assert!(
+            issues[0].autofix.is_none(),
+            "dense same-line target violations remain report-only in conservative LT009 migration"
+        );
     }
 
     #[test]

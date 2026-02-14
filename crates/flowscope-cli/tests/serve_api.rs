@@ -620,6 +620,53 @@ async fn lint_fix_applies_lt011_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt007_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "WITH cte AS (\n  SELECT 1)\nSELECT * FROM cte"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "WITH cte AS (\n  SELECT 1\n)\nSELECT * FROM cte\n",
+        "expected LT007 core autofix to place CTE close bracket on its own line"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_applies_lt009_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "select\n  a,\n  b,\n  c from x",
+            "disabled_rules": ["LINT_LT_014"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "select\n  a,\n  b,\n  c\nfrom x\n",
+        "expected LT009 core autofix to place FROM on a new line after final target"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_lt008_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
