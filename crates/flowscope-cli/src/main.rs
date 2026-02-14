@@ -37,6 +37,7 @@ const EXIT_CONFIG_ERROR: u8 = 66;
 struct LintFixRuntimeOptions {
     include_unsafe_fixes: bool,
     show_fixes: bool,
+    legacy_ast_fixes: bool,
 }
 
 impl LintFixRuntimeOptions {
@@ -44,6 +45,7 @@ impl LintFixRuntimeOptions {
         Self {
             include_unsafe_fixes: args.unsafe_fixes,
             show_fixes: args.show_fixes,
+            legacy_ast_fixes: args.legacy_ast_fixes,
         }
     }
 }
@@ -87,6 +89,7 @@ fn apply_lint_fixes_with_runtime_options(
         lint_config,
         FixOptions {
             include_unsafe_fixes: runtime_options.include_unsafe_fixes,
+            include_rewrite_candidates: runtime_options.legacy_ast_fixes,
         },
     )?;
     let candidate_stats = collect_fix_candidate_stats(&outcome, runtime_options);

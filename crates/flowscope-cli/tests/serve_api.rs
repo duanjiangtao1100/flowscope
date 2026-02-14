@@ -242,7 +242,10 @@ async fn lint_fix_applies_safe_fix_and_reports_counts() {
     assert!(json["fix_counts"]["total"].as_u64().unwrap() > 0);
 
     let fixed_sql = json["sql"].as_str().unwrap().to_ascii_uppercase();
-    assert!(fixed_sql.contains("COUNT(*)"), "fixed SQL was: {fixed_sql}");
+    assert!(
+        fixed_sql.contains("COUNT(*)") || fixed_sql.contains("COUNT (*)"),
+        "fixed SQL was: {fixed_sql}"
+    );
 }
 
 #[tokio::test]
@@ -256,7 +259,8 @@ async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
         "/api/lint-fix",
         json!({
             "sql": sql,
-            "unsafe_fixes": false
+            "unsafe_fixes": false,
+            "legacy_ast_fixes": true
         }),
     )
     .await;
@@ -265,7 +269,8 @@ async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
         "/api/lint-fix",
         json!({
             "sql": sql,
-            "unsafe_fixes": true
+            "unsafe_fixes": true,
+            "legacy_ast_fixes": true
         }),
     )
     .await;
@@ -282,7 +287,7 @@ async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     );
     assert!(
         unsafe_sql.contains("WITH SUB AS"),
-        "unsafe mode should apply ST_005 rewrite: {unsafe_sql}"
+        "unsafe mode with legacy AST rewrites should apply ST_005 rewrite: {unsafe_sql}"
     );
     assert!(
         safe_json["skipped_counts"]["unsafe_skipped"]
@@ -291,6 +296,30 @@ async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
             > 0
     );
     assert_eq!(unsafe_json["skipped_counts"]["unsafe_skipped"], 0);
+}
+
+#[tokio::test]
+async fn lint_fix_unsafe_without_legacy_ast_rewrites_keeps_st05_shape() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+    let sql = "SELECT * FROM (SELECT 1) sub";
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql,
+            "unsafe_fixes": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let fixed_sql = json["sql"].as_str().unwrap().to_ascii_uppercase();
+    assert!(
+        !fixed_sql.contains("WITH SUB AS"),
+        "unsafe patch mode without legacy AST rewrites should not emit ST_005 CTE rewrite: {fixed_sql}"
+    );
 }
 
 #[tokio::test]
@@ -333,6 +362,7 @@ async fn lint_fix_respects_disabled_rules() {
         json!({
             "sql": "SELECT * FROM (SELECT 1) sub",
             "unsafe_fixes": true,
+            "legacy_ast_fixes": true,
             "disabled_rules": ["LINT_ST_005"]
         }),
     )

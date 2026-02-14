@@ -65,6 +65,10 @@ pub struct Args {
     #[arg(long, requires_all = ["lint", "fix"])]
     pub unsafe_fixes: bool,
 
+    /// Enable legacy AST-based lint rewrites (opt-in; defaults to off)
+    #[arg(long, requires_all = ["lint", "fix"])]
+    pub legacy_ast_fixes: bool,
+
     /// Show blocked/display-only fix candidates in lint mode (requires --lint)
     #[arg(long, requires = "lint")]
     pub show_fixes: bool,
@@ -279,6 +283,7 @@ mod tests {
         assert!(args.lint);
         assert!(!args.fix);
         assert!(!args.unsafe_fixes);
+        assert!(!args.legacy_ast_fixes);
         assert!(!args.show_fixes);
         assert!(args.exclude_rules.is_empty());
         assert!(args.rule_configs.is_none());
@@ -290,6 +295,7 @@ mod tests {
         assert!(args.lint);
         assert!(args.fix);
         assert!(!args.unsafe_fixes);
+        assert!(!args.legacy_ast_fixes);
         assert!(!args.show_fixes);
     }
 
@@ -314,6 +320,30 @@ mod tests {
 
         let missing_fix =
             Args::try_parse_from(["flowscope", "--lint", "--unsafe-fixes", "test.sql"]);
+        assert!(missing_fix.is_err());
+    }
+
+    #[test]
+    fn test_legacy_ast_fixes_flag() {
+        let args = Args::parse_from([
+            "flowscope",
+            "--lint",
+            "--fix",
+            "--legacy-ast-fixes",
+            "test.sql",
+        ]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(args.legacy_ast_fixes);
+    }
+
+    #[test]
+    fn test_legacy_ast_fixes_requires_lint_and_fix() {
+        let missing_both = Args::try_parse_from(["flowscope", "--legacy-ast-fixes", "test.sql"]);
+        assert!(missing_both.is_err());
+
+        let missing_fix =
+            Args::try_parse_from(["flowscope", "--lint", "--legacy-ast-fixes", "test.sql"]);
         assert!(missing_fix.is_err());
     }
 

@@ -674,7 +674,7 @@ fn test_lint_fix_default_safe_mode_skips_unsafe_or_display_only_candidates() {
 }
 
 #[test]
-fn test_lint_unsafe_fixes_enables_additional_fixes_over_safe_mode() {
+fn test_lint_unsafe_fixes_with_legacy_ast_rewrites_enables_additional_fixes_over_safe_mode() {
     let dir = tempdir().expect("temp dir");
     let safe_path = dir.path().join("safe_mode.sql");
     let unsafe_path = dir.path().join("unsafe_mode.sql");
@@ -693,9 +693,11 @@ fn test_lint_unsafe_fixes_enables_additional_fixes_over_safe_mode() {
         "--lint",
         "--fix",
         "--unsafe-fixes",
+        "--legacy-ast-fixes",
         unsafe_path.to_str().expect("unsafe path"),
     ]);
     assert_flag_was_accepted(&unsafe_output, "--unsafe-fixes");
+    assert_flag_was_accepted(&unsafe_output, "--legacy-ast-fixes");
 
     let safe_codes = lint_violation_codes(&safe_path);
     let unsafe_codes = lint_violation_codes(&unsafe_path);
@@ -705,11 +707,38 @@ fn test_lint_unsafe_fixes_enables_additional_fixes_over_safe_mode() {
     );
     assert!(
         !unsafe_codes.iter().any(|code| code == "ST05"),
-        "Expected --unsafe-fixes to apply additional structural rewrites and clear ST05. unsafe={unsafe_codes:?}"
+        "Expected --unsafe-fixes --legacy-ast-fixes to apply additional structural rewrites and clear ST05. unsafe={unsafe_codes:?}"
     );
     assert!(
         unsafe_codes != safe_codes,
-        "Expected --unsafe-fixes to produce a different lint outcome than safe mode. safe={safe_codes:?}, unsafe={unsafe_codes:?}"
+        "Expected --unsafe-fixes --legacy-ast-fixes to produce a different lint outcome than safe mode. safe={safe_codes:?}, unsafe={unsafe_codes:?}"
+    );
+}
+
+#[test]
+fn test_lint_unsafe_fixes_without_legacy_ast_rewrites_keeps_st05() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("unsafe_without_legacy.sql");
+    std::fs::write(&sql_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("write sql");
+
+    let output = run_flowscope(&[
+        "--lint",
+        "--fix",
+        "--unsafe-fixes",
+        sql_path.to_str().expect("sql path"),
+    ]);
+    assert_flag_was_accepted(&output, "--unsafe-fixes");
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected run to execute without clap/parser failure: {}",
+        combined_output(&output)
+    );
+
+    let codes = lint_violation_codes(&sql_path);
+    assert!(
+        codes.iter().any(|code| code == "ST05"),
+        "Expected ST05 to remain unless --legacy-ast-fixes is enabled: {codes:?}"
     );
 }
 

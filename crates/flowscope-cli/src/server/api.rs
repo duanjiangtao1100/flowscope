@@ -84,6 +84,8 @@ struct LintFixRequest {
     sql: String,
     #[serde(default, alias = "include_unsafe_fixes")]
     unsafe_fixes: bool,
+    #[serde(default, alias = "legacyAstFixes")]
+    legacy_ast_fixes: bool,
     #[serde(default, alias = "exclude_rules")]
     disabled_rules: Vec<String>,
     #[serde(default)]
@@ -213,6 +215,7 @@ async fn lint_fix(
         &lint_config,
         crate::fix::FixOptions {
             include_unsafe_fixes: payload.unsafe_fixes,
+            include_rewrite_candidates: payload.legacy_ast_fixes,
         },
     )
     .map_err(|err| {

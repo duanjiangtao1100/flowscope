@@ -75,10 +75,20 @@ pub struct FixSkippedCounts {
     pub display_only: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 #[must_use]
 pub struct FixOptions {
     pub include_unsafe_fixes: bool,
+    pub include_rewrite_candidates: bool,
+}
+
+impl Default for FixOptions {
+    fn default() -> Self {
+        Self {
+            include_unsafe_fixes: false,
+            include_rewrite_candidates: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -312,6 +322,7 @@ pub fn apply_lint_fixes_with_lint_config(
         FixOptions {
             // Preserve existing behavior for direct/internal callers.
             include_unsafe_fixes: true,
+            include_rewrite_candidates: true,
         },
     )
 }
@@ -323,57 +334,65 @@ pub fn apply_lint_fixes_with_options(
     fix_options: FixOptions,
 ) -> Result<FixOutcome, ParseError> {
     let rule_filter = RuleFilter::from_lint_config(lint_config);
-    let safe_rule_filter = if fix_options.include_unsafe_fixes {
-        rule_filter.clone()
-    } else {
-        // Structural subquery-to-CTE rewrites are useful but higher risk and
-        // therefore opt-in under `--unsafe-fixes`.
-        rule_filter.with_rule_disabled(issue_codes::LINT_ST_005)
-    };
 
     let before_issues = lint_issues(sql, dialect, lint_config);
     let before_counts = lint_rule_counts_from_issues(&before_issues);
-    let mut statements = parse_sql_with_dialect(sql, dialect)?;
-    for stmt in &mut statements {
-        fix_statement(stmt, &safe_rule_filter);
-    }
-
-    let mut rewritten_sql = render_statements(&statements, sql);
-    rewritten_sql = apply_text_fixes(&rewritten_sql, &safe_rule_filter, dialect);
-    rewritten_sql = apply_am005_full_outer_keyword_fix(&rewritten_sql, &safe_rule_filter);
-    rewritten_sql = apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
-    if fix_options.include_unsafe_fixes {
-        rewritten_sql = apply_post_cte_layout_fixes(&rewritten_sql, &safe_rule_filter, dialect);
-    }
-
     let core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
+    let mut candidates = Vec::new();
 
-    let mut candidates = build_fix_candidates_from_rewrite(
-        sql,
-        &rewritten_sql,
-        FixCandidateApplicability::Safe,
-        FixCandidateSource::PrimaryRewrite,
-    );
-    candidates.extend(core_candidates.iter().cloned());
-    if !fix_options.include_unsafe_fixes {
-        let mut unsafe_statements = parse_sql_with_dialect(sql, dialect)?;
-        for stmt in &mut unsafe_statements {
-            fix_statement(stmt, &rule_filter);
+    if fix_options.include_rewrite_candidates {
+        let safe_rule_filter = if fix_options.include_unsafe_fixes {
+            rule_filter.clone()
+        } else {
+            // Structural subquery-to-CTE rewrites are useful but higher risk and
+            // therefore opt-in under `--unsafe-fixes`.
+            rule_filter.with_rule_disabled(issue_codes::LINT_ST_005)
+        };
+
+        let mut statements = parse_sql_with_dialect(sql, dialect)?;
+        for stmt in &mut statements {
+            fix_statement(stmt, &safe_rule_filter);
         }
-        let mut unsafe_sql = render_statements(&unsafe_statements, sql);
-        unsafe_sql = apply_text_fixes(&unsafe_sql, &rule_filter, dialect);
-        unsafe_sql = apply_am005_full_outer_keyword_fix(&unsafe_sql, &rule_filter);
-        unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
-        unsafe_sql = apply_post_cte_layout_fixes(&unsafe_sql, &rule_filter, dialect);
-        if unsafe_sql != rewritten_sql {
-            candidates.extend(build_fix_candidates_from_rewrite(
-                sql,
-                &unsafe_sql,
-                FixCandidateApplicability::Unsafe,
-                FixCandidateSource::UnsafeFallback,
-            ));
+
+        let mut rewritten_sql = render_statements(&statements, sql);
+        rewritten_sql = apply_text_fixes(&rewritten_sql, &safe_rule_filter, dialect);
+        rewritten_sql = apply_am005_full_outer_keyword_fix(&rewritten_sql, &safe_rule_filter);
+        rewritten_sql =
+            apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
+        if fix_options.include_unsafe_fixes {
+            rewritten_sql = apply_post_cte_layout_fixes(&rewritten_sql, &safe_rule_filter, dialect);
         }
+
+        let mut rewrite_candidates = build_fix_candidates_from_rewrite(
+            sql,
+            &rewritten_sql,
+            FixCandidateApplicability::Safe,
+            FixCandidateSource::PrimaryRewrite,
+        );
+        if !fix_options.include_unsafe_fixes {
+            let mut unsafe_statements = parse_sql_with_dialect(sql, dialect)?;
+            for stmt in &mut unsafe_statements {
+                fix_statement(stmt, &rule_filter);
+            }
+            let mut unsafe_sql = render_statements(&unsafe_statements, sql);
+            unsafe_sql = apply_text_fixes(&unsafe_sql, &rule_filter, dialect);
+            unsafe_sql = apply_am005_full_outer_keyword_fix(&unsafe_sql, &rule_filter);
+            unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
+            unsafe_sql = apply_post_cte_layout_fixes(&unsafe_sql, &rule_filter, dialect);
+            if unsafe_sql != rewritten_sql {
+                rewrite_candidates.extend(build_fix_candidates_from_rewrite(
+                    sql,
+                    &unsafe_sql,
+                    FixCandidateApplicability::Unsafe,
+                    FixCandidateSource::UnsafeFallback,
+                ));
+            }
+        }
+
+        candidates.extend(rewrite_candidates);
     }
+
+    candidates.extend(core_candidates.iter().cloned());
 
     let protected_ranges =
         collect_comment_protected_ranges(sql, dialect, !fix_options.include_unsafe_fixes);
@@ -7076,6 +7095,7 @@ mod tests {
             &default_lint_config(),
             FixOptions {
                 include_unsafe_fixes: false,
+                include_rewrite_candidates: true,
             },
         )
         .expect("fix result");
@@ -7105,6 +7125,7 @@ mod tests {
             &default_lint_config(),
             FixOptions {
                 include_unsafe_fixes: true,
+                include_rewrite_candidates: true,
             },
         )
         .expect("fix result");

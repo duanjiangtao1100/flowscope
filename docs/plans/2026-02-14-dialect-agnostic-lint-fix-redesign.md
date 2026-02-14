@@ -14,6 +14,8 @@ Status (2026-02-14): implemented in `flowscope-cli` with safe/unsafe applicabili
 
 Status update (2026-02-14, later): core lint diagnostics now carry first-class autofix metadata (`Issue.autofix`), CV001/CV004 emit precise safe patch edits, CLI fix planning consumes core autofix candidates, and fallback planning applies core-only fixes when mixed rewrite candidates regress.
 
+Status update (2026-02-14, latest): CLI/API default fix path is patch-only; legacy AST rewrite candidates are opt-in via `--legacy-ast-fixes` (CLI) and `legacy_ast_fixes` (`/api/lint-fix`).
+
 ## Problem Statement
 
 Legacy behavior (before this redesign) intentionally skipped comment-containing files to avoid losing comments during AST render.
@@ -123,6 +125,7 @@ CLI:
 
 - `--fix`: apply `Safe` fixes only.
 - `--unsafe-fixes`: include `Unsafe` fixes.
+- `--legacy-ast-fixes`: opt into legacy AST rewrite candidates.
 - `--show-fixes`: show blocked/display-only fix suggestions.
 
 LSP:
@@ -139,7 +142,7 @@ Current completion snapshot:
 - Phase 2: complete for applicability plumbing (`Safe`/`Unsafe`/`DisplayOnly`) and CLI reporting of skipped/blocked counts.
 - Phase 3: validated on existing multi-dialect core fixture matrix (`cargo test -p flowscope-core`), with migrated rules exercised through parser/token adapters.
 - Phase 4: protected template/comment/string ranges enforced in planner; safe mode blocks unstable template edits.
-- Phase 5: in progress overall; AST-based rewrites still exist for non-migrated rules, but comment-file global skip is removed and migrated rules are patch-safe by default.
+- Phase 5: complete for default execution path (patch-only in CLI/API), with legacy AST rewrites retained as explicit opt-in for non-migrated parity rules.
 
 ## Phase 0: Foundations
 
