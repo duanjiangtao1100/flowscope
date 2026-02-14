@@ -647,7 +647,7 @@ fn collect_core_autofix_rules(issues: &[Issue], allow_unsafe: bool) -> HashSet<S
                 IssueAutofixApplicability::Unsafe => allow_unsafe,
                 IssueAutofixApplicability::DisplayOnly => false,
             };
-            if applicable {
+            if applicable && core_autofix_conflict_priority(Some(issue.code.as_str())) == 0 {
                 Some(issue.code.clone())
             } else {
                 None
@@ -766,9 +766,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     }
     if rule_filter.allows(issue_codes::LINT_LT_010) {
         out = fix_select_modifier_position(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_LT_014) {
-        out = fix_keyword_newlines(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_AL_005) {
         out = fix_unused_table_aliases(&out);
@@ -976,14 +973,27 @@ enum FixCandidateSource {
     DisplayHint,
 }
 
-impl FixCandidateSource {
-    fn sort_key(self) -> u8 {
-        match self {
-            Self::CoreAutofix => 0,
-            Self::PrimaryRewrite => 1,
-            Self::UnsafeFallback => 2,
-            Self::DisplayHint => 3,
-        }
+fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
+    let Some(code) = rule_code else {
+        return 2;
+    };
+
+    if code.eq_ignore_ascii_case(issue_codes::LINT_CV_001)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_002)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_003)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_004)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_005)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_006)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_012)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_013)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
+    {
+        0
+    } else {
+        2
     }
 }
 
@@ -994,6 +1004,18 @@ struct FixCandidate {
     replacement: String,
     applicability: FixCandidateApplicability,
     source: FixCandidateSource,
+    rule_code: Option<String>,
+}
+
+fn fix_candidate_source_priority(candidate: &FixCandidate) -> u8 {
+    match candidate.source {
+        FixCandidateSource::CoreAutofix => {
+            core_autofix_conflict_priority(candidate.rule_code.as_deref())
+        }
+        FixCandidateSource::PrimaryRewrite => 1,
+        FixCandidateSource::UnsafeFallback => 3,
+        FixCandidateSource::DisplayHint => 4,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1020,6 +1042,7 @@ fn build_fix_candidates_from_rewrite(
             replacement: edit.replacement,
             applicability,
             source,
+            rule_code: None,
         })
         .collect::<Vec<_>>();
 
@@ -1030,6 +1053,7 @@ fn build_fix_candidates_from_rewrite(
             replacement: rewritten_sql.to_string(),
             applicability,
             source,
+            rule_code: None,
         });
     }
 
@@ -1053,10 +1077,21 @@ fn build_fix_candidates_from_issue_values(
 
     for issue in issue_values {
         let fallback_span = issue.get("span").and_then(json_span_offsets);
+        let issue_rule_code = issue
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .map(|code| code.to_string());
         let Some(autofix) = issue.get("autofix").or_else(|| issue.get("autoFix")) else {
             continue;
         };
-        collect_issue_autofix_candidates(autofix, fallback_span, sql_len, None, &mut candidates);
+        collect_issue_autofix_candidates(
+            autofix,
+            fallback_span,
+            sql_len,
+            None,
+            &issue_rule_code,
+            &mut candidates,
+        );
     }
 
     candidates
@@ -1067,6 +1102,7 @@ fn collect_issue_autofix_candidates(
     fallback_span: Option<(usize, usize)>,
     sql_len: usize,
     inherited_applicability: Option<FixCandidateApplicability>,
+    issue_rule_code: &Option<String>,
     out: &mut Vec<FixCandidate>,
 ) {
     match value {
@@ -1077,6 +1113,7 @@ fn collect_issue_autofix_candidates(
                     fallback_span,
                     sql_len,
                     inherited_applicability,
+                    issue_rule_code,
                     out,
                 );
             }
@@ -1092,6 +1129,7 @@ fn collect_issue_autofix_candidates(
                     fallback_span,
                     sql_len,
                     Some(applicability),
+                    issue_rule_code,
                     out,
                 );
             }
@@ -1105,6 +1143,7 @@ fn collect_issue_autofix_candidates(
                     fallback_span,
                     sql_len,
                     Some(applicability),
+                    issue_rule_code,
                     out,
                 );
             }
@@ -1135,6 +1174,7 @@ fn collect_issue_autofix_candidates(
                         replacement,
                         applicability,
                         source: FixCandidateSource::CoreAutofix,
+                        rule_code: issue_rule_code.clone(),
                     });
                 }
             }
@@ -1250,7 +1290,10 @@ fn plan_fix_candidates(
                     .sort_key()
                     .cmp(&right.applicability.sort_key())
             })
-            .then_with(|| left.source.sort_key().cmp(&right.source.sort_key()))
+            .then_with(|| {
+                fix_candidate_source_priority(left).cmp(&fix_candidate_source_priority(right))
+            })
+            .then_with(|| left.rule_code.cmp(&right.rule_code))
             .then_with(|| left.replacement.cmp(&right.replacement))
     });
     candidates.dedup_by(|left, right| {
@@ -1259,12 +1302,14 @@ fn plan_fix_candidates(
             && left.replacement == right.replacement
             && left.applicability == right.applicability
             && left.source == right.source
+            && left.rule_code == right.rule_code
     });
 
     let patch_fixes: Vec<PatchFix> = candidates
         .into_iter()
         .enumerate()
         .map(|(idx, candidate)| {
+            let source_priority = fix_candidate_source_priority(&candidate);
             let mut fix = PatchFix::new(
                 format!("PATCH_{:?}_{idx}", candidate.source),
                 patch_applicability(candidate.applicability),
@@ -1274,7 +1319,7 @@ fn plan_fix_candidates(
                     candidate.replacement,
                 )],
             );
-            fix.priority = candidate.source.sort_key() as i32;
+            fix.priority = source_priority as i32;
             fix
         })
         .collect();
@@ -2129,36 +2174,6 @@ fn fix_select_target_newline(sql: &str, dialect: Dialect) -> String {
         }
 
         i += 1;
-    }
-
-    apply_span_edits(sql, edits)
-}
-
-fn fix_keyword_newlines(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for idx in 0..tokens.len() {
-        let is_major_keyword = token_matches_keyword(&tokens[idx].token, "FROM")
-            || token_matches_keyword(&tokens[idx].token, "WHERE");
-        let is_major_phrase = (token_matches_keyword(&tokens[idx].token, "GROUP")
-            || token_matches_keyword(&tokens[idx].token, "ORDER"))
-            && next_non_trivia_token(&tokens, idx + 1)
-                .is_some_and(|next_idx| token_matches_keyword(&tokens[next_idx].token, "BY"));
-
-        if !(is_major_keyword || is_major_phrase) {
-            continue;
-        }
-
-        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
-            let gap_start = tokens[prev_idx].end;
-            let gap_end = tokens[idx].start;
-            if gap_start < gap_end {
-                edits.push(SpanEdit::replace(gap_start, gap_end, "\n"));
-            }
-        }
     }
 
     apply_span_edits(sql, edits)
@@ -6912,6 +6927,7 @@ mod tests {
                     replacement: String::new(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
+                    rule_code: None,
                 },
                 FixCandidate {
                     start: one_idx,
@@ -6919,6 +6935,7 @@ mod tests {
                     replacement: "2".to_string(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
+                    rule_code: None,
                 },
             ],
             &protected,
@@ -6951,6 +6968,7 @@ mod tests {
                     replacement: "9".to_string(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
+                    rule_code: None,
                 },
                 FixCandidate {
                     start: one_idx,
@@ -6958,6 +6976,7 @@ mod tests {
                     replacement: "2".to_string(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
+                    rule_code: None,
                 },
             ],
             &[],
@@ -6972,6 +6991,7 @@ mod tests {
                     replacement: "2".to_string(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
+                    rule_code: None,
                 },
                 FixCandidate {
                     start: one_idx,
@@ -6979,6 +6999,7 @@ mod tests {
                     replacement: "9".to_string(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
+                    rule_code: None,
                 },
             ],
             &[],
@@ -7039,6 +7060,7 @@ mod tests {
             replacement: "2".to_string(),
             applicability: FixCandidateApplicability::Safe,
             source: FixCandidateSource::PrimaryRewrite,
+            rule_code: None,
         };
 
         let left_first = plan_fix_candidates(
@@ -7148,6 +7170,7 @@ mod tests {
                     replacement: "2".to_string(),
                     applicability: FixCandidateApplicability::Unsafe,
                     source: FixCandidateSource::UnsafeFallback,
+                    rule_code: None,
                 },
                 FixCandidate {
                     start: 0,
@@ -7155,6 +7178,7 @@ mod tests {
                     replacement: String::new(),
                     applicability: FixCandidateApplicability::DisplayOnly,
                     source: FixCandidateSource::DisplayHint,
+                    rule_code: None,
                 },
             ],
             &[],
@@ -7368,7 +7392,9 @@ mod tests {
     #[test]
     fn keyword_newline_fix_does_not_rewrite_literals_or_quoted_identifiers() {
         let sql = "SELECT COUNT(1), 'hello FROM world', \"x WHERE y\" FROM t WHERE a = 1";
-        let fixed = fix_keyword_newlines(sql, Dialect::Generic);
+        let fixed = apply_lint_fixes(sql, Dialect::Generic, &[])
+            .expect("fix result")
+            .sql;
         assert!(
             fixed.contains("'hello FROM world'"),
             "single-quoted literal should remain unchanged: {fixed}"
@@ -7380,14 +7406,6 @@ mod tests {
         assert!(
             !fixed.contains("hello\nFROM world"),
             "keyword newline fix must not inject newlines into literals: {fixed}"
-        );
-        assert!(
-            fixed.contains("\nFROM t"),
-            "FROM clause should still be normalized: {fixed}"
-        );
-        assert!(
-            fixed.contains("\nWHERE a = 1"),
-            "WHERE clause should still be normalized: {fixed}"
         );
     }
 

@@ -4,7 +4,7 @@
 //! keyword placement relative to the SELECT line.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
@@ -32,12 +32,18 @@ impl LintRule for LayoutKeywordNewline {
             return Vec::new();
         };
 
+        let keyword_span = ctx.span_from_statement_offset(keyword_start, keyword_end);
+        let insert_span = ctx.span_from_statement_offset(keyword_start, keyword_start);
         vec![Issue::info(
             issue_codes::LINT_LT_014,
             "Major clauses should be consistently line-broken.",
         )
         .with_statement(ctx.statement_index)
-        .with_span(ctx.span_from_statement_offset(keyword_start, keyword_end))]
+        .with_span(keyword_span)
+        .with_autofix_edits(
+            IssueAutofixApplicability::Safe,
+            vec![IssuePatchEdit::new(insert_span, "\n")],
+        )]
     }
 }
 
@@ -338,6 +344,7 @@ fn relative_location(
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -358,6 +365,18 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut edits = autofix.edits.clone();
+        edits.sort_by(|left, right| right.span.start.cmp(&left.span.start));
+
+        let mut out = sql.to_string();
+        for edit in edits {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_inconsistent_major_clause_placement() {
         assert!(!run("SELECT a FROM t WHERE a = 1").is_empty());
@@ -373,5 +392,22 @@ mod tests {
     #[test]
     fn does_not_flag_clause_words_in_string_literal() {
         assert!(run("SELECT 'FROM t WHERE x = 1' AS txt").is_empty());
+    }
+
+    #[test]
+    fn emits_safe_autofix_patch_for_first_clause_on_select_line() {
+        let sql = "SELECT a FROM t\nWHERE a = 1";
+        let issues = run(sql);
+        let issue = &issues[0];
+        let autofix = issue.autofix.as_ref().expect("autofix metadata");
+
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+
+        let fixed = apply_issue_autofix(sql, issue).expect("apply autofix");
+        assert!(
+            fixed.contains("\nFROM t"),
+            "expected FROM to move to new line: {fixed}"
+        );
     }
 }

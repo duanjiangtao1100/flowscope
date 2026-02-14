@@ -551,6 +551,29 @@ async fn lint_fix_applies_lt013_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt014_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT a FROM t\nWHERE a = 1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.contains("\nFROM t"),
+        "expected LT014 core autofix to line-break major clause keyword: {fixed_sql:?}"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_jj001_core_autofix_only_in_unsafe_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
