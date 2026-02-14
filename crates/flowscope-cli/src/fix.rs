@@ -752,9 +752,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_007) {
         out = fix_cte_bracket(&out, dialect);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_008) {
-        out = fix_cte_newline(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_009) {
         out = fix_select_target_newline(&out, dialect);
     }
@@ -832,9 +829,6 @@ fn apply_post_cte_layout_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dia
     let mut out = sql.to_string();
     if rule_filter.allows(issue_codes::LINT_LT_007) {
         out = fix_cte_bracket(&out, dialect);
-    }
-    if rule_filter.allows(issue_codes::LINT_LT_008) {
-        out = fix_cte_newline(&out, dialect);
     }
     out
 }
@@ -2001,35 +1995,6 @@ fn fix_cte_bracket(sql: &str, dialect: Dialect) -> String {
             tokens[next_idx].start,
             "(",
         ));
-    }
-
-    apply_span_edits(sql, edits)
-}
-
-fn fix_cte_newline(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for (idx, token) in tokens.iter().enumerate() {
-        if !matches!(token.token, Token::RParen) {
-            continue;
-        }
-        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
-            continue;
-        };
-        if !token_matches_keyword(&tokens[next_idx].token, "SELECT") {
-            continue;
-        }
-        let gap_start = token.end;
-        let gap_end = tokens[next_idx].start;
-        if gap_start < gap_end {
-            let gap = &sql[gap_start..gap_end];
-            if !gap.contains('\n') && !gap.contains('\r') {
-                edits.push(SpanEdit::replace(gap_start, gap_end, "\n"));
-            }
-        }
     }
 
     apply_span_edits(sql, edits)

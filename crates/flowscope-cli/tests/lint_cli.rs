@@ -920,6 +920,31 @@ fn test_lint_fix_applies_lt011_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_lt008_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("cte_newline_patch_fix.sql");
+    std::fs::write(&sql_path, "WITH cte AS (SELECT 1) SELECT * FROM cte").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte",
+        "Expected LT008 core autofix to place SELECT on a new line after CTE close: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_lt015_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("layout_newlines_patch_fix.sql");

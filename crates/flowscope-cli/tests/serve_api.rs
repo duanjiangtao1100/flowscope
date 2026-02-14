@@ -620,6 +620,29 @@ async fn lint_fix_applies_lt011_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt008_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "WITH cte AS (SELECT 1) SELECT * FROM cte"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte",
+        "expected LT008 core autofix to place SELECT on a new line after CTE close"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_lt015_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

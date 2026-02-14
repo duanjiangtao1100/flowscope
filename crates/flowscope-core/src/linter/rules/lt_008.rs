@@ -4,7 +4,7 @@
 //! closing parenthesis and following query/CTE text.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -26,13 +26,23 @@ impl LintRule for LayoutCteNewline {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         lt08_violation_spans(statement, ctx)
             .into_iter()
-            .map(|(start, end)| {
-                Issue::info(
+            .map(|((start, end), fix_span)| {
+                let mut issue = Issue::info(
                     issue_codes::LINT_LT_008,
                     "Blank line expected but not found after CTE closing bracket.",
                 )
                 .with_statement(ctx.statement_index)
-                .with_span(ctx.span_from_statement_offset(start, end))
+                .with_span(ctx.span_from_statement_offset(start, end));
+                if let Some((fix_start, fix_end)) = fix_span {
+                    issue = issue.with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        vec![IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(fix_start, fix_end),
+                            "\n\n",
+                        )],
+                    );
+                }
+                issue
             })
             .collect()
     }
@@ -45,7 +55,11 @@ struct LocatedToken {
     end: usize,
 }
 
-fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<(usize, usize)> {
+type Lt08Span = (usize, usize);
+type Lt08AutofixSpan = (usize, usize);
+type Lt08Violation = (Lt08Span, Option<Lt08AutofixSpan>);
+
+fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<Lt08Violation> {
     let Statement::Query(query) = statement else {
         return Vec::new();
     };
@@ -57,6 +71,7 @@ fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<(usize,
         return Vec::new();
     };
 
+    let statement_start = ctx.statement_range.start;
     let mut spans = Vec::new();
 
     for cte in &with_clause.cte_tables {
@@ -73,9 +88,24 @@ fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<(usize,
 
         if blank_lines == 0 {
             if let Some((next_start, next_end)) = next_code_span {
+                let mut autofix_span = None;
+                let gap_start = close_abs + 1;
+                if gap_start < next_start {
+                    let gap = &ctx.sql[gap_start..next_start];
+                    let next_token = &ctx.sql[next_start..next_end];
+                    if gap.chars().all(char::is_whitespace)
+                        && !gap.contains('\n')
+                        && !gap.contains('\r')
+                        && next_token.eq_ignore_ascii_case("SELECT")
+                    {
+                        autofix_span =
+                            Some((gap_start - statement_start, next_start - statement_start));
+                    }
+                }
+
                 spans.push((
-                    next_start - ctx.statement_range.start,
-                    next_end - ctx.statement_range.start,
+                    (next_start - statement_start, next_end - statement_start),
+                    autofix_span,
                 ));
             }
         }
@@ -267,6 +297,7 @@ fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, u
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -287,10 +318,34 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_missing_blank_line_after_cte() {
-        assert!(!run("WITH cte AS (SELECT 1) SELECT * FROM cte").is_empty());
-        assert!(!run("WITH cte AS (SELECT 1)\nSELECT * FROM cte").is_empty());
+        let inline_sql = "WITH cte AS (SELECT 1) SELECT * FROM cte";
+        let inline_issues = run(inline_sql);
+        assert!(!inline_issues.is_empty());
+        let autofix = inline_issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(inline_sql, &inline_issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte");
+
+        let newline_sql = "WITH cte AS (SELECT 1)\nSELECT * FROM cte";
+        let newline_issues = run(newline_sql);
+        assert!(!newline_issues.is_empty());
+        assert!(
+            newline_issues[0].autofix.is_none(),
+            "single-newline LT008 violation remains report-only"
+        );
     }
 
     #[test]
