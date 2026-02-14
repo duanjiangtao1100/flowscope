@@ -985,8 +985,8 @@ enum FixCandidateSource {
 impl FixCandidateSource {
     fn sort_key(self) -> u8 {
         match self {
-            Self::PrimaryRewrite => 0,
-            Self::CoreAutofix => 1,
+            Self::CoreAutofix => 0,
+            Self::PrimaryRewrite => 1,
             Self::UnsafeFallback => 2,
             Self::DisplayHint => 3,
         }
@@ -7091,7 +7091,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_prefers_rewrite_candidates_over_core_autofix_conflicts() {
+    fn planner_prefers_core_autofix_over_rewrite_conflicts() {
         let sql = "SELECT 1";
         let one_idx = sql.rfind('1').expect("digit exists");
         let core_issue = serde_json::json!({
@@ -7123,7 +7123,7 @@ mod tests {
 
         let left_sql = apply_planned_edits(sql, &left_first.edits);
         let right_sql = apply_planned_edits(sql, &right_first.edits);
-        assert_eq!(left_sql, "SELECT 2");
+        assert_eq!(left_sql, "SELECT 9");
         assert_eq!(left_sql, right_sql);
         assert_eq!(left_first.skipped.overlap_conflict_blocked, 1);
         assert_eq!(right_first.skipped.overlap_conflict_blocked, 1);
@@ -7390,8 +7390,9 @@ mod tests {
             "string literal should remain unchanged: {}",
             out.sql
         );
-        let has_c_style = out.sql.contains("a != b") && out.sql.contains("c != d");
-        let has_ansi_style = out.sql.contains("a <> b") && out.sql.contains("c <> d");
+        let compact: String = out.sql.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let has_c_style = compact.contains("a!=b") && compact.contains("c!=d");
+        let has_ansi_style = compact.contains("a<>b") && compact.contains("c<>d");
         assert!(
             has_c_style || has_ansi_style,
             "operator usage should still normalize to a single style: {}",
