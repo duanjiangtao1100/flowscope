@@ -654,6 +654,31 @@ fn test_lint_fix_applies_cv005_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_cv007_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("statement_brackets_patch_fix.sql");
+    std::fs::write(&sql_path, "(SELECT 1)").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT 1",
+        "Expected CV07 core autofix to remove outer wrapper brackets in patch mode"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_cv003_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("select_trailing_comma_patch_fix.sql");

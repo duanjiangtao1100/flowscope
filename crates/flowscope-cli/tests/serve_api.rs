@@ -377,6 +377,29 @@ async fn lint_fix_applies_cv005_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_cv007_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "(SELECT 1)"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1",
+        "expected CV07 core autofix to remove outer wrapper brackets"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cv003_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

@@ -3528,12 +3528,7 @@ fn collect_table_alias_idents_in_table_factor<F: FnMut(&Ident)>(
 
 fn fix_statement(stmt: &mut Statement, rule_filter: &RuleFilter) {
     match stmt {
-        Statement::Query(query) => {
-            if rule_filter.allows(issue_codes::LINT_CV_007) {
-                unwrap_wrapper_queries(query);
-            }
-            fix_query(query, rule_filter);
-        }
+        Statement::Query(query) => fix_query(query, rule_filter),
         Statement::Insert(insert) => {
             if let Some(source) = insert.source.as_mut() {
                 fix_query(source, rule_filter);
@@ -3546,29 +3541,6 @@ fn fix_statement(stmt: &mut Statement, rule_filter: &RuleFilter) {
             }
         }
         _ => {}
-    }
-}
-
-fn unwrap_wrapper_queries(query: &mut Query) {
-    loop {
-        if query.with.is_some()
-            || query.order_by.is_some()
-            || query.limit_clause.is_some()
-            || query.fetch.is_some()
-            || !query.locks.is_empty()
-            || query.for_clause.is_some()
-            || query.settings.is_some()
-            || query.format_clause.is_some()
-            || !query.pipe_operators.is_empty()
-        {
-            return;
-        }
-
-        let SetExpr::Query(inner) = query.body.as_ref() else {
-            return;
-        };
-
-        *query = inner.as_ref().clone();
     }
 }
 
