@@ -12,7 +12,7 @@ Replace AST round-trip auto-fix as the default with a patch-based fix engine tha
 
 Status (2026-02-14): implemented in `flowscope-cli` with safe/unsafe applicability, deterministic patch planning, protected ranges, CLI flags (`--unsafe-fixes`, `--show-fixes`), and a serve-mode `/api/lint-fix` endpoint.
 
-Status update (2026-02-14, later): core lint diagnostics now carry first-class autofix metadata (`Issue.autofix`), CV001/CV004/CV006 emit precise safe patch edits, CLI fix planning consumes core autofix candidates, and fallback planning applies core-only fixes when mixed rewrite candidates regress.
+Status update (2026-02-14, later): core lint diagnostics now carry first-class autofix metadata (`Issue.autofix`), CV001/CV002/CV004/CV006 emit precise safe patch edits, CLI fix planning consumes core autofix candidates, and fallback planning applies core-only fixes when mixed rewrite candidates regress.
 
 Status update (2026-02-14, latest): CLI/API default fix path is patch-only; legacy AST rewrite candidates are opt-in via `--legacy-ast-fixes` (CLI) and `legacy_ast_fixes` (`/api/lint-fix`).
 
