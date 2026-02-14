@@ -399,6 +399,27 @@ check-generated:
     fi
     echo "Generated code is up to date."
 
+# Run SQLFluff parity comparison report
+sqlfluff-parity SQLFLUFF_DIR="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{SQLFLUFF_DIR}}" ]; then
+        dir="{{SQLFLUFF_DIR}}"
+    elif [ -n "${SQLFLUFF_DIR:-}" ]; then
+        dir="$SQLFLUFF_DIR"
+    else
+        echo "Usage: just sqlfluff-parity /path/to/sqlfluff"
+        echo "  or:  SQLFLUFF_DIR=/path/to/sqlfluff just sqlfluff-parity"
+        exit 1
+    fi
+    venv="$dir/.venv/bin/python"
+    if [ ! -x "$venv" ]; then
+        echo "SQLFluff venv not found at $venv"
+        echo "Expected a SQLFluff source checkout with .venv containing PyYAML."
+        exit 1
+    fi
+    "$venv" scripts/sqlfluff-parity-report.py "$dir"
+
 # Pre-release validation: all checks needed before tagging a release
 pre-release: check-generated check-all
     @echo "All pre-release checks passed!"
