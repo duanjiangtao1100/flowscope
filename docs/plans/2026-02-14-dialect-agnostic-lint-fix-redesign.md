@@ -138,7 +138,7 @@ LSP:
 Current completion snapshot:
 
 - Phase 0: complete in CLI (`fix_engine` module, applicability model, deterministic planner, protected ranges).
-- Phase 1: actively migrated with core-emitted patch edits for CV001/CV002/CV003/CV004/CV005/CV006/ST012/LT013/JJ001 and CLI ingestion; CV001/CV003/CV004/CV005/CV006/ST012/LT013/JJ001 legacy AST/text rewrite paths removed in favor of core patch metadata.
+- Phase 1: actively migrated with core-emitted patch edits for CV001/CV002/CV003/CV004/CV005/CV006/ST012/LT013/JJ001 and CLI ingestion; CV001/CV002/CV003/CV004/CV005/CV006/ST012/LT013/JJ001 legacy AST/text rewrite paths removed in favor of core patch metadata.
 - Phase 2: complete for applicability plumbing (`Safe`/`Unsafe`/`DisplayOnly`) and CLI reporting of skipped/blocked counts.
 - Phase 3: validated on existing multi-dialect core fixture matrix (`cargo test -p flowscope-core`), with migrated rules exercised through parser/token adapters.
 - Phase 4: protected template/comment/string ranges enforced in planner; safe mode blocks unstable template edits.

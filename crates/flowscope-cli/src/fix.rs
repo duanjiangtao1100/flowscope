@@ -5472,13 +5472,6 @@ fn fix_function(func: &mut Function, rule_filter: &RuleFilter) {
     for order_expr in &mut func.within_group {
         fix_expr(&mut order_expr.expr, rule_filter);
     }
-
-    if rule_filter.allows(issue_codes::LINT_CV_002) {
-        let function_name_upper = func.name.to_string().to_ascii_uppercase();
-        if function_name_upper == "IFNULL" || function_name_upper == "NVL" {
-            func.name = vec![Ident::new("COALESCE")].into();
-        }
-    }
 }
 
 fn fix_function_arg(arg: &mut FunctionArg, rule_filter: &RuleFilter) {
