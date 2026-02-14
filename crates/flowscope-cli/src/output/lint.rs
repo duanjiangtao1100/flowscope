@@ -1,6 +1,6 @@
 //! Lint output formatting (sqlfluff-style).
 
-use flowscope_core::Severity;
+use flowscope_core::{linter::config::canonicalize_rule_code, Severity};
 use owo_colors::OwoColorize;
 use std::fmt::Write;
 use std::time::Duration;
@@ -95,14 +95,15 @@ fn write_file_section(out: &mut String, file: &FileLintResult, colored: bool) {
     sorted.sort_by_key(|i| (i.line, i.col));
 
     for issue in sorted {
+        let display_code = sqlfluff_display_code(&issue.code);
         let code_str = if colored {
             match issue.severity {
-                Severity::Error => issue.code.red().to_string(),
-                Severity::Warning => issue.code.yellow().to_string(),
-                Severity::Info => issue.code.blue().to_string(),
+                Severity::Error => display_code.red().to_string(),
+                Severity::Warning => display_code.yellow().to_string(),
+                Severity::Info => display_code.blue().to_string(),
             }
         } else {
-            issue.code.clone()
+            display_code
         };
 
         writeln!(
@@ -111,6 +112,38 @@ fn write_file_section(out: &mut String, file: &FileLintResult, colored: bool) {
             issue.line, issue.col, code_str, issue.message
         )
         .unwrap();
+    }
+}
+
+fn sqlfluff_display_code(code: &str) -> String {
+    let Some(canonical) = canonicalize_rule_code(code) else {
+        return code.to_string();
+    };
+
+    let Some(suffix) = canonical.strip_prefix("LINT_") else {
+        return code.to_string();
+    };
+
+    let Some((group, number)) = suffix.split_once('_') else {
+        return code.to_string();
+    };
+
+    if group.len() != 2 || !group.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return code.to_string();
+    }
+
+    let Ok(number) = number.parse::<usize>() else {
+        return code.to_string();
+    };
+
+    if number == 0 {
+        return code.to_string();
+    }
+
+    if number >= 100 {
+        format!("{group}{number:03}")
+    } else {
+        format!("{group}{number:02}")
     }
 }
 
@@ -174,7 +207,7 @@ pub fn format_lint_json(results: &[FileLintResult], compact: bool) -> String {
                     serde_json::json!({
                         "line": issue.line,
                         "column": issue.col,
-                        "code": issue.code,
+                        "code": sqlfluff_display_code(&issue.code),
                         "message": issue.message,
                         "severity": match issue.severity {
                             Severity::Error => "error",
@@ -284,11 +317,18 @@ mod tests {
         assert!(output.contains("FAIL"));
         assert!(output.contains("All Finished in 1.50s!"));
         assert!(output.contains("bad.sql"));
-        assert!(output.contains("LINT_AM_007"));
-        assert!(output.contains("LINT_ST_006"));
+        assert!(output.contains("AM07"));
+        assert!(output.contains("ST06"));
         assert!(output.contains("L:   3 | P:  12"));
         assert!(output.contains("L:   7 | P:   1"));
         assert!(output.contains("2 violations"));
+    }
+
+    #[test]
+    fn test_sqlfluff_display_code() {
+        assert_eq!(sqlfluff_display_code("LINT_AM_007"), "AM07");
+        assert_eq!(sqlfluff_display_code("lt5"), "LT05");
+        assert_eq!(sqlfluff_display_code("PARSE_ERROR"), "PARSE_ERROR");
     }
 
     #[test]
@@ -338,7 +378,7 @@ mod tests {
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["file"], "test.sql");
-        assert_eq!(arr[0]["violations"][0]["code"], "LINT_AM_007");
+        assert_eq!(arr[0]["violations"][0]["code"], "AM07");
         assert_eq!(arr[0]["violations"][0]["line"], 1);
         assert_eq!(arr[0]["violations"][0]["column"], 8);
     }

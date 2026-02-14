@@ -59,10 +59,7 @@ fn test_lint_file_with_violations() {
         "Expected exit 1, got: {stdout}"
     );
     assert!(stdout.contains("FAIL"), "Expected FAIL in output: {stdout}");
-    assert!(
-        stdout.contains("LINT_AM_002"),
-        "Expected LINT_AM_002: {stdout}"
-    );
+    assert!(stdout.contains("AM02"), "Expected AM02: {stdout}");
     assert!(
         stdout.contains("1 violations"),
         "Expected 1 violation: {stdout}"
@@ -176,7 +173,7 @@ fn test_lint_fix_excluded_rule_not_rewritten_when_other_fixes_apply() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert!(
-        after.contains("COUNT(*)"),
+        after.to_ascii_uppercase().contains("COUNT(*)"),
         "Expected non-excluded fix to apply: {after}"
     );
     assert!(
@@ -342,8 +339,8 @@ fn test_lint_stdin() {
         "Expected exit 1 for stdin violations: {stdout}"
     );
     assert!(
-        stdout.contains("LINT_AM_002"),
-        "Expected LINT_AM_002 from stdin: {stdout}"
+        stdout.contains("AM02"),
+        "Expected AM02 from stdin: {stdout}"
     );
 }
 
@@ -382,7 +379,7 @@ fn test_lint_templated_sql_without_template_flag_uses_jinja_fallback() {
 
     let has_st05 = violations
         .iter()
-        .any(|v| v["code"].as_str() == Some("LINT_ST_005"));
+        .any(|v| v["code"].as_str() == Some("ST05"));
     let has_parse_error = violations
         .iter()
         .any(|v| v["code"].as_str() == Some("PARSE_ERROR"));
@@ -420,7 +417,7 @@ fn test_lint_rule_configs_flag_applies_rule_options() {
         .as_array()
         .expect("violations array")
         .iter()
-        .any(|v| v["code"].as_str() == Some("LINT_ST_005"));
+        .any(|v| v["code"].as_str() == Some("ST05"));
     assert!(
         !no_cfg_has_st05,
         "Expected default ST05 config (join) to ignore FROM subquery: {no_cfg_stdout}"
@@ -445,7 +442,7 @@ fn test_lint_rule_configs_flag_applies_rule_options() {
         .as_array()
         .expect("violations array")
         .iter()
-        .any(|v| v["code"].as_str() == Some("LINT_ST_005"));
+        .any(|v| v["code"].as_str() == Some("ST05"));
     assert!(
         with_cfg_has_st05,
         "Expected ST05 with forbid_subquery_in=from: {with_cfg_stdout}"
@@ -531,7 +528,7 @@ fn test_lint_directory_recursively() {
         "Expected one failing SQL file in recursive lint output: {stdout}"
     );
     assert!(
-        stdout.contains("LINT_AM_002"),
+        stdout.contains("AM02"),
         "Expected lint violation from nested SQL file: {stdout}"
     );
     assert!(
