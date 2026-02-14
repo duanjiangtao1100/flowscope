@@ -350,6 +350,33 @@ async fn lint_fix_applies_cv001_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_cv005_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT * FROM t WHERE a = NULL AND b <> NULL"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.contains("a IS NULL"),
+        "expected CV05 core autofix to rewrite '= NULL': {fixed_sql}"
+    );
+    assert!(
+        fixed_sql.contains("b IS NOT NULL"),
+        "expected CV05 core autofix to rewrite '<> NULL': {fixed_sql}"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cv003_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

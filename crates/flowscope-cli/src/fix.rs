@@ -5376,13 +5376,6 @@ fn fix_expr(expr: &mut Expr, rule_filter: &RuleFilter) {
         _ => {}
     }
 
-    if rule_filter.allows(issue_codes::LINT_CV_001) {
-        if let Some(rewritten) = null_comparison_rewrite(expr) {
-            *expr = rewritten;
-            return;
-        }
-    }
-
     if rule_filter.allows(issue_codes::LINT_CV_011) {
         rewrite_cast_style(expr, rule_filter.cv011_style);
     }
@@ -5497,26 +5490,6 @@ fn fix_function_arg(arg: &mut FunctionArg, rule_filter: &RuleFilter) {
                 fix_expr(expr, rule_filter);
             }
         }
-    }
-}
-
-fn null_comparison_rewrite(expr: &Expr) -> Option<Expr> {
-    let Expr::BinaryOp { left, op, right } = expr else {
-        return None;
-    };
-
-    let target = if lint_helpers::is_null_expr(right) {
-        left.as_ref().clone()
-    } else if lint_helpers::is_null_expr(left) {
-        right.as_ref().clone()
-    } else {
-        return None;
-    };
-
-    match op {
-        BinaryOperator::Eq => Some(Expr::IsNull(Box::new(target))),
-        BinaryOperator::NotEq => Some(Expr::IsNotNull(Box::new(target))),
-        _ => None,
     }
 }
 
