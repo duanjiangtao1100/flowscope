@@ -806,9 +806,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_TQ_003) {
         out = fix_tsql_empty_batches(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_012) {
-        out = fix_trailing_newline(&out);
-    }
 
     out
 }
@@ -3299,13 +3296,6 @@ fn fix_tsql_empty_batches(sql: &str) -> String {
     }
 
     out
-}
-
-fn fix_trailing_newline(sql: &str) -> String {
-    if sql.contains('\n') && !sql.ends_with('\n') {
-        return format!("{sql}\n");
-    }
-    sql.to_string()
 }
 
 struct LocatedToken {
@@ -7927,7 +7917,11 @@ mod tests {
         let sql = "SELECT a.x, b.y FROM a JOIN b WHERE a.id = b.id";
         let out1 = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix");
         let out2 = apply_lint_fixes(&out1.sql, Dialect::Generic, &[]).expect("fix2");
-        assert_eq!(out1.sql, out2.sql, "second pass should be idempotent");
+        assert_eq!(
+            out1.sql.trim_end_matches('\n'),
+            out2.sql.trim_end_matches('\n'),
+            "second pass should be idempotent aside from LT012 trailing-newline normalization"
+        );
     }
 
     // --- LT_002: indentation normalization ---

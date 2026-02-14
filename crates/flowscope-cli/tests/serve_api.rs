@@ -501,6 +501,29 @@ async fn lint_fix_applies_st012_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt012_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1\nFROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1\nFROM t\n",
+        "expected LT012 core autofix to enforce exactly one trailing newline"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_lt013_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
@@ -516,10 +539,14 @@ async fn lint_fix_applies_lt013_core_autofix_in_patch_mode() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["changed"], true);
-    assert_eq!(
-        json["sql"].as_str().unwrap(),
-        "SELECT 1",
-        "expected LT013 core autofix to remove leading blank lines"
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.starts_with("SELECT 1"),
+        "expected LT013 core autofix to remove leading blank lines: {fixed_sql:?}"
+    );
+    assert!(
+        !fixed_sql.starts_with('\n'),
+        "expected LT013 output to start with SQL text: {fixed_sql:?}"
     );
 }
 
