@@ -13,7 +13,7 @@ use crate::fix_engine::{
 use flowscope_core::linter::config::canonicalize_rule_code;
 use flowscope_core::{
     analyze, issue_codes, linter::helpers as lint_helpers, parse_sql_with_dialect, AnalysisOptions,
-    AnalyzeRequest, Dialect, Issue, LintConfig, ParseError,
+    AnalyzeRequest, Dialect, Issue, IssueAutofixApplicability, LintConfig, ParseError,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
@@ -333,6 +333,8 @@ pub fn apply_lint_fixes_with_options(
     let before_issues = lint_issues(sql, dialect, lint_config);
     let before_counts = lint_rule_counts_from_issues(&before_issues);
     let core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
+    let core_autofix_rules =
+        collect_core_autofix_rules(&before_issues, fix_options.include_unsafe_fixes);
     let mut candidates = Vec::new();
 
     if fix_options.include_rewrite_candidates {
@@ -425,6 +427,22 @@ pub fn apply_lint_fixes_with_options(
             skipped_due_to_regression: true,
             skipped_counts: planned.skipped,
         });
+    }
+
+    if fix_options.include_rewrite_candidates
+        && core_autofix_rules_not_improved(&before_counts, &after_counts, &core_autofix_rules)
+    {
+        if let Some(outcome) = try_core_only_fix_plan(
+            sql,
+            dialect,
+            lint_config,
+            &before_counts,
+            &core_candidates,
+            &protected_ranges,
+            fix_options.include_unsafe_fixes,
+        ) {
+            return Ok(outcome);
+        }
     }
 
     if counts.total() == 0 {
@@ -619,6 +637,36 @@ fn lint_rule_counts_from_issues(issues: &[Issue]) -> BTreeMap<String, usize> {
     counts
 }
 
+fn collect_core_autofix_rules(issues: &[Issue], allow_unsafe: bool) -> HashSet<String> {
+    issues
+        .iter()
+        .filter_map(|issue| {
+            let autofix = issue.autofix.as_ref()?;
+            let applicable = match autofix.applicability {
+                IssueAutofixApplicability::Safe => true,
+                IssueAutofixApplicability::Unsafe => allow_unsafe,
+                IssueAutofixApplicability::DisplayOnly => false,
+            };
+            if applicable {
+                Some(issue.code.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn core_autofix_rules_not_improved(
+    before_counts: &BTreeMap<String, usize>,
+    after_counts: &BTreeMap<String, usize>,
+    core_autofix_rules: &HashSet<String>,
+) -> bool {
+    core_autofix_rules.iter().any(|code| {
+        let before_count = before_counts.get(code).copied().unwrap_or(0);
+        before_count > 0 && after_counts.get(code).copied().unwrap_or(0) >= before_count
+    })
+}
+
 fn parse_errors_increased(
     before_counts: &BTreeMap<String, usize>,
     after_counts: &BTreeMap<String, usize>,
@@ -686,9 +734,6 @@ fn try_core_only_fix_plan(
 fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
     let mut out = sql.to_string();
 
-    if rule_filter.allows(issue_codes::LINT_CV_001) {
-        out = fix_not_equal_operator(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_015) {
         out = fix_excessive_blank_lines(&out);
     }
@@ -1580,10 +1625,6 @@ fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
     }
     let ch = bytes[check_idx] as char;
     !(ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn fix_not_equal_operator(sql: &str) -> String {
-    replace_outside_single_quotes(sql, |segment| segment.replace("<>", "!="))
 }
 
 fn replace_outside_single_quotes<F>(sql: &str, mut transform: F) -> String
@@ -7123,6 +7164,38 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_mode_falls_back_to_core_plan_when_core_rule_is_not_improved() {
+        let sql = "SELECT * FROM t WHERE a <> b AND c != d";
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: true,
+            },
+        )
+        .expect("fix result");
+
+        assert_eq!(fix_count_for_code(&out.counts, issue_codes::LINT_CV_001), 1);
+        assert!(
+            out.sql.contains("a != b"),
+            "expected CV001 style fix: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.contains("c != d"),
+            "expected CV001 style fix: {}",
+            out.sql
+        );
+        assert!(
+            !out.sql.contains("<>"),
+            "expected no angle-style operator: {}",
+            out.sql
+        );
+    }
+
+    #[test]
     fn core_autofix_applicability_is_mapped_to_existing_planner_logic() {
         let sql = "SELECT 1";
         let one_idx = sql.rfind('1').expect("digit exists");
@@ -7351,9 +7424,11 @@ mod tests {
             "string literal should remain unchanged: {}",
             out.sql
         );
+        let has_c_style = out.sql.contains("a != b") && out.sql.contains("c != d");
+        let has_ansi_style = out.sql.contains("a <> b") && out.sql.contains("c <> d");
         assert!(
-            out.sql.contains("a != b"),
-            "operator usage should still be normalized: {}",
+            has_c_style || has_ansi_style,
+            "operator usage should still normalize to a single style: {}",
             out.sql
         );
     }
