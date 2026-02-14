@@ -397,6 +397,45 @@ async fn lint_fix_applies_lt013_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_jj001_core_autofix_only_in_unsafe_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+    let sql = "SELECT '{{foo}}' AS templated";
+
+    let (safe_status, safe_json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql,
+            "unsafe_fixes": false
+        }),
+    )
+    .await;
+    let (unsafe_status, unsafe_json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql,
+            "unsafe_fixes": true
+        }),
+    )
+    .await;
+
+    assert_eq!(safe_status, StatusCode::OK);
+    assert_eq!(unsafe_status, StatusCode::OK);
+    assert_eq!(
+        safe_json["sql"].as_str().unwrap(),
+        sql,
+        "safe mode should keep JJ001 template edits blocked by protected ranges"
+    );
+    assert!(
+        unsafe_json["sql"].as_str().unwrap().contains("{{ foo }}"),
+        "unsafe mode should apply JJ001 core autofix: {}",
+        unsafe_json["sql"].as_str().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

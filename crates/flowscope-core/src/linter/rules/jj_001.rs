@@ -4,7 +4,7 @@
 //! Jinja delimiters.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 
@@ -28,12 +28,27 @@ impl LintRule for JinjaPadding {
             return Vec::new();
         };
 
-        vec![Issue::info(
+        let mut issue = Issue::info(
             issue_codes::LINT_JJ_001,
             "Jinja tag spacing appears inconsistent.",
         )
         .with_statement(ctx.statement_index)
-        .with_span(ctx.span_from_statement_offset(start, end))]
+        .with_span(ctx.span_from_statement_offset(start, end));
+
+        let edits: Vec<IssuePatchEdit> = jinja_padding_autofix_edits(ctx.statement_sql())
+            .into_iter()
+            .map(|edit| {
+                IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit.start, edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect();
+        if !edits.is_empty() {
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+        }
+
+        vec![issue]
     }
 }
 
@@ -162,6 +177,81 @@ fn token_text_violation(sql: &str, token: &TokenSpan) -> Option<(usize, usize)> 
     None
 }
 
+#[derive(Debug)]
+struct JinjaPaddingEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn jinja_padding_autofix_edits(sql: &str) -> Vec<JinjaPaddingEdit> {
+    let mut edits =
+        normalize_template_tag_padding_edits(sql, b"{{", b"}}", |b| b != b'{' && b != b'}');
+    edits.extend(normalize_template_tag_padding_edits(
+        sql,
+        b"{%",
+        b"%}",
+        |b| b != b'%',
+    ));
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    edits.dedup_by(|left, right| {
+        left.start == right.start && left.end == right.end && left.replacement == right.replacement
+    });
+    edits
+}
+
+fn normalize_template_tag_padding_edits<F>(
+    sql: &str,
+    open: &[u8],
+    close: &[u8],
+    inner_ok: F,
+) -> Vec<JinjaPaddingEdit>
+where
+    F: Fn(u8) -> bool,
+{
+    let bytes = sql.as_bytes();
+    let mut edits = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let mut replaced = false;
+        if i + open.len() <= bytes.len() && &bytes[i..i + open.len()] == open {
+            let mut j = i + open.len();
+            while j + close.len() <= bytes.len() {
+                if &bytes[j..j + close.len()] == close {
+                    let inner = &sql[i + open.len()..j];
+                    if !inner.is_empty() && inner.as_bytes().iter().copied().all(&inner_ok) {
+                        let open_text =
+                            std::str::from_utf8(open).expect("template delimiter is ascii");
+                        let close_text =
+                            std::str::from_utf8(close).expect("template delimiter is ascii");
+                        let replacement = format!("{open_text} {} {close_text}", inner.trim());
+                        let end = j + close.len();
+                        if replacement != sql[i..end] {
+                            edits.push(JinjaPaddingEdit {
+                                start: i,
+                                end,
+                                replacement,
+                            });
+                        }
+                        i = end;
+                        replaced = true;
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if replaced {
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    edits
+}
+
 const OPEN_DELIMITERS: [&str; 3] = ["{{", "{%", "{#"];
 const CLOSE_DELIMITERS: [&str; 3] = ["}}", "%}", "#}"];
 
@@ -254,6 +344,7 @@ fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, u
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -274,17 +365,31 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_missing_padding_in_jinja_expression() {
-        let issues = run("SELECT '{{foo}}' AS templated");
+        let sql = "SELECT '{{foo}}' AS templated";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_JJ_001);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         assert_eq!(
             issues[0].span.expect("expected span").start,
-            "SELECT '{{foo}}' AS templated"
-                .find("{{")
-                .expect("expected opening delimiter"),
+            sql.find("{{").expect("expected opening delimiter"),
         );
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT '{{ foo }}' AS templated");
     }
 
     #[test]
@@ -294,16 +399,22 @@ mod tests {
 
     #[test]
     fn flags_missing_padding_in_jinja_statement_tag() {
-        let issues = run("SELECT '{%for x in y %}' AS templated");
+        let sql = "SELECT '{%for x in y %}' AS templated";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_JJ_001);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT '{% for x in y %}' AS templated");
     }
 
     #[test]
     fn flags_missing_padding_before_statement_close_tag() {
-        let issues = run("SELECT '{% for x in y%}' AS templated");
+        let sql = "SELECT '{% for x in y%}' AS templated";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_JJ_001);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT '{% for x in y %}' AS templated");
     }
 
     #[test]
@@ -311,6 +422,10 @@ mod tests {
         let issues = run("SELECT '{#comment#}' AS templated");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_JJ_001);
+        assert!(
+            issues[0].autofix.is_none(),
+            "comment-tag JJ001 findings are report-only in current core autofix scope"
+        );
     }
 
     #[test]

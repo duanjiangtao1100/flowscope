@@ -691,9 +691,6 @@ fn try_core_only_fix_plan(
 fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
     let mut out = sql.to_string();
 
-    if rule_filter.allows(issue_codes::LINT_JJ_001) {
-        out = fix_jinja_padding(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_CV_006) {
         out = fix_statement_terminators(&out, dialect, rule_filter.cv06_require_final_semicolon);
     }
@@ -1591,51 +1588,6 @@ fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
     }
     let ch = bytes[check_idx] as char;
     !(ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn fix_jinja_padding(sql: &str) -> String {
-    let out = normalize_template_tag_padding(sql, b"{{", b"}}", |b| b != b'{' && b != b'}');
-    normalize_template_tag_padding(&out, b"{%", b"%}", |b| b != b'%')
-}
-
-fn normalize_template_tag_padding<F>(sql: &str, open: &[u8], close: &[u8], inner_ok: F) -> String
-where
-    F: Fn(u8) -> bool,
-{
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let mut replaced = false;
-        if i + open.len() <= bytes.len() && &bytes[i..i + open.len()] == open {
-            let mut j = i + open.len();
-            while j + close.len() <= bytes.len() {
-                if &bytes[j..j + close.len()] == close {
-                    let inner = &sql[i + open.len()..j];
-                    if !inner.is_empty() && inner.as_bytes().iter().copied().all(&inner_ok) {
-                        out.push_str(std::str::from_utf8(open).expect("template delimiter ascii"));
-                        out.push(' ');
-                        out.push_str(inner.trim());
-                        out.push(' ');
-                        out.push_str(std::str::from_utf8(close).expect("template delimiter ascii"));
-                        i = j + close.len();
-                        replaced = true;
-                    }
-                    break;
-                }
-                j += 1;
-            }
-            if replaced {
-                continue;
-            }
-        }
-
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-
-    out
 }
 
 fn fix_statement_terminators(sql: &str, dialect: Dialect, require_final_semicolon: bool) -> String {

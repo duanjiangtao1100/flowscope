@@ -679,6 +679,52 @@ fn test_lint_fix_applies_lt013_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_jj001_core_autofix_only_in_unsafe_mode() {
+    let dir = tempdir().expect("temp dir");
+    let safe_path = dir.path().join("jinja_padding_safe.sql");
+    std::fs::write(&safe_path, "SELECT '{{foo}}' AS templated").expect("write sql");
+
+    let safe_output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", safe_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with safe fix");
+    assert_ne!(
+        safe_output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&safe_output)
+    );
+    let safe_after = std::fs::read_to_string(&safe_path).expect("read SQL after safe fix");
+    assert!(
+        safe_after.contains("{{foo}}"),
+        "safe mode should keep template edits protected: {safe_after}"
+    );
+
+    let unsafe_path = dir.path().join("jinja_padding_unsafe.sql");
+    std::fs::write(&unsafe_path, "SELECT '{{foo}}' AS templated").expect("write sql");
+    let unsafe_output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--unsafe-fixes",
+            unsafe_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with unsafe fix");
+    assert_ne!(
+        unsafe_output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&unsafe_output)
+    );
+    let unsafe_after = std::fs::read_to_string(&unsafe_path).expect("read SQL after unsafe fix");
+    assert!(
+        unsafe_after.contains("{{ foo }}"),
+        "unsafe mode should apply JJ001 core autofix: {unsafe_after}"
+    );
+}
+
+#[test]
 fn test_lint_multiple_files() {
     let dir = tempdir().expect("temp dir");
     let clean_path = dir.path().join("clean.sql");
