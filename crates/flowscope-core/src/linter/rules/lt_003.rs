@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -70,27 +70,44 @@ impl LintRule for LayoutOperators {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if has_inconsistent_operator_layout(ctx, self.line_position) {
-            vec![Issue::info(
+        if let Some(((start, end), edits)) = operator_layout_violation(ctx, self.line_position) {
+            let mut issue = Issue::info(
                 issue_codes::LINT_LT_003,
                 "Operator line placement appears inconsistent.",
             )
-            .with_statement(ctx.statement_index)]
+            .with_statement(ctx.statement_index)
+            .with_span(ctx.span_from_statement_offset(start, end));
+            if !edits.is_empty() {
+                let edits = edits
+                    .into_iter()
+                    .map(|(edit_start, edit_end, replacement)| {
+                        IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(edit_start, edit_end),
+                            replacement,
+                        )
+                    })
+                    .collect();
+                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            }
+            vec![issue]
         } else {
             Vec::new()
         }
     }
 }
 
-fn has_inconsistent_operator_layout(
+type Lt03Span = (usize, usize);
+type Lt03AutofixEdit = (usize, usize, &'static str);
+type Lt03Violation = (Lt03Span, Vec<Lt03AutofixEdit>);
+
+fn operator_layout_violation(
     ctx: &LintContext,
     line_position: OperatorLinePosition,
-) -> bool {
+) -> Option<Lt03Violation> {
     let tokens =
         tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
-    let Some(tokens) = tokens else {
-        return false;
-    };
+    let tokens = tokens?;
+    let sql = ctx.statement_sql();
 
     for (index, token) in tokens.iter().enumerate() {
         if !is_layout_operator(&token.token) {
@@ -119,11 +136,66 @@ fn has_inconsistent_operator_layout(
             OperatorLinePosition::Trailing => line_break_before && !line_break_after,
         };
         if has_violation {
-            return true;
+            let Some((start, end)) = token_with_span_offsets(sql, token) else {
+                continue;
+            };
+            let edits = safe_operator_leading_autofix_edits(
+                sql,
+                &tokens,
+                index,
+                line_position,
+                line_break_before,
+                line_break_after,
+            )
+            .unwrap_or_default();
+            return Some(((start, end), edits));
         }
     }
 
-    false
+    None
+}
+
+fn safe_operator_leading_autofix_edits(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    operator_idx: usize,
+    line_position: OperatorLinePosition,
+    line_break_before: bool,
+    line_break_after: bool,
+) -> Option<Vec<Lt03AutofixEdit>> {
+    if line_position != OperatorLinePosition::Leading || line_break_before || !line_break_after {
+        return None;
+    }
+
+    let prev_idx = prev_non_trivia_index(tokens, operator_idx)?;
+    let next_idx = next_non_trivia_index(tokens, operator_idx + 1)?;
+    let (_, before_start) = token_with_span_offsets(sql, &tokens[prev_idx])?;
+    let (before_end, _) = token_with_span_offsets(sql, &tokens[operator_idx])?;
+    let (_, after_start) = token_with_span_offsets(sql, &tokens[operator_idx])?;
+    let (after_end, _) = token_with_span_offsets(sql, &tokens[next_idx])?;
+
+    if before_start > before_end || after_start > after_end || after_end > sql.len() {
+        return None;
+    }
+
+    let before_gap = &sql[before_start..before_end];
+    let after_gap = &sql[after_start..after_end];
+    if !before_gap.chars().all(char::is_whitespace)
+        || before_gap.contains('\n')
+        || before_gap.contains('\r')
+    {
+        return None;
+    }
+    if !after_gap.chars().all(char::is_whitespace)
+        || (!after_gap.contains('\n') && !after_gap.contains('\r'))
+    {
+        return None;
+    }
+
+    Some(vec![
+        (before_start, before_end, "\n"),
+        (after_start, after_end, " "),
+    ])
 }
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
@@ -198,6 +270,26 @@ fn is_trivia_token(token: &Token) -> bool {
             | Token::Whitespace(Whitespace::SingleLineComment { .. })
             | Token::Whitespace(Whitespace::MultiLineComment(_))
     )
+}
+
+fn next_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
+    while index < tokens.len() {
+        if !is_trivia_token(&tokens[index].token) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn prev_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
+    while index > 0 {
+        index -= 1;
+        if !is_trivia_token(&tokens[index].token) {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -309,6 +401,7 @@ mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run_with_rule(sql: &str, rule: &LayoutOperators) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -332,11 +425,27 @@ mod tests {
         run_with_rule(sql, &LayoutOperators::default())
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_trailing_operator() {
-        let issues = run("SELECT a +\n b FROM t");
+        let sql = "SELECT a +\n b FROM t";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a\n+ b FROM t");
     }
 
     #[test]
@@ -365,6 +474,10 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+        assert!(
+            issues[0].autofix.is_none(),
+            "trailing-style violations remain report-only in conservative LT003 migration"
+        );
     }
 
     #[test]

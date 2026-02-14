@@ -736,9 +736,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_001) {
         out = fix_operator_spacing(&out, dialect);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_003) {
-        out = fix_operator_line_position(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
@@ -1821,42 +1818,6 @@ fn fix_operator_spacing(sql: &str, dialect: Dialect) -> String {
             if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
                 edits.push(SpanEdit::replace(after_start, after_end, " "));
             }
-        }
-    }
-
-    apply_span_edits(sql, edits)
-}
-
-fn fix_operator_line_position(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for (idx, token) in tokens.iter().enumerate() {
-        if !is_spacing_operator_token(&token.token) {
-            continue;
-        }
-        let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) else {
-            continue;
-        };
-        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
-            continue;
-        };
-
-        let before_start = tokens[prev_idx].end;
-        let before_end = token.start;
-        let after_start = token.end;
-        let after_end = tokens[next_idx].start;
-        if before_start >= before_end || after_start >= after_end {
-            continue;
-        }
-
-        let before_gap = &sql[before_start..before_end];
-        let after_gap = &sql[after_start..after_end];
-        if !before_gap.contains('\n') && after_gap.contains('\n') {
-            edits.push(SpanEdit::replace(before_start, before_end, "\n"));
-            edits.push(SpanEdit::replace(after_start, after_end, " "));
         }
     }
 
