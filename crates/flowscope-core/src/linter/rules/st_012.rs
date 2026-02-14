@@ -4,7 +4,7 @@
 //! document text.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -24,37 +24,53 @@ impl LintRule for StructureConsecutiveSemicolons {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let tokens = tokenize_with_offsets_for_context(ctx);
-        let has_violation = ctx.statement_index == 0
-            && sql_has_consecutive_semicolons(ctx.sql, ctx.dialect(), tokens.as_deref());
-        if has_violation {
+        if ctx.statement_index > 0 {
+            Vec::new()
+        } else {
+            let tokens = tokenize_with_offsets_for_context(ctx);
+            let Some(fix) = consecutive_semicolon_fix(ctx.sql, ctx.dialect(), tokens.as_deref())
+            else {
+                return Vec::new();
+            };
+
+            let edits = fix
+                .remove_spans
+                .into_iter()
+                .map(|(start, end)| IssuePatchEdit::new(Span::new(start, end), ""))
+                .collect();
+
             vec![
                 Issue::warning(issue_codes::LINT_ST_012, "Consecutive semicolons detected.")
-                    .with_statement(ctx.statement_index),
+                    .with_statement(ctx.statement_index)
+                    .with_span(Span::new(fix.issue_start, fix.issue_end))
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, edits),
             ]
-        } else {
-            Vec::new()
         }
     }
 }
 
-fn sql_has_consecutive_semicolons(
+#[derive(Debug)]
+struct ConsecutiveSemicolonFix {
+    issue_start: usize,
+    issue_end: usize,
+    remove_spans: Vec<(usize, usize)>,
+}
+
+fn consecutive_semicolon_fix(
     sql: &str,
     dialect: Dialect,
     tokens: Option<&[LocatedToken]>,
-) -> bool {
+) -> Option<ConsecutiveSemicolonFix> {
     let owned_tokens;
     let tokens = if let Some(tokens) = tokens {
         tokens
     } else {
-        owned_tokens = match tokenize_with_offsets(sql, dialect) {
-            Some(tokens) => tokens,
-            None => return false,
-        };
+        owned_tokens = tokenize_with_offsets(sql, dialect)?;
         &owned_tokens
     };
 
-    let mut previous_semicolon_end = None;
+    let mut previous_semicolon_seen = false;
+    let mut remove_spans = Vec::new();
 
     for token in tokens {
         if is_trivia_token(&token.token) {
@@ -62,16 +78,22 @@ fn sql_has_consecutive_semicolons(
         }
 
         if matches!(token.token, Token::SemiColon) {
-            if previous_semicolon_end.is_some_and(|previous_end| previous_end <= token.start) {
-                return true;
+            if previous_semicolon_seen {
+                remove_spans.push((token.start, token.end));
+            } else {
+                previous_semicolon_seen = true;
             }
-            previous_semicolon_end = Some(token.end);
         } else {
-            previous_semicolon_end = None;
+            previous_semicolon_seen = false;
         }
     }
 
-    false
+    let (issue_start, issue_end) = remove_spans.first().copied()?;
+    Some(ConsecutiveSemicolonFix {
+        issue_start,
+        issue_end,
+        remove_spans,
+    })
 }
 
 #[derive(Clone)]
@@ -191,7 +213,7 @@ mod tests {
     use super::*;
     use crate::linter::rule::with_active_dialect;
     use crate::parser::{parse_sql, parse_sql_with_dialect};
-    use crate::types::Dialect;
+    use crate::types::{Dialect, IssueAutofixApplicability};
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -233,11 +255,26 @@ mod tests {
         issues
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_consecutive_semicolons() {
         let issues = run("SELECT 1;;");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_ST_012);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix("SELECT 1;;", &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT 1;");
     }
 
     #[test]
@@ -260,9 +297,16 @@ mod tests {
 
     #[test]
     fn flags_consecutive_semicolons_separated_by_comment() {
-        let issues = run("SELECT 1; /* keep */ ;");
+        let sql = "SELECT 1; /* keep */ ;";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_ST_012);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert!(
+            fixed.contains("/* keep */"),
+            "comment should be preserved after ST012 autofix: {fixed}"
+        );
+        assert_eq!(fixed.matches(';').count(), 1);
     }
 
     #[test]
@@ -274,8 +318,8 @@ mod tests {
     #[test]
     fn mysql_hash_comment_is_treated_as_trivia() {
         let sql = "SELECT 1; # dialect-specific comment\n;";
-        assert!(!sql_has_consecutive_semicolons(sql, Dialect::Generic, None));
-        assert!(sql_has_consecutive_semicolons(sql, Dialect::Mysql, None));
+        assert!(consecutive_semicolon_fix(sql, Dialect::Generic, None).is_none());
+        assert!(consecutive_semicolon_fix(sql, Dialect::Mysql, None).is_some());
 
         let issues = run_in_dialect(sql, Dialect::Mysql);
         assert_eq!(issues.len(), 1);

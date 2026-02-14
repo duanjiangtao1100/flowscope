@@ -629,6 +629,56 @@ fn test_lint_fix_rule_configs_enable_cv003_require_core_autofix_in_patch_mode() 
 }
 
 #[test]
+fn test_lint_fix_applies_st012_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("consecutive_semicolons_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT 1;;").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT 1;",
+        "Expected ST012 core autofix to collapse consecutive semicolons"
+    );
+}
+
+#[test]
+fn test_lint_fix_applies_lt013_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("leading_blank_lines_patch_fix.sql");
+    std::fs::write(&sql_path, "\n\nSELECT 1").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT 1",
+        "Expected LT013 core autofix to remove leading blank lines"
+    );
+}
+
+#[test]
 fn test_lint_multiple_files() {
     let dir = tempdir().expect("temp dir");
     let clean_path = dir.path().join("clean.sql");

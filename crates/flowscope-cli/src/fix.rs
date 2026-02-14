@@ -694,17 +694,11 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_JJ_001) {
         out = fix_jinja_padding(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_ST_012) {
-        out = fix_consecutive_semicolons(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_CV_006) {
         out = fix_statement_terminators(&out, dialect, rule_filter.cv06_require_final_semicolon);
     }
     if rule_filter.allows(issue_codes::LINT_CV_001) {
         out = fix_not_equal_operator(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_LT_013) {
-        out = fix_leading_blank_lines(&out);
     }
     if rule_filter.allows(issue_codes::LINT_LT_015) {
         out = fix_excessive_blank_lines(&out);
@@ -1644,61 +1638,6 @@ where
     out
 }
 
-fn fix_consecutive_semicolons(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return collapse_semicolon_runs_without_tokenizer(sql);
-    };
-
-    let mut out = String::with_capacity(sql.len());
-    let mut cursor = 0usize;
-    let mut idx = 0usize;
-
-    while idx < tokens.len() {
-        if !matches!(tokens[idx].token, Token::SemiColon) {
-            idx += 1;
-            continue;
-        }
-
-        let mut j = idx + 1;
-        let mut semicolon_count = 1usize;
-        let mut last_semicolon_end = tokens[idx].end;
-
-        while j < tokens.len() {
-            match &tokens[j].token {
-                Token::SemiColon => {
-                    semicolon_count += 1;
-                    last_semicolon_end = tokens[j].end;
-                    j += 1;
-                }
-                token if is_trivia_token(token) => {
-                    j += 1;
-                }
-                _ => break,
-            }
-        }
-
-        if semicolon_count < 2 {
-            idx += 1;
-            continue;
-        }
-
-        let run_start = tokens[idx].start;
-        if run_start > cursor {
-            out.push_str(&sql[cursor..run_start]);
-        }
-        out.push(';');
-        cursor = last_semicolon_end;
-        idx = j;
-    }
-
-    if cursor == 0 {
-        return sql.to_string();
-    }
-
-    out.push_str(&sql[cursor..]);
-    out
-}
-
 fn fix_statement_terminators(sql: &str, dialect: Dialect, require_final_semicolon: bool) -> String {
     let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
         return sql.to_string();
@@ -1735,46 +1674,6 @@ fn fix_statement_terminators(sql: &str, dialect: Dialect, require_final_semicolo
     }
 
     apply_span_edits(sql, edits)
-}
-
-fn collapse_semicolon_runs_without_tokenizer(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if bytes[i] != b';' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-
-        let mut j = i + 1;
-        let mut semicolon_count = 1usize;
-        let mut scan = j;
-        while scan < bytes.len() {
-            while scan < bytes.len() && is_ascii_whitespace_byte(bytes[scan]) {
-                scan += 1;
-            }
-            if scan < bytes.len() && bytes[scan] == b';' {
-                semicolon_count += 1;
-                scan += 1;
-                j = scan;
-            } else {
-                break;
-            }
-        }
-
-        if semicolon_count >= 2 {
-            out.push(';');
-            i = j;
-        } else {
-            out.push(';');
-            i += 1;
-        }
-    }
-
-    out
 }
 
 fn fix_not_equal_operator(sql: &str) -> String {
@@ -1821,19 +1720,6 @@ where
     }
 
     out
-}
-
-fn fix_leading_blank_lines(sql: &str) -> String {
-    let first_non_ws = sql
-        .char_indices()
-        .find(|(_, ch)| !ch.is_whitespace())
-        .map(|(idx, _)| idx)
-        .unwrap_or(sql.len());
-    let leading = &sql[..first_non_ws];
-    let Some(last_newline) = leading.rfind('\n') else {
-        return sql.to_string();
-    };
-    sql[last_newline + 1..].to_string()
 }
 
 fn fix_excessive_blank_lines(sql: &str) -> String {
@@ -7495,7 +7381,16 @@ mod tests {
     #[test]
     fn consecutive_semicolon_fix_ignores_string_literal_content() {
         let sql = "SELECT 'a;;b' AS txt;;";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
         assert!(
             out.sql.contains("'a;;b'"),
             "string literal content must be preserved: {}",
@@ -7510,8 +7405,17 @@ mod tests {
 
     #[test]
     fn consecutive_semicolon_fix_collapses_whitespace_separated_runs() {
-        let fixed = fix_consecutive_semicolons("SELECT 1;\n \t ;", Dialect::Generic);
-        assert_eq!(fixed, "SELECT 1;");
+        let out = apply_lint_fixes_with_options(
+            "SELECT 1;\n \t ;",
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
+        assert_eq!(out.sql.matches(';').count(), 1);
     }
 
     #[test]

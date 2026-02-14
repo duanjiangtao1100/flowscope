@@ -351,6 +351,52 @@ async fn lint_fix_rule_config_enables_cv003_require_core_autofix() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_st012_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1;;"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1;",
+        "expected ST012 core autofix to collapse consecutive semicolons"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_applies_lt013_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "\n\nSELECT 1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1",
+        "expected LT013 core autofix to remove leading blank lines"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
