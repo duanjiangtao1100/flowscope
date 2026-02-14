@@ -198,7 +198,7 @@ fn has_missing_padding_before(sql: &str, delimiter_start: usize) -> bool {
         return true;
     }
 
-    match sql[..delimiter_start].chars().rev().next() {
+    match sql[..delimiter_start].chars().next_back() {
         Some(prev) => !is_padding_or_trim_marker(prev),
         None => true,
     }

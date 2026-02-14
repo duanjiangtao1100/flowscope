@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use super::semantic_helpers::visit_selects_in_statement;
 
+#[derive(Default)]
 pub struct AliasingForbidSingleTable {
     force_enable: bool,
 }
@@ -21,14 +22,6 @@ impl AliasingForbidSingleTable {
             force_enable: config
                 .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
                 .unwrap_or(false),
-        }
-    }
-}
-
-impl Default for AliasingForbidSingleTable {
-    fn default() -> Self {
-        Self {
-            force_enable: false,
         }
     }
 }

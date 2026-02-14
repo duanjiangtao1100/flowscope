@@ -49,7 +49,10 @@ pub use types::{
     GlobalLineage,
     GlobalNode,
     Issue,
+    IssueAutofix,
+    IssueAutofixApplicability,
     IssueCount,
+    IssuePatchEdit,
     JoinType,
     // Legacy
     LineageResult,

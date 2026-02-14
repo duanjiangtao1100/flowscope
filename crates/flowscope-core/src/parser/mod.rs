@@ -78,8 +78,8 @@ fn looks_like_postgres_syntax(sql: &str) -> bool {
 
 fn sanitize_escaped_identifiers_for_dialect(sql: &str, dialect: Dialect) -> Option<String> {
     let delimiters: &[u8] = match dialect {
-        Dialect::Bigquery => &[b'`'],
-        Dialect::Clickhouse => &[b'`', b'"'],
+        Dialect::Bigquery => b"`",
+        Dialect::Clickhouse => b"`\"",
         _ => return None,
     };
 

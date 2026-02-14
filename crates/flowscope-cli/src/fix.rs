@@ -5,10 +5,15 @@
 //! - Text rewrites for parity-style formatting/convention rules.
 //! - Lint before/after comparison to report per-rule removed violations.
 
+use crate::fix_engine::{
+    apply_edits as apply_patch_edits, derive_protected_ranges, plan_fixes, BlockedReason,
+    Edit as PatchEdit, Fix as PatchFix, FixApplicability as PatchApplicability,
+    ProtectedRange as PatchProtectedRange, ProtectedRangeKind,
+};
 use flowscope_core::linter::config::canonicalize_rule_code;
 use flowscope_core::{
     analyze, issue_codes, linter::helpers as lint_helpers, parse_sql_with_dialect, AnalysisOptions,
-    AnalyzeRequest, Dialect, LintConfig, ParseError,
+    AnalyzeRequest, Dialect, Issue, LintConfig, ParseError,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
@@ -58,6 +63,22 @@ pub struct FixOutcome {
     pub changed: bool,
     pub skipped_due_to_comments: bool,
     pub skipped_due_to_regression: bool,
+    pub skipped_counts: FixSkippedCounts,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct FixSkippedCounts {
+    pub unsafe_skipped: usize,
+    pub protected_range_blocked: usize,
+    pub overlap_conflict_blocked: usize,
+    pub display_only: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[must_use]
+pub struct FixOptions {
+    pub include_unsafe_fixes: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -248,13 +269,20 @@ impl RuleFilter {
             canonicalize_rule_code(code).unwrap_or_else(|| code.trim().to_ascii_uppercase());
         !self.disabled.contains(&canonical)
     }
+
+    fn with_rule_disabled(&self, code: &str) -> Self {
+        let mut updated = self.clone();
+        let canonical =
+            canonicalize_rule_code(code).unwrap_or_else(|| code.trim().to_ascii_uppercase());
+        updated.disabled.insert(canonical);
+        updated
+    }
 }
 
 /// Apply deterministic lint fixes to a SQL document.
 ///
 /// Notes:
-/// - If comment markers are detected, auto-fix is skipped to avoid losing
-///   comments when rendering SQL from AST.
+/// - Fixes are planned as localized patches and applied only when non-overlapping.
 /// - Parse errors are returned so callers can decide whether to continue linting.
 pub fn apply_lint_fixes(
     sql: &str,
@@ -277,53 +305,138 @@ pub fn apply_lint_fixes_with_lint_config(
     dialect: Dialect,
     lint_config: &LintConfig,
 ) -> Result<FixOutcome, ParseError> {
+    apply_lint_fixes_with_options(
+        sql,
+        dialect,
+        lint_config,
+        FixOptions {
+            // Preserve existing behavior for direct/internal callers.
+            include_unsafe_fixes: true,
+        },
+    )
+}
+
+pub fn apply_lint_fixes_with_options(
+    sql: &str,
+    dialect: Dialect,
+    lint_config: &LintConfig,
+    fix_options: FixOptions,
+) -> Result<FixOutcome, ParseError> {
     let rule_filter = RuleFilter::from_lint_config(lint_config);
+    let safe_rule_filter = if fix_options.include_unsafe_fixes {
+        rule_filter.clone()
+    } else {
+        // Structural subquery-to-CTE rewrites are useful but higher risk and
+        // therefore opt-in under `--unsafe-fixes`.
+        rule_filter.with_rule_disabled(issue_codes::LINT_ST_005)
+    };
 
-    if contains_comment_markers(sql, dialect) {
-        return Ok(FixOutcome {
-            sql: sql.to_string(),
-            counts: FixCounts::default(),
-            changed: false,
-            skipped_due_to_comments: true,
-            skipped_due_to_regression: false,
-        });
-    }
-
-    let before_counts = lint_rule_counts(sql, dialect, lint_config);
+    let before_issues = lint_issues(sql, dialect, lint_config);
+    let before_counts = lint_rule_counts_from_issues(&before_issues);
     let mut statements = parse_sql_with_dialect(sql, dialect)?;
     for stmt in &mut statements {
-        fix_statement(stmt, &rule_filter);
+        fix_statement(stmt, &safe_rule_filter);
     }
 
-    let mut fixed_sql = render_statements(&statements, sql);
-    fixed_sql = apply_text_fixes(&fixed_sql, &rule_filter, dialect);
-    fixed_sql = apply_am005_full_outer_keyword_fix(&fixed_sql, &rule_filter);
-    fixed_sql = apply_al001_alias_style_fix(sql, &fixed_sql, dialect, &rule_filter);
+    let mut rewritten_sql = render_statements(&statements, sql);
+    rewritten_sql = apply_text_fixes(&rewritten_sql, &safe_rule_filter, dialect);
+    rewritten_sql = apply_am005_full_outer_keyword_fix(&rewritten_sql, &safe_rule_filter);
+    rewritten_sql = apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
+    if fix_options.include_unsafe_fixes {
+        rewritten_sql = apply_post_cte_layout_fixes(&rewritten_sql, &safe_rule_filter, dialect);
+    }
+
+    let core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
+
+    let mut candidates = build_fix_candidates_from_rewrite(
+        sql,
+        &rewritten_sql,
+        FixCandidateApplicability::Safe,
+        FixCandidateSource::PrimaryRewrite,
+    );
+    candidates.extend(core_candidates.iter().cloned());
+    if !fix_options.include_unsafe_fixes {
+        let mut unsafe_statements = parse_sql_with_dialect(sql, dialect)?;
+        for stmt in &mut unsafe_statements {
+            fix_statement(stmt, &rule_filter);
+        }
+        let mut unsafe_sql = render_statements(&unsafe_statements, sql);
+        unsafe_sql = apply_text_fixes(&unsafe_sql, &rule_filter, dialect);
+        unsafe_sql = apply_am005_full_outer_keyword_fix(&unsafe_sql, &rule_filter);
+        unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
+        unsafe_sql = apply_post_cte_layout_fixes(&unsafe_sql, &rule_filter, dialect);
+        if unsafe_sql != rewritten_sql {
+            candidates.extend(build_fix_candidates_from_rewrite(
+                sql,
+                &unsafe_sql,
+                FixCandidateApplicability::Unsafe,
+                FixCandidateSource::UnsafeFallback,
+            ));
+        }
+    }
+
+    let protected_ranges =
+        collect_comment_protected_ranges(sql, dialect, !fix_options.include_unsafe_fixes);
+    let planned = plan_fix_candidates(
+        sql,
+        candidates,
+        &protected_ranges,
+        fix_options.include_unsafe_fixes,
+    );
+    let fixed_sql = apply_planned_edits(sql, &planned.edits);
 
     let after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
     let counts = FixCounts::from_removed(&before_counts, &after_counts);
+    let before_total: usize = before_counts.values().sum();
+    let after_total: usize = after_counts.values().sum();
 
     if parse_errors_increased(&before_counts, &after_counts) {
+        if let Some(outcome) = try_core_only_fix_plan(
+            sql,
+            dialect,
+            lint_config,
+            &before_counts,
+            &core_candidates,
+            &protected_ranges,
+            fix_options.include_unsafe_fixes,
+        ) {
+            return Ok(outcome);
+        }
+
         return Ok(FixOutcome {
             sql: sql.to_string(),
             counts: FixCounts::default(),
             changed: false,
             skipped_due_to_comments: false,
             skipped_due_to_regression: true,
+            skipped_counts: planned.skipped,
         });
     }
 
     if counts.total() == 0 {
         // Regression guard: no rules improved. Flag as regression if total violations
         // actually increased (text-fix side effects introduced new violations).
-        let before_total: usize = before_counts.values().sum();
-        let after_total: usize = after_counts.values().sum();
+        if after_total > before_total {
+            if let Some(outcome) = try_core_only_fix_plan(
+                sql,
+                dialect,
+                lint_config,
+                &before_counts,
+                &core_candidates,
+                &protected_ranges,
+                fix_options.include_unsafe_fixes,
+            ) {
+                return Ok(outcome);
+            }
+        }
+
         return Ok(FixOutcome {
             sql: sql.to_string(),
             counts,
             changed: false,
             skipped_due_to_comments: false,
             skipped_due_to_regression: after_total > before_total,
+            skipped_counts: planned.skipped,
         });
     }
     let changed = fixed_sql != sql;
@@ -334,10 +447,12 @@ pub fn apply_lint_fixes_with_lint_config(
         changed,
         skipped_due_to_comments: false,
         skipped_due_to_regression: false,
+        skipped_counts: planned.skipped,
     })
 }
 
 /// Check whether SQL contains comment markers outside of quoted regions.
+#[cfg(test)]
 fn contains_comment_markers(sql: &str, dialect: Dialect) -> bool {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ScanMode {
@@ -456,6 +571,11 @@ fn lint_rule_counts(
     dialect: Dialect,
     lint_config: &LintConfig,
 ) -> BTreeMap<String, usize> {
+    let issues = lint_issues(sql, dialect, lint_config);
+    lint_rule_counts_from_issues(&issues)
+}
+
+fn lint_issues(sql: &str, dialect: Dialect, lint_config: &LintConfig) -> Vec<Issue> {
     let request = AnalyzeRequest {
         sql: sql.to_string(),
         files: None,
@@ -470,13 +590,17 @@ fn lint_rule_counts(
         template_config: None,
     };
 
-    let mut counts = BTreeMap::new();
-    for issue in analyze(&request)
+    analyze(&request)
         .issues
         .into_iter()
         .filter(|issue| issue.code.starts_with("LINT_") || issue.code == issue_codes::PARSE_ERROR)
-    {
-        *counts.entry(issue.code).or_insert(0usize) += 1;
+        .collect()
+}
+
+fn lint_rule_counts_from_issues(issues: &[Issue]) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for issue in issues {
+        *counts.entry(issue.code.clone()).or_insert(0usize) += 1;
     }
     counts
 }
@@ -493,6 +617,56 @@ fn parse_errors_increased(
             .get(issue_codes::PARSE_ERROR)
             .copied()
             .unwrap_or(0)
+}
+
+fn try_core_only_fix_plan(
+    sql: &str,
+    dialect: Dialect,
+    lint_config: &LintConfig,
+    before_counts: &BTreeMap<String, usize>,
+    core_candidates: &[FixCandidate],
+    protected_ranges: &[PatchProtectedRange],
+    allow_unsafe: bool,
+) -> Option<FixOutcome> {
+    if core_candidates.is_empty() {
+        return None;
+    }
+
+    let planned = plan_fix_candidates(
+        sql,
+        core_candidates.to_vec(),
+        protected_ranges,
+        allow_unsafe,
+    );
+    if planned.edits.is_empty() {
+        return None;
+    }
+
+    let fixed_sql = apply_planned_edits(sql, &planned.edits);
+    if fixed_sql == sql {
+        return None;
+    }
+
+    let after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
+    if parse_errors_increased(before_counts, &after_counts) {
+        return None;
+    }
+
+    let counts = FixCounts::from_removed(before_counts, &after_counts);
+    let before_total: usize = before_counts.values().sum();
+    let after_total: usize = after_counts.values().sum();
+    if counts.total() == 0 || after_total > before_total {
+        return None;
+    }
+
+    Some(FixOutcome {
+        sql: fixed_sql,
+        counts,
+        changed: true,
+        skipped_due_to_comments: false,
+        skipped_due_to_regression: false,
+        skipped_counts: planned.skipped,
+    })
 }
 
 fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
@@ -628,6 +802,17 @@ fn apply_al001_alias_style_fix(
     }
 }
 
+fn apply_post_cte_layout_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
+    let mut out = sql.to_string();
+    if rule_filter.allows(issue_codes::LINT_LT_007) {
+        out = fix_cte_bracket(&out, dialect);
+    }
+    if rule_filter.allows(issue_codes::LINT_LT_008) {
+        out = fix_cte_newline(&out, dialect);
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 struct TableAliasOccurrence {
     alias_key: String,
@@ -724,6 +909,545 @@ impl SpanEdit {
             replacement: replacement.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+#[allow(dead_code)]
+enum FixCandidateApplicability {
+    Safe,
+    Unsafe,
+    DisplayOnly,
+}
+
+impl FixCandidateApplicability {
+    fn sort_key(self) -> u8 {
+        match self {
+            Self::Safe => 0,
+            Self::Unsafe => 1,
+            Self::DisplayOnly => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+#[allow(dead_code)]
+enum FixCandidateSource {
+    PrimaryRewrite,
+    CoreAutofix,
+    UnsafeFallback,
+    DisplayHint,
+}
+
+impl FixCandidateSource {
+    fn sort_key(self) -> u8 {
+        match self {
+            Self::PrimaryRewrite => 0,
+            Self::CoreAutofix => 1,
+            Self::UnsafeFallback => 2,
+            Self::DisplayHint => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FixCandidate {
+    start: usize,
+    end: usize,
+    replacement: String,
+    applicability: FixCandidateApplicability,
+    source: FixCandidateSource,
+}
+
+#[derive(Debug, Default)]
+struct PlannedFixes {
+    edits: Vec<PatchEdit>,
+    skipped: FixSkippedCounts,
+}
+
+fn build_fix_candidates_from_rewrite(
+    sql: &str,
+    rewritten_sql: &str,
+    applicability: FixCandidateApplicability,
+    source: FixCandidateSource,
+) -> Vec<FixCandidate> {
+    if sql == rewritten_sql {
+        return Vec::new();
+    }
+
+    let mut candidates = derive_localized_span_edits(sql, rewritten_sql)
+        .into_iter()
+        .map(|edit| FixCandidate {
+            start: edit.start,
+            end: edit.end,
+            replacement: edit.replacement,
+            applicability,
+            source,
+        })
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        candidates.push(FixCandidate {
+            start: 0,
+            end: sql.len(),
+            replacement: rewritten_sql.to_string(),
+            applicability,
+            source,
+        });
+    }
+
+    candidates
+}
+
+fn build_fix_candidates_from_issue_autofixes(sql: &str, issues: &[Issue]) -> Vec<FixCandidate> {
+    let issue_values: Vec<serde_json::Value> = issues
+        .iter()
+        .filter_map(|issue| serde_json::to_value(issue).ok())
+        .collect();
+    build_fix_candidates_from_issue_values(sql, &issue_values)
+}
+
+fn build_fix_candidates_from_issue_values(
+    sql: &str,
+    issue_values: &[serde_json::Value],
+) -> Vec<FixCandidate> {
+    let mut candidates = Vec::new();
+    let sql_len = sql.len();
+
+    for issue in issue_values {
+        let fallback_span = issue.get("span").and_then(json_span_offsets);
+        let Some(autofix) = issue.get("autofix").or_else(|| issue.get("autoFix")) else {
+            continue;
+        };
+        collect_issue_autofix_candidates(autofix, fallback_span, sql_len, None, &mut candidates);
+    }
+
+    candidates
+}
+
+fn collect_issue_autofix_candidates(
+    value: &serde_json::Value,
+    fallback_span: Option<(usize, usize)>,
+    sql_len: usize,
+    inherited_applicability: Option<FixCandidateApplicability>,
+    out: &mut Vec<FixCandidate>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_issue_autofix_candidates(
+                    item,
+                    fallback_span,
+                    sql_len,
+                    inherited_applicability,
+                    out,
+                );
+            }
+        }
+        serde_json::Value::Object(_) => {
+            let applicability = parse_issue_autofix_applicability(value)
+                .or(inherited_applicability)
+                .unwrap_or(FixCandidateApplicability::Safe);
+
+            if let Some(edit) = value.get("edit") {
+                collect_issue_autofix_candidates(
+                    edit,
+                    fallback_span,
+                    sql_len,
+                    Some(applicability),
+                    out,
+                );
+            }
+            if let Some(edits) = value
+                .get("edits")
+                .or_else(|| value.get("fixes"))
+                .or_else(|| value.get("changes"))
+            {
+                collect_issue_autofix_candidates(
+                    edits,
+                    fallback_span,
+                    sql_len,
+                    Some(applicability),
+                    out,
+                );
+            }
+
+            if let Some((start, end)) = parse_issue_autofix_offsets(value, fallback_span) {
+                if start <= end
+                    && end <= sql_len
+                    && value
+                        .get("replacement")
+                        .or_else(|| value.get("new_text"))
+                        .or_else(|| value.get("newText"))
+                        .or_else(|| value.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                {
+                    let replacement = value
+                        .get("replacement")
+                        .or_else(|| value.get("new_text"))
+                        .or_else(|| value.get("newText"))
+                        .or_else(|| value.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+
+                    out.push(FixCandidate {
+                        start,
+                        end,
+                        replacement,
+                        applicability,
+                        source: FixCandidateSource::CoreAutofix,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_issue_autofix_offsets(
+    value: &serde_json::Value,
+    fallback_span: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    let object = value.as_object()?;
+
+    let mut start = json_usize_field(object, &["start", "start_byte", "startByte"]);
+    let mut end = json_usize_field(object, &["end", "end_byte", "endByte"]);
+
+    if let Some((span_start, span_end)) = object.get("span").and_then(json_span_offsets) {
+        if start.is_none() {
+            start = Some(span_start);
+        }
+        if end.is_none() {
+            end = Some(span_end);
+        }
+    }
+
+    if let Some((span_start, span_end)) = fallback_span {
+        if start.is_none() {
+            start = Some(span_start);
+        }
+        if end.is_none() {
+            end = Some(span_end);
+        }
+    }
+
+    Some((start?, end?))
+}
+
+fn json_span_offsets(value: &serde_json::Value) -> Option<(usize, usize)> {
+    let object = value.as_object()?;
+    let start = json_usize_field(object, &["start", "start_byte", "startByte"])?;
+    let end = json_usize_field(object, &["end", "end_byte", "endByte"])?;
+    Some((start, end))
+}
+
+fn json_usize_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<usize> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|raw| usize::try_from(raw).ok())
+                .or_else(|| value.as_str().and_then(|raw| raw.parse::<usize>().ok()))
+        })
+    })
+}
+
+fn parse_issue_autofix_applicability(
+    value: &serde_json::Value,
+) -> Option<FixCandidateApplicability> {
+    let object = value.as_object()?;
+
+    if object
+        .get("display_only")
+        .or_else(|| object.get("displayOnly"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Some(FixCandidateApplicability::DisplayOnly);
+    }
+    if object.get("unsafe").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Some(FixCandidateApplicability::Unsafe);
+    }
+
+    let text = object
+        .get("applicability")
+        .or_else(|| object.get("safety"))
+        .or_else(|| object.get("kind"))
+        .or_else(|| object.get("mode"))
+        .and_then(serde_json::Value::as_str)?;
+    parse_issue_autofix_applicability_text(text)
+}
+
+fn parse_issue_autofix_applicability_text(text: &str) -> Option<FixCandidateApplicability> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "safe" => Some(FixCandidateApplicability::Safe),
+        "unsafe" => Some(FixCandidateApplicability::Unsafe),
+        "display_only" | "display-only" | "displayonly" | "display" | "hint" | "suggestion" => {
+            Some(FixCandidateApplicability::DisplayOnly)
+        }
+        _ => None,
+    }
+}
+
+fn plan_fix_candidates(
+    sql: &str,
+    mut candidates: Vec<FixCandidate>,
+    protected_ranges: &[PatchProtectedRange],
+    allow_unsafe: bool,
+) -> PlannedFixes {
+    if candidates.is_empty() {
+        return PlannedFixes::default();
+    }
+
+    candidates.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| {
+                left.applicability
+                    .sort_key()
+                    .cmp(&right.applicability.sort_key())
+            })
+            .then_with(|| left.source.sort_key().cmp(&right.source.sort_key()))
+            .then_with(|| left.replacement.cmp(&right.replacement))
+    });
+    candidates.dedup_by(|left, right| {
+        left.start == right.start
+            && left.end == right.end
+            && left.replacement == right.replacement
+            && left.applicability == right.applicability
+            && left.source == right.source
+    });
+
+    let patch_fixes: Vec<PatchFix> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(idx, candidate)| {
+            let mut fix = PatchFix::new(
+                format!("PATCH_{:?}_{idx}", candidate.source),
+                patch_applicability(candidate.applicability),
+                vec![PatchEdit::replace(
+                    candidate.start,
+                    candidate.end,
+                    candidate.replacement,
+                )],
+            );
+            fix.priority = candidate.source.sort_key() as i32;
+            fix
+        })
+        .collect();
+
+    let mut allowed = vec![PatchApplicability::Safe];
+    if allow_unsafe {
+        allowed.push(PatchApplicability::Unsafe);
+    }
+
+    let plan = plan_fixes(sql, patch_fixes, &allowed, protected_ranges);
+    let mut skipped = FixSkippedCounts::default();
+    for blocked in &plan.blocked {
+        let reasons = &blocked.reasons;
+        if reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                BlockedReason::ApplicabilityNotAllowed {
+                    applicability: PatchApplicability::Unsafe
+                }
+            )
+        }) {
+            skipped.unsafe_skipped += 1;
+            continue;
+        }
+        if reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                BlockedReason::ApplicabilityNotAllowed {
+                    applicability: PatchApplicability::DisplayOnly
+                }
+            )
+        }) {
+            skipped.display_only += 1;
+            continue;
+        }
+        if reasons
+            .iter()
+            .any(|reason| matches!(reason, BlockedReason::TouchesProtectedRange { .. }))
+        {
+            skipped.protected_range_blocked += 1;
+            continue;
+        }
+        skipped.overlap_conflict_blocked += 1;
+    }
+
+    PlannedFixes {
+        edits: plan.accepted_edits(),
+        skipped,
+    }
+}
+
+fn patch_applicability(applicability: FixCandidateApplicability) -> PatchApplicability {
+    match applicability {
+        FixCandidateApplicability::Safe => PatchApplicability::Safe,
+        FixCandidateApplicability::Unsafe => PatchApplicability::Unsafe,
+        FixCandidateApplicability::DisplayOnly => PatchApplicability::DisplayOnly,
+    }
+}
+
+fn apply_planned_edits(sql: &str, edits: &[PatchEdit]) -> String {
+    apply_patch_edits(sql, edits)
+}
+
+fn collect_comment_protected_ranges(
+    sql: &str,
+    dialect: Dialect,
+    strict_safety_mode: bool,
+) -> Vec<PatchProtectedRange> {
+    derive_protected_ranges(sql, dialect)
+        .into_iter()
+        .filter(|range| strict_safety_mode || range.kind == ProtectedRangeKind::SqlComment)
+        .collect()
+}
+
+fn derive_localized_span_edits(original: &str, rewritten: &str) -> Vec<SpanEdit> {
+    if original == rewritten {
+        return Vec::new();
+    }
+
+    let original_chars = original.chars().collect::<Vec<_>>();
+    let rewritten_chars = rewritten.chars().collect::<Vec<_>>();
+
+    const MAX_DIFF_MATRIX_CELLS: usize = 2_500_000;
+    let matrix_cells = (original_chars.len() + 1).saturating_mul(rewritten_chars.len() + 1);
+    if matrix_cells > MAX_DIFF_MATRIX_CELLS {
+        return vec![SpanEdit::replace(0, original.len(), rewritten)];
+    }
+
+    let diff_steps = diff_steps_via_lcs(&original_chars, &rewritten_chars);
+    if diff_steps.is_empty() {
+        return Vec::new();
+    }
+
+    let original_offsets = char_to_byte_offsets(original);
+    let rewritten_offsets = char_to_byte_offsets(rewritten);
+
+    let mut edits = Vec::new();
+    let mut original_char_idx = 0usize;
+    let mut rewritten_char_idx = 0usize;
+    let mut step_idx = 0usize;
+
+    while step_idx < diff_steps.len() {
+        if matches!(diff_steps[step_idx], DiffStep::Equal) {
+            original_char_idx += 1;
+            rewritten_char_idx += 1;
+            step_idx += 1;
+            continue;
+        }
+
+        let edit_original_start = original_char_idx;
+        let edit_rewritten_start = rewritten_char_idx;
+
+        while step_idx < diff_steps.len() && !matches!(diff_steps[step_idx], DiffStep::Equal) {
+            match diff_steps[step_idx] {
+                DiffStep::Delete => original_char_idx += 1,
+                DiffStep::Insert => rewritten_char_idx += 1,
+                DiffStep::Equal => {}
+            }
+            step_idx += 1;
+        }
+
+        let start = original_offsets[edit_original_start];
+        let end = original_offsets[original_char_idx];
+        let replacement_start = rewritten_offsets[edit_rewritten_start];
+        let replacement_end = rewritten_offsets[rewritten_char_idx];
+        edits.push(SpanEdit::replace(
+            start,
+            end,
+            &rewritten[replacement_start..replacement_end],
+        ));
+    }
+
+    edits
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DiffStep {
+    Equal,
+    Delete,
+    Insert,
+}
+
+fn diff_steps_via_lcs(original: &[char], rewritten: &[char]) -> Vec<DiffStep> {
+    if original.is_empty() {
+        return vec![DiffStep::Insert; rewritten.len()];
+    }
+    if rewritten.is_empty() {
+        return vec![DiffStep::Delete; original.len()];
+    }
+
+    let cols = rewritten.len() + 1;
+    let mut lcs = vec![0u32; (original.len() + 1) * cols];
+
+    for original_idx in 0..original.len() {
+        for rewritten_idx in 0..rewritten.len() {
+            let cell = (original_idx + 1) * cols + rewritten_idx + 1;
+            lcs[cell] = if original[original_idx] == rewritten[rewritten_idx] {
+                lcs[original_idx * cols + rewritten_idx] + 1
+            } else {
+                lcs[original_idx * cols + rewritten_idx + 1]
+                    .max(lcs[(original_idx + 1) * cols + rewritten_idx])
+            };
+        }
+    }
+
+    let mut steps_reversed = Vec::with_capacity(original.len() + rewritten.len());
+    let mut original_idx = original.len();
+    let mut rewritten_idx = rewritten.len();
+
+    while original_idx > 0 || rewritten_idx > 0 {
+        if original_idx > 0
+            && rewritten_idx > 0
+            && original[original_idx - 1] == rewritten[rewritten_idx - 1]
+        {
+            steps_reversed.push(DiffStep::Equal);
+            original_idx -= 1;
+            rewritten_idx -= 1;
+            continue;
+        }
+
+        let left = if rewritten_idx > 0 {
+            lcs[original_idx * cols + rewritten_idx - 1]
+        } else {
+            0
+        };
+        let up = if original_idx > 0 {
+            lcs[(original_idx - 1) * cols + rewritten_idx]
+        } else {
+            0
+        };
+
+        if rewritten_idx > 0 && (original_idx == 0 || left >= up) {
+            steps_reversed.push(DiffStep::Insert);
+            rewritten_idx -= 1;
+        } else if original_idx > 0 {
+            steps_reversed.push(DiffStep::Delete);
+            original_idx -= 1;
+        }
+    }
+
+    steps_reversed.reverse();
+    steps_reversed
+}
+
+fn char_to_byte_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(text.chars().count() + 1);
+    offsets.push(0);
+    for (idx, ch) in text.char_indices() {
+        offsets.push(idx + ch.len_utf8());
+    }
+    offsets
 }
 
 fn apply_span_edits(sql: &str, mut edits: Vec<SpanEdit>) -> String {
@@ -4953,12 +5677,6 @@ fn fix_function(func: &mut Function, rule_filter: &RuleFilter) {
             func.name = vec![Ident::new("COALESCE")].into();
         }
     }
-
-    if rule_filter.allows(issue_codes::LINT_CV_004) && is_count_rowcount_numeric_literal(func) {
-        if let FunctionArguments::List(arg_list) = &mut func.args {
-            arg_list.args[0] = FunctionArg::Unnamed(FunctionArgExpr::Wildcard);
-        }
-    }
 }
 
 fn fix_function_arg(arg: &mut FunctionArg, rule_filter: &RuleFilter) {
@@ -4971,39 +5689,6 @@ fn fix_function_arg(arg: &mut FunctionArg, rule_filter: &RuleFilter) {
             }
         }
     }
-}
-
-fn is_count_rowcount_numeric_literal(func: &Function) -> bool {
-    if !func.name.to_string().eq_ignore_ascii_case("COUNT") {
-        return false;
-    }
-
-    let FunctionArguments::List(arg_list) = &func.args else {
-        return false;
-    };
-
-    if arg_list.duplicate_treatment.is_some() || !arg_list.clauses.is_empty() {
-        return false;
-    }
-
-    if arg_list.args.len() != 1 {
-        return false;
-    }
-
-    matches!(
-        &arg_list.args[0],
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-            value: Value::Number(n, _),
-            ..
-        }))) if numeric_literal_matches(n, 1) || numeric_literal_matches(n, 0)
-    )
-}
-
-fn numeric_literal_matches(raw: &str, expected: u8) -> bool {
-    raw.trim()
-        .parse::<u64>()
-        .ok()
-        .is_some_and(|value| value == expected as u64)
 }
 
 fn null_comparison_rewrite(expr: &Expr) -> Option<Expr> {
@@ -6383,22 +7068,103 @@ mod tests {
     }
 
     #[test]
-    fn skips_files_with_comments() {
-        let sql = "-- keep this comment\nSELECT COUNT(1) FROM t";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
-        assert!(!out.changed);
-        assert!(out.skipped_due_to_comments);
-        assert_eq!(out.sql, sql);
+    fn safe_mode_blocks_template_tag_edits_but_applies_non_template_fixes() {
+        let sql = "SELECT '{{foo}}' AS templated, COUNT(1) FROM t";
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: false,
+            },
+        )
+        .expect("fix result");
+
+        assert!(
+            out.sql.contains("{{foo}}"),
+            "template tag bytes should be preserved in safe mode: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "non-template safe fixes should still apply: {}",
+            out.sql
+        );
+        assert!(
+            out.skipped_counts.protected_range_blocked > 0,
+            "template-tag edits should be blocked in safe mode"
+        );
     }
 
     #[test]
-    fn skips_files_with_mysql_hash_comments() {
+    fn unsafe_mode_allows_template_tag_edits() {
+        let sql = "SELECT '{{foo}}' AS templated, COUNT(1) FROM t";
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: true,
+            },
+        )
+        .expect("fix result");
+
+        assert!(
+            out.sql.contains("{{ foo }}"),
+            "unsafe mode should allow template-tag formatting fixes: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "other fixes should still apply: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn comments_are_not_globally_skipped() {
+        let sql = "-- keep this comment\nSELECT COUNT(1) FROM t";
+        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        assert!(
+            !out.skipped_due_to_comments,
+            "comment presence should not skip all fixes"
+        );
+        assert!(
+            out.sql.contains("-- keep this comment"),
+            "comment text must be preserved: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "non-comment region should still be fixable: {}",
+            out.sql
+        );
+        assert!(
+            out.skipped_counts.protected_range_blocked > 0,
+            "planner should record blocked edits for protected comment ranges"
+        );
+    }
+
+    #[test]
+    fn mysql_hash_comments_are_not_globally_skipped() {
         let sql = "# keep this comment\nSELECT COUNT(1) FROM t";
         let out = apply_lint_fixes(sql, Dialect::Mysql, &[]).expect("fix result");
-        assert!(!out.changed);
-        assert!(out.skipped_due_to_comments);
-        assert_eq!(out.sql, sql);
+        assert!(
+            !out.skipped_due_to_comments,
+            "comment presence should not skip all fixes"
+        );
+        assert!(
+            out.sql.contains("# keep this comment"),
+            "comment text must be preserved: {}",
+            out.sql
+        );
+        assert!(
+            out.sql.to_ascii_uppercase().contains("COUNT(*)"),
+            "non-comment region should still be fixable: {}",
+            out.sql
+        );
     }
+
     #[test]
     fn does_not_treat_double_quoted_comment_markers_as_comments() {
         let sql = "SELECT \"a--b\", \"x/*y\" FROM t";
@@ -6423,6 +7189,243 @@ mod tests {
         let sql = "SELECT `a--b`, COUNT(1) FROM t";
         let out = apply_lint_fixes(sql, Dialect::Mysql, &[]).expect("fix result");
         assert!(!out.skipped_due_to_comments);
+    }
+
+    #[test]
+    fn planner_blocks_protected_ranges_and_applies_non_overlapping_edits() {
+        let sql = "-- keep\nSELECT 1";
+        let protected = collect_comment_protected_ranges(sql, Dialect::Generic, true);
+        let one_idx = sql.rfind('1').expect("digit exists");
+
+        let planned = plan_fix_candidates(
+            sql,
+            vec![
+                FixCandidate {
+                    start: 0,
+                    end: 7,
+                    replacement: String::new(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::PrimaryRewrite,
+                },
+                FixCandidate {
+                    start: one_idx,
+                    end: one_idx + 1,
+                    replacement: "2".to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::PrimaryRewrite,
+                },
+            ],
+            &protected,
+            false,
+        );
+
+        let applied = apply_planned_edits(sql, &planned.edits);
+        assert!(
+            applied.contains("-- keep"),
+            "comment should remain: {applied}"
+        );
+        assert!(
+            applied.ends_with("2"),
+            "expected non-overlapping edit: {applied}"
+        );
+        assert_eq!(planned.skipped.protected_range_blocked, 1);
+    }
+
+    #[test]
+    fn planner_is_deterministic_for_conflicting_candidates() {
+        let sql = "SELECT 1";
+        let one_idx = sql.rfind('1').expect("digit exists");
+
+        let left_first = plan_fix_candidates(
+            sql,
+            vec![
+                FixCandidate {
+                    start: one_idx,
+                    end: one_idx + 1,
+                    replacement: "9".to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::PrimaryRewrite,
+                },
+                FixCandidate {
+                    start: one_idx,
+                    end: one_idx + 1,
+                    replacement: "2".to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::PrimaryRewrite,
+                },
+            ],
+            &[],
+            false,
+        );
+        let right_first = plan_fix_candidates(
+            sql,
+            vec![
+                FixCandidate {
+                    start: one_idx,
+                    end: one_idx + 1,
+                    replacement: "2".to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::PrimaryRewrite,
+                },
+                FixCandidate {
+                    start: one_idx,
+                    end: one_idx + 1,
+                    replacement: "9".to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::PrimaryRewrite,
+                },
+            ],
+            &[],
+            false,
+        );
+
+        let left_sql = apply_planned_edits(sql, &left_first.edits);
+        let right_sql = apply_planned_edits(sql, &right_first.edits);
+        assert_eq!(left_sql, "SELECT 2");
+        assert_eq!(left_sql, right_sql);
+        assert_eq!(left_first.skipped.overlap_conflict_blocked, 1);
+        assert_eq!(right_first.skipped.overlap_conflict_blocked, 1);
+    }
+
+    #[test]
+    fn core_autofix_candidates_are_collected_and_applied() {
+        let sql = "SELECT 1";
+        let one_idx = sql.rfind('1').expect("digit exists");
+        let issues = vec![serde_json::json!({
+            "code": issue_codes::LINT_CV_004,
+            "span": { "start": one_idx, "end": one_idx + 1 },
+            "autofix": {
+                "applicability": "safe",
+                "edits": [
+                    {
+                        "start": one_idx,
+                        "end": one_idx + 1,
+                        "replacement": "2"
+                    }
+                ]
+            }
+        })];
+        let candidates = build_fix_candidates_from_issue_values(sql, &issues);
+
+        assert_eq!(candidates.len(), 1);
+        let planned = plan_fix_candidates(sql, candidates, &[], false);
+        let applied = apply_planned_edits(sql, &planned.edits);
+        assert_eq!(applied, "SELECT 2");
+    }
+
+    #[test]
+    fn planner_prefers_rewrite_candidates_over_core_autofix_conflicts() {
+        let sql = "SELECT 1";
+        let one_idx = sql.rfind('1').expect("digit exists");
+        let core_issue = serde_json::json!({
+            "code": issue_codes::LINT_CV_004,
+            "autofix": {
+                "start": one_idx,
+                "end": one_idx + 1,
+                "replacement": "9",
+                "applicability": "safe"
+            }
+        });
+        let core_candidate = build_fix_candidates_from_issue_values(sql, &[core_issue])[0].clone();
+        let rewrite_candidate = FixCandidate {
+            start: one_idx,
+            end: one_idx + 1,
+            replacement: "2".to_string(),
+            applicability: FixCandidateApplicability::Safe,
+            source: FixCandidateSource::PrimaryRewrite,
+        };
+
+        let left_first = plan_fix_candidates(
+            sql,
+            vec![rewrite_candidate.clone(), core_candidate.clone()],
+            &[],
+            false,
+        );
+        let right_first =
+            plan_fix_candidates(sql, vec![core_candidate, rewrite_candidate], &[], false);
+
+        let left_sql = apply_planned_edits(sql, &left_first.edits);
+        let right_sql = apply_planned_edits(sql, &right_first.edits);
+        assert_eq!(left_sql, "SELECT 2");
+        assert_eq!(left_sql, right_sql);
+        assert_eq!(left_first.skipped.overlap_conflict_blocked, 1);
+        assert_eq!(right_first.skipped.overlap_conflict_blocked, 1);
+    }
+
+    #[test]
+    fn core_autofix_applicability_is_mapped_to_existing_planner_logic() {
+        let sql = "SELECT 1";
+        let one_idx = sql.rfind('1').expect("digit exists");
+        let issues = vec![
+            serde_json::json!({
+                "code": issue_codes::LINT_ST_005,
+                "autofix": {
+                    "start": one_idx,
+                    "end": one_idx + 1,
+                    "replacement": "2",
+                    "applicability": "unsafe"
+                }
+            }),
+            serde_json::json!({
+                "code": issue_codes::LINT_ST_005,
+                "autofix": {
+                    "start": one_idx,
+                    "end": one_idx + 1,
+                    "replacement": "3",
+                    "applicability": "display_only"
+                }
+            }),
+        ];
+        let candidates = build_fix_candidates_from_issue_values(sql, &issues);
+
+        assert_eq!(
+            candidates[0].applicability,
+            FixCandidateApplicability::Unsafe
+        );
+        assert_eq!(
+            candidates[1].applicability,
+            FixCandidateApplicability::DisplayOnly
+        );
+
+        let planned_safe = plan_fix_candidates(sql, candidates.clone(), &[], false);
+        assert_eq!(apply_planned_edits(sql, &planned_safe.edits), sql);
+        assert_eq!(planned_safe.skipped.unsafe_skipped, 1);
+        assert_eq!(planned_safe.skipped.display_only, 1);
+
+        let planned_unsafe = plan_fix_candidates(sql, candidates, &[], true);
+        assert_eq!(apply_planned_edits(sql, &planned_unsafe.edits), "SELECT 2");
+        assert_eq!(planned_unsafe.skipped.display_only, 1);
+    }
+
+    #[test]
+    fn planner_tracks_unsafe_and_display_only_skips() {
+        let sql = "SELECT 1";
+        let one_idx = sql.rfind('1').expect("digit exists");
+        let planned = plan_fix_candidates(
+            sql,
+            vec![
+                FixCandidate {
+                    start: one_idx,
+                    end: one_idx + 1,
+                    replacement: "2".to_string(),
+                    applicability: FixCandidateApplicability::Unsafe,
+                    source: FixCandidateSource::UnsafeFallback,
+                },
+                FixCandidate {
+                    start: 0,
+                    end: 0,
+                    replacement: String::new(),
+                    applicability: FixCandidateApplicability::DisplayOnly,
+                    source: FixCandidateSource::DisplayHint,
+                },
+            ],
+            &[],
+            false,
+        );
+        let applied = apply_planned_edits(sql, &planned.edits);
+        assert_eq!(applied, sql);
+        assert_eq!(planned.skipped.unsafe_skipped, 1);
+        assert_eq!(planned.skipped.display_only, 1);
     }
 
     #[test]

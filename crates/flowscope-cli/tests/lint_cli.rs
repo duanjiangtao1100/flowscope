@@ -20,6 +20,71 @@ INNER JOIN (
         {{"mrgn"}} AS margin
     FROM b_tbl
 ) AS b_table ON a_table.some_column = b_table.some_column"#;
+/// Representative SQL with comments and one deterministic safe fix candidate.
+const SQL_COMMENTED_SAFE_FIX: &str =
+    "-- keep:lead\nSELECT COUNT(1) AS row_count /* keep:mid */\nFROM t -- keep:tail\n";
+/// Representative query used to validate safe-vs-unsafe fix behavior.
+const SQL_UNSAFE_FIX_REPRESENTATIVE: &str =
+    "SELECT t.id\nFROM t\nINNER JOIN (\n    SELECT id\n    FROM u\n) AS u2 ON t.id = u2.id\n";
+
+fn run_flowscope(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(args)
+        .output()
+        .expect("run CLI")
+}
+
+fn combined_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!("{stdout}\n{stderr}")
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    let lowercase = haystack.to_ascii_lowercase();
+    needles
+        .iter()
+        .any(|needle| lowercase.contains(&needle.to_ascii_lowercase()))
+}
+
+fn assert_flag_was_accepted(output: &std::process::Output, flag: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected {flag} to be accepted by the CLI, got clap parse failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "Expected {flag} to be accepted, but CLI reported an unexpected argument: {stderr}"
+    );
+}
+
+fn lint_violation_codes(sql_path: &std::path::Path) -> Vec<String> {
+    let output = run_flowscope(&[
+        "--lint",
+        "--format",
+        "json",
+        sql_path.to_str().expect("sql path"),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
+        panic!("Expected valid lint JSON output, got error: {err}; stdout: {stdout}")
+    });
+    let files = parsed.as_array().expect("Expected top-level JSON array");
+    assert_eq!(files.len(), 1, "Expected exactly one file result: {stdout}");
+    files[0]["violations"]
+        .as_array()
+        .expect("Expected violations array")
+        .iter()
+        .map(|violation| {
+            violation["code"]
+                .as_str()
+                .unwrap_or("<unknown>")
+                .to_string()
+        })
+        .collect()
+}
 
 #[test]
 fn test_lint_clean_file() {
@@ -534,5 +599,165 @@ fn test_lint_directory_recursively() {
     assert!(
         !stdout.contains("notes.txt"),
         "Expected non-sql files to be ignored: {stdout}"
+    );
+}
+
+#[test]
+fn test_lint_fix_can_modify_commented_sql_while_preserving_comment_bytes() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("commented_safe_fix.sql");
+    std::fs::write(&sql_path, SQL_COMMENTED_SAFE_FIX).expect("write sql");
+
+    let output = run_flowscope(&["--lint", "--fix", sql_path.to_str().expect("sql path")]);
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_ne!(
+        after, SQL_COMMENTED_SAFE_FIX,
+        "Expected --lint --fix to modify commented SQL file"
+    );
+    assert!(
+        after.to_ascii_uppercase().contains("COUNT(*)"),
+        "Expected safe fix to rewrite COUNT(1): {after}"
+    );
+    for comment in ["-- keep:lead", "/* keep:mid */", "-- keep:tail"] {
+        assert_eq!(
+            after.matches(comment).count(),
+            1,
+            "Expected comment bytes to be preserved exactly once: {comment}; SQL: {after}"
+        );
+    }
+
+    let output_text = combined_output(&output);
+    assert!(
+        !output_text
+            .to_ascii_lowercase()
+            .contains("comments are present"),
+        "Expected comment-aware fixer to avoid whole-file comment skip: {output_text}"
+    );
+}
+
+#[test]
+fn test_lint_fix_default_safe_mode_skips_unsafe_or_display_only_candidates() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("unsafe_candidate.sql");
+    std::fs::write(&sql_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("write sql");
+
+    let output = run_flowscope(&["--lint", "--fix", sql_path.to_str().expect("sql path")]);
+    let output_text = combined_output(&output);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Expected remaining violations in safe mode when unsafe/display-only fixes are skipped: {output_text}"
+    );
+
+    let remaining_codes = lint_violation_codes(&sql_path);
+    assert!(
+        remaining_codes.iter().any(|code| code == "ST05"),
+        "Expected representative unsafe violation ST05 to remain in default safe mode: {remaining_codes:?}"
+    );
+
+    assert!(
+        contains_any(
+            &output_text,
+            &[
+                "unsafe",
+                "blocked",
+                "display-only",
+                "display only",
+                "safety",
+                "not applied"
+            ]
+        ),
+        "Expected safe-mode output to report blocked unsafe/display-only fixes: {output_text}"
+    );
+}
+
+#[test]
+fn test_lint_unsafe_fixes_enables_additional_fixes_over_safe_mode() {
+    let dir = tempdir().expect("temp dir");
+    let safe_path = dir.path().join("safe_mode.sql");
+    let unsafe_path = dir.path().join("unsafe_mode.sql");
+    std::fs::write(&safe_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("write safe sql");
+    std::fs::write(&unsafe_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("write unsafe sql");
+
+    let safe_output = run_flowscope(&["--lint", "--fix", safe_path.to_str().expect("safe path")]);
+    assert_ne!(
+        safe_output.status.code(),
+        Some(2),
+        "Expected baseline safe fix run to execute, got parse error: {}",
+        combined_output(&safe_output)
+    );
+
+    let unsafe_output = run_flowscope(&[
+        "--lint",
+        "--fix",
+        "--unsafe-fixes",
+        unsafe_path.to_str().expect("unsafe path"),
+    ]);
+    assert_flag_was_accepted(&unsafe_output, "--unsafe-fixes");
+
+    let safe_codes = lint_violation_codes(&safe_path);
+    let unsafe_codes = lint_violation_codes(&unsafe_path);
+    assert!(
+        safe_codes.iter().any(|code| code == "ST05"),
+        "Expected safe mode to retain representative ST05 violation: {safe_codes:?}"
+    );
+    assert!(
+        !unsafe_codes.iter().any(|code| code == "ST05"),
+        "Expected --unsafe-fixes to apply additional structural rewrites and clear ST05. unsafe={unsafe_codes:?}"
+    );
+    assert!(
+        unsafe_codes != safe_codes,
+        "Expected --unsafe-fixes to produce a different lint outcome than safe mode. safe={safe_codes:?}, unsafe={unsafe_codes:?}"
+    );
+}
+
+#[test]
+fn test_lint_show_fixes_surfaces_blocked_or_suggested_fix_info() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("show_fixes.sql");
+    std::fs::write(&sql_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("write baseline sql");
+
+    let baseline_output = run_flowscope(&["--lint", "--fix", sql_path.to_str().expect("sql path")]);
+    assert_ne!(
+        baseline_output.status.code(),
+        Some(2),
+        "Expected baseline run to execute: {}",
+        combined_output(&baseline_output)
+    );
+
+    std::fs::write(&sql_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("reset sql");
+
+    let output = run_flowscope(&[
+        "--lint",
+        "--fix",
+        "--show-fixes",
+        sql_path.to_str().expect("sql path"),
+    ]);
+    assert_flag_was_accepted(&output, "--show-fixes");
+
+    let baseline_stderr = String::from_utf8_lossy(&baseline_output.stderr);
+    let output_stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(
+        output_stderr, baseline_stderr,
+        "Expected --show-fixes to change stderr by surfacing additional fix visibility details"
+    );
+    assert!(
+        output_stderr.len() > baseline_stderr.len(),
+        "Expected --show-fixes to provide more stderr detail than baseline --fix output. baseline={baseline_stderr}, show={output_stderr}"
+    );
+    assert!(
+        contains_any(
+            &output_stderr,
+            &[
+                "blocked",
+                "suggested",
+                "display-only",
+                "display only",
+                "unsafe"
+            ]
+        ),
+        "Expected --show-fixes output to include blocked/suggested fix details: {output_stderr}"
     );
 }

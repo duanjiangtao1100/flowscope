@@ -208,7 +208,7 @@ pub(crate) fn collect_statements<'a>(
                 source_sql,
                 source_name: Some(Rc::new(file.name.clone())),
                 dialect: request.dialect,
-                untemplated_sql: templating_applied.then(|| Cow::Borrowed(file.content.as_str())),
+                untemplated_sql: templating_applied.then_some(Cow::Borrowed(file.content.as_str())),
                 templating_applied,
             };
             let (file_stmts, file_issues) = parse_statements_individually(&ctx);
@@ -240,7 +240,7 @@ pub(crate) fn collect_statements<'a>(
             source_sql,
             source_name: request.source_name.clone().map(Rc::new),
             dialect: request.dialect,
-            untemplated_sql: templating_applied.then(|| Cow::Borrowed(request.sql.as_str())),
+            untemplated_sql: templating_applied.then_some(Cow::Borrowed(request.sql.as_str())),
             templating_applied,
         };
         let (inline_stmts, inline_issues) = parse_statements_individually(&ctx);

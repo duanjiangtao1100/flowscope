@@ -224,11 +224,22 @@ fn normalize_issues(mut issues: Vec<Issue>) -> Vec<Issue> {
             && left.severity == right.severity
             && left.code == right.code
             && left.message == right.message
+            && left.autofix == right.autofix
     });
     issues
 }
 
-fn issue_sort_key(issue: &Issue) -> (usize, usize, usize, u8, &str, &str) {
+fn issue_sort_key(
+    issue: &Issue,
+) -> (
+    usize,
+    usize,
+    usize,
+    u8,
+    &str,
+    &str,
+    Option<&crate::types::IssueAutofix>,
+) {
     (
         issue.statement_index.unwrap_or(usize::MAX),
         issue.span.map_or(usize::MAX, |span| span.start),
@@ -236,6 +247,7 @@ fn issue_sort_key(issue: &Issue) -> (usize, usize, usize, u8, &str, &str) {
         severity_rank(issue.severity),
         issue.code.as_str(),
         issue.message.as_str(),
+        issue.autofix.as_ref(),
     )
 }
 
@@ -466,7 +478,8 @@ fn offset_to_line(sql: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_templated_areas;
+    use super::{normalize_issues, strip_templated_areas};
+    use crate::types::{Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 
     #[test]
     fn strip_templated_areas_preserves_lines_and_replaces_tag_content() {
@@ -478,5 +491,38 @@ mod tests {
         assert!(!stripped.contains("{%"));
         assert!(stripped.contains("SELECT"));
         assert!(stripped.contains("FROM t"));
+    }
+
+    #[test]
+    fn normalize_issues_keeps_distinct_autofix_metadata() {
+        let base = Issue::warning("LINT_X", "lint message")
+            .with_statement(0)
+            .with_span(Span::new(0, 1));
+
+        let safe = base.clone().with_autofix_edits(
+            IssueAutofixApplicability::Safe,
+            vec![IssuePatchEdit::new(Span::new(0, 1), "x")],
+        );
+        let unsafe_fix = base.with_autofix_edits(
+            IssueAutofixApplicability::Unsafe,
+            vec![IssuePatchEdit::new(Span::new(0, 1), "x")],
+        );
+
+        let normalized = normalize_issues(vec![unsafe_fix, safe]);
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn normalize_issues_dedups_when_autofix_matches() {
+        let issue = Issue::warning("LINT_X", "lint message")
+            .with_statement(0)
+            .with_span(Span::new(0, 1))
+            .with_autofix_edits(
+                IssueAutofixApplicability::Safe,
+                vec![IssuePatchEdit::new(Span::new(0, 1), "x")],
+            );
+
+        let normalized = normalize_issues(vec![issue.clone(), issue]);
+        assert_eq!(normalized.len(), 1);
     }
 }

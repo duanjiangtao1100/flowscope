@@ -1238,6 +1238,17 @@
                 "type": "null"
               }
             ]
+          },
+          "autofix": {
+            "description": "Optional: autofix metadata for this issue.",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/IssueAutofix"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -1279,6 +1290,73 @@
           "parser_fallback",
           "tokenizer_fallback",
           "heuristic_rule"
+        ]
+      },
+      "IssueAutofix": {
+        "description": "Autofix metadata attached to an issue.",
+        "type": "object",
+        "properties": {
+          "applicability": {
+            "description": "Applicability category for this fix.",
+            "allOf": [
+              {
+                "$ref": "#/definitions/IssueAutofixApplicability"
+              }
+            ]
+          },
+          "edits": {
+            "description": "Edits required to apply this fix.",
+            "type": "array",
+            "items": {
+              "$ref": "#/definitions/IssuePatchEdit"
+            }
+          }
+        },
+        "required": [
+          "applicability",
+          "edits"
+        ]
+      },
+      "IssueAutofixApplicability": {
+        "description": "Autofix applicability metadata for an issue.",
+        "oneOf": [
+          {
+            "description": "The fix is considered safe and should not change semantics.",
+            "type": "string",
+            "const": "safe"
+          },
+          {
+            "description": "The fix may change semantics and should require explicit opt-in.",
+            "type": "string",
+            "const": "unsafe"
+          },
+          {
+            "description": "The fix is presented for visibility only and should not be auto-applied.",
+            "type": "string",
+            "const": "displayOnly"
+          }
+        ]
+      },
+      "IssuePatchEdit": {
+        "description": "A text patch edit associated with an issue autofix.",
+        "type": "object",
+        "properties": {
+          "span": {
+            "description": "Byte range in the source SQL to replace.",
+            "allOf": [
+              {
+                "$ref": "#/definitions/Span"
+              }
+            ]
+          },
+          "replacement": {
+            "description": "Replacement text for the target span.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "span",
+          "replacement"
         ]
       },
       "Summary": {

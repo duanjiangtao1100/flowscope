@@ -393,18 +393,16 @@ fn projection_unqualified_count_with_aliases(
                     &HashSet::new(),
                 )
             }
-            SelectItem::QualifiedWildcard(kind, _) => match kind {
-                SelectItemQualifiedWildcardKind::Expr(expr) => {
-                    count_unqualified_references_in_expr_no_subqueries(
-                        expr,
-                        aliases,
-                        value_table_aliases,
-                        ctx,
-                        &HashSet::new(),
-                    )
-                }
-                _ => 0,
-            },
+            SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(expr), _) => {
+                count_unqualified_references_in_expr_no_subqueries(
+                    expr,
+                    aliases,
+                    value_table_aliases,
+                    ctx,
+                    &HashSet::new(),
+                )
+            }
+            SelectItem::QualifiedWildcard(_, _) => 0,
             _ => 0,
         })
         .sum()

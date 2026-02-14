@@ -61,6 +61,14 @@ pub struct Args {
     #[arg(long, requires = "lint")]
     pub fix: bool,
 
+    /// Include unsafe lint auto-fixes (requires --lint and --fix)
+    #[arg(long, requires_all = ["lint", "fix"])]
+    pub unsafe_fixes: bool,
+
+    /// Show blocked/display-only fix candidates in lint mode (requires --lint)
+    #[arg(long, requires = "lint")]
+    pub show_fixes: bool,
+
     /// Comma-separated list of lint rule codes to exclude (e.g., LINT_AM_008,LINT_ST_006)
     #[arg(long, value_delimiter = ',')]
     pub exclude_rules: Vec<String>,
@@ -270,6 +278,8 @@ mod tests {
         let args = Args::parse_from(["flowscope", "--lint", "test.sql"]);
         assert!(args.lint);
         assert!(!args.fix);
+        assert!(!args.unsafe_fixes);
+        assert!(!args.show_fixes);
         assert!(args.exclude_rules.is_empty());
         assert!(args.rule_configs.is_none());
     }
@@ -279,11 +289,44 @@ mod tests {
         let args = Args::parse_from(["flowscope", "--lint", "--fix", "test.sql"]);
         assert!(args.lint);
         assert!(args.fix);
+        assert!(!args.unsafe_fixes);
+        assert!(!args.show_fixes);
     }
 
     #[test]
     fn test_fix_requires_lint() {
         let result = Args::try_parse_from(["flowscope", "--fix", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unsafe_fixes_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--fix", "--unsafe-fixes", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(args.unsafe_fixes);
+    }
+
+    #[test]
+    fn test_unsafe_fixes_requires_lint_and_fix() {
+        let missing_both = Args::try_parse_from(["flowscope", "--unsafe-fixes", "test.sql"]);
+        assert!(missing_both.is_err());
+
+        let missing_fix =
+            Args::try_parse_from(["flowscope", "--lint", "--unsafe-fixes", "test.sql"]);
+        assert!(missing_fix.is_err());
+    }
+
+    #[test]
+    fn test_show_fixes_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--show-fixes", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.show_fixes);
+    }
+
+    #[test]
+    fn test_show_fixes_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--show-fixes", "test.sql"]);
         assert!(result.is_err());
     }
 

@@ -6,8 +6,9 @@
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::visit;
-use crate::types::{issue_codes, Issue};
-use sqlparser::ast::*;
+use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use sqlparser::ast::{Spanned, *};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CountPreference {
@@ -47,6 +48,14 @@ impl CountPreference {
             Self::Star => matches!(kind, CountArgKind::One | CountArgKind::Zero),
             Self::One => matches!(kind, CountArgKind::Star | CountArgKind::Zero),
             Self::Zero => matches!(kind, CountArgKind::Star | CountArgKind::One),
+        }
+    }
+
+    fn replacement(self) -> &'static str {
+        match self {
+            Self::Star => "*",
+            Self::One => "1",
+            Self::Zero => "0",
         }
     }
 }
@@ -93,16 +102,54 @@ impl LintRule for CountStyle {
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let tokens =
+            tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
+        let wildcard_spans = tokens
+            .as_deref()
+            .map(collect_count_wildcard_spans)
+            .unwrap_or_default();
+        let numeric_spans = tokens
+            .as_deref()
+            .map(collect_count_numeric_spans)
+            .unwrap_or_default();
+        let mut wildcard_index = 0usize;
+        let mut numeric_index = 0usize;
+
         let mut issues = Vec::new();
         visit::visit_expressions(stmt, &mut |expr| {
-            if let Expr::Function(func) = expr {
-                let fname = func.name.to_string().to_uppercase();
-                if fname == "COUNT" && self.preference.violates(count_argument_kind(&func.args)) {
-                    issues.push(
-                        Issue::info(issue_codes::LINT_CV_004, self.preference.message())
-                            .with_statement(ctx.statement_index),
+            let Expr::Function(func) = expr else {
+                return;
+            };
+            if !func.name.to_string().eq_ignore_ascii_case("COUNT") {
+                return;
+            }
+
+            let kind = count_argument_kind(&func.args);
+            let argument_span = match kind {
+                CountArgKind::Star => {
+                    let span = wildcard_spans.get(wildcard_index).copied();
+                    wildcard_index = wildcard_index.saturating_add(1);
+                    span
+                }
+                CountArgKind::One | CountArgKind::Zero => {
+                    let span = numeric_spans.get(numeric_index).copied();
+                    numeric_index = numeric_index.saturating_add(1);
+                    span.or_else(|| count_numeric_argument_span(ctx, func))
+                }
+                CountArgKind::Other => None,
+            };
+
+            if self.preference.violates(kind) {
+                let mut issue = Issue::info(issue_codes::LINT_CV_004, self.preference.message())
+                    .with_statement(ctx.statement_index);
+                if let Some((start, end)) = argument_span {
+                    let span = ctx.span_from_statement_offset(start, end);
+                    issue = issue.with_span(span).with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        vec![IssuePatchEdit::new(span, self.preference.replacement())],
                     );
                 }
+                issues.push(issue);
             }
         });
         issues
@@ -140,10 +187,287 @@ fn numeric_literal_matches(raw: &str, expected: u8) -> bool {
         .is_some_and(|value| value == expected as u64)
 }
 
+fn count_numeric_argument_span(ctx: &LintContext, func: &Function) -> Option<(usize, usize)> {
+    let FunctionArguments::List(arg_list) = &func.args else {
+        return None;
+    };
+    if arg_list.args.len() != 1 {
+        return None;
+    }
+
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = &arg_list.args[0] else {
+        return None;
+    };
+
+    if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
+        return Some((start, end));
+    }
+
+    let (start, end) = expr_span_offsets(ctx.sql, expr)?;
+    if start < ctx.statement_range.start || end > ctx.statement_range.end {
+        return None;
+    }
+
+    Some((
+        start - ctx.statement_range.start,
+        end - ctx.statement_range.start,
+    ))
+}
+
+fn collect_count_wildcard_spans(tokens: &[LocatedToken]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        if !is_count_word(&tokens[i].token) {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        skip_trivia_tokens(tokens, &mut j);
+        if j >= tokens.len() || !matches!(tokens[j].token, Token::LParen) {
+            i += 1;
+            continue;
+        }
+
+        j += 1;
+        skip_trivia_tokens(tokens, &mut j);
+        if j >= tokens.len() {
+            break;
+        }
+
+        if let Token::Word(word) = &tokens[j].token {
+            if word.value.eq_ignore_ascii_case("ALL") || word.value.eq_ignore_ascii_case("DISTINCT")
+            {
+                j += 1;
+                skip_trivia_tokens(tokens, &mut j);
+            }
+        }
+
+        if j >= tokens.len() || !matches!(tokens[j].token, Token::Mul) {
+            i += 1;
+            continue;
+        }
+
+        let star_start = tokens[j].start;
+        let star_end = tokens[j].end;
+        j += 1;
+        skip_trivia_tokens(tokens, &mut j);
+        if j < tokens.len() && matches!(tokens[j].token, Token::RParen) {
+            spans.push((star_start, star_end));
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    spans
+}
+
+fn collect_count_numeric_spans(tokens: &[LocatedToken]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        if !is_count_word(&tokens[i].token) {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 1;
+        skip_trivia_tokens(tokens, &mut j);
+        if j >= tokens.len() || !matches!(tokens[j].token, Token::LParen) {
+            i += 1;
+            continue;
+        }
+
+        j += 1;
+        skip_trivia_tokens(tokens, &mut j);
+        if j >= tokens.len() {
+            break;
+        }
+
+        if let Token::Word(word) = &tokens[j].token {
+            if word.value.eq_ignore_ascii_case("ALL") || word.value.eq_ignore_ascii_case("DISTINCT")
+            {
+                j += 1;
+                skip_trivia_tokens(tokens, &mut j);
+            }
+        }
+
+        if j >= tokens.len() {
+            break;
+        }
+
+        let Some(raw_number) = token_numeric_literal(&tokens[j].token) else {
+            i += 1;
+            continue;
+        };
+        if !numeric_literal_matches(raw_number, 0) && !numeric_literal_matches(raw_number, 1) {
+            i += 1;
+            continue;
+        }
+
+        let number_start = tokens[j].start;
+        let number_end = tokens[j].end;
+        j += 1;
+        skip_trivia_tokens(tokens, &mut j);
+        if j < tokens.len() && matches!(tokens[j].token, Token::RParen) {
+            spans.push((number_start, number_end));
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    spans
+}
+
+fn skip_trivia_tokens(tokens: &[LocatedToken], index: &mut usize) {
+    while *index < tokens.len() && is_trivia_token(&tokens[*index].token) {
+        *index += 1;
+    }
+}
+
+fn is_count_word(token: &Token) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("COUNT"))
+}
+
+fn token_numeric_literal(token: &Token) -> Option<&str> {
+    match token {
+        Token::Number(raw, _) => Some(raw.as_str()),
+        _ => None,
+    }
+}
+
+fn expr_span_offsets(sql: &str, expr: &Expr) -> Option<(usize, usize)> {
+    let span = expr.span();
+    if span.start.line == 0 || span.start.column == 0 || span.end.line == 0 || span.end.column == 0
+    {
+        return None;
+    }
+    let start = line_col_to_offset(sql, span.start.line as usize, span.start.column as usize)?;
+    let end = line_col_to_offset(sql, span.end.line as usize, span.end.column as usize)?;
+    if end < start {
+        return None;
+    }
+    Some((start, end))
+}
+
+#[derive(Clone)]
+struct LocatedToken {
+    token: Token,
+    start: usize,
+    end: usize,
+}
+
+fn tokenized(sql: &str, dialect: crate::types::Dialect) -> Option<Vec<LocatedToken>> {
+    let dialect = dialect.to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
+    let tokens = tokenizer.tokenize_with_location().ok()?;
+
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let Some((start, end)) = token_with_span_offsets(sql, &token) else {
+            continue;
+        };
+        out.push(LocatedToken {
+            token: token.token,
+            start,
+            end,
+        });
+    }
+    Some(out)
+}
+
+fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<LocatedToken>> {
+    let statement_start = ctx.statement_range.start;
+    let from_document = ctx.with_document_tokens(|tokens| {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        Some(
+            tokens
+                .iter()
+                .filter_map(|token| {
+                    let (start, end) = token_with_span_offsets(ctx.sql, token)?;
+                    if start < ctx.statement_range.start || end > ctx.statement_range.end {
+                        return None;
+                    }
+
+                    Some(LocatedToken {
+                        token: token.token.clone(),
+                        start: start - statement_start,
+                        end: end - statement_start,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+
+    if let Some(tokens) = from_document {
+        return Some(tokens);
+    }
+
+    tokenized(ctx.statement_sql(), ctx.dialect())
+}
+
+fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
+    let start = line_col_to_offset(
+        sql,
+        token.span.start.line as usize,
+        token.span.start.column as usize,
+    )?;
+    let end = line_col_to_offset(
+        sql,
+        token.span.end.line as usize,
+        token.span.end.column as usize,
+    )?;
+    Some((start, end))
+}
+
+fn is_trivia_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(Whitespace::Space | Whitespace::Tab | Whitespace::Newline)
+            | Token::Whitespace(Whitespace::SingleLineComment { .. })
+            | Token::Whitespace(Whitespace::MultiLineComment(_))
+    )
+}
+
+fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1usize;
+    let mut current_col = 1usize;
+    for (offset, ch) in sql.char_indices() {
+        if current_line == line && current_col == column {
+            return Some(offset);
+        }
+        if ch == '\n' {
+            current_line += 1;
+            current_col = 1;
+        } else {
+            current_col += 1;
+        }
+    }
+
+    if current_line == line && current_col == column {
+        Some(sql.len())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn check_sql(sql: &str) -> Vec<Issue> {
         let stmts = parse_sql(sql).unwrap();
@@ -160,17 +484,45 @@ mod tests {
         issues
     }
 
+    fn assert_single_safe_edit(
+        issue: &Issue,
+        expected_start: usize,
+        expected_end: usize,
+        expected_replacement: &str,
+    ) {
+        let span = issue.span.expect("issue span");
+        assert_eq!(span.start, expected_start);
+        assert_eq!(span.end, expected_end);
+
+        let autofix = issue.autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].span.start, expected_start);
+        assert_eq!(autofix.edits[0].span.end, expected_end);
+        assert_eq!(autofix.edits[0].replacement, expected_replacement);
+    }
+
     #[test]
     fn test_count_one_detected() {
-        let issues = check_sql("SELECT COUNT(1) FROM t");
+        let sql = "SELECT COUNT(1) FROM t";
+        let issues = check_sql(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, "LINT_CV_004");
+
+        let one_start = sql.find('1').expect("count literal");
+        assert_single_safe_edit(&issues[0], one_start, one_start + 1, "*");
     }
 
     #[test]
     fn test_count_leading_zero_numeric_literals_are_detected() {
-        let issues = check_sql("SELECT COUNT(01), COUNT(00) FROM t");
+        let sql = "SELECT COUNT(01), COUNT(00) FROM t";
+        let issues = check_sql(sql);
         assert_eq!(issues.len(), 2);
+
+        let first_start = sql.find("01").expect("first literal");
+        let second_start = sql.find("00").expect("second literal");
+        assert_single_safe_edit(&issues[0], first_start, first_start + 2, "*");
+        assert_single_safe_edit(&issues[1], second_start, second_start + 2, "*");
     }
 
     #[test]
@@ -241,16 +593,20 @@ mod tests {
             )]),
         };
         let rule = CountStyle::from_config(&config);
-        let stmts = parse_sql("SELECT COUNT(*) FROM t").unwrap();
+        let sql = "SELECT COUNT(*) FROM t";
+        let stmts = parse_sql(sql).unwrap();
         let issues = rule.check(
             &stmts[0],
             &LintContext {
-                sql: "SELECT COUNT(*) FROM t",
-                statement_range: 0.."SELECT COUNT(*) FROM t".len(),
+                sql,
+                statement_range: 0..sql.len(),
                 statement_index: 0,
             },
         );
         assert_eq!(issues.len(), 1);
+
+        let star_start = sql.find('*').expect("star argument");
+        assert_single_safe_edit(&issues[0], star_start, star_start + 1, "1");
     }
 
     #[test]
@@ -264,15 +620,19 @@ mod tests {
             )]),
         };
         let rule = CountStyle::from_config(&config);
-        let stmts = parse_sql("SELECT COUNT(1) FROM t").unwrap();
+        let sql = "SELECT COUNT(1) FROM t";
+        let stmts = parse_sql(sql).unwrap();
         let issues = rule.check(
             &stmts[0],
             &LintContext {
-                sql: "SELECT COUNT(1) FROM t",
-                statement_range: 0.."SELECT COUNT(1) FROM t".len(),
+                sql,
+                statement_range: 0..sql.len(),
                 statement_index: 0,
             },
         );
         assert_eq!(issues.len(), 1);
+
+        let one_start = sql.find('1').expect("count literal");
+        assert_single_safe_edit(&issues[0], one_start, one_start + 1, "0");
     }
 }

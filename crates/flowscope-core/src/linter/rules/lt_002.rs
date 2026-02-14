@@ -166,15 +166,15 @@ fn line_indent_snapshots(ctx: &LintContext, tab_space_size: usize) -> Vec<LineIn
 
         return first_token_by_line
             .into_iter()
-            .filter_map(|(line, token_start)| {
+            .map(|(line, token_start)| {
                 let line_start = ctx.sql[..token_start]
                     .rfind('\n')
                     .map_or(0, |index| index + 1);
                 let leading = &ctx.sql[line_start..token_start];
-                Some(LineIndentSnapshot {
+                LineIndentSnapshot {
                     line_index: line.saturating_sub(statement_start_line),
                     indent: leading_indent_from_prefix(leading, tab_space_size),
-                })
+                }
             })
             .collect();
     }

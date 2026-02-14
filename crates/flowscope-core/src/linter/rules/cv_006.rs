@@ -193,12 +193,11 @@ fn statement_has_trailing_comment_before_semicolon(
 
     tokens
         .iter()
-        .filter(|token| {
+        .rfind(|token| {
             token.start >= ctx.statement_range.start
                 && token.end <= semicolon
                 && !is_spacing_whitespace(&token.token)
         })
-        .next_back()
         .is_some_and(|token| is_comment_token(&token.token))
 }
 

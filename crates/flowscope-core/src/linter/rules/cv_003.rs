@@ -309,9 +309,7 @@ fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<LocatedToken>> {
             tokens
                 .iter()
                 .filter_map(|token| {
-                    let Some((start, end)) = token_with_span_offsets(ctx.sql, token) else {
-                        return None;
-                    };
+                    let (start, end) = token_with_span_offsets(ctx.sql, token)?;
                     if start < ctx.statement_range.start || end > ctx.statement_range.end {
                         return None;
                     }

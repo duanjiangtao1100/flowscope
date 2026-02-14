@@ -6,7 +6,7 @@
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::visit::visit_expressions;
-use crate::types::{issue_codes, Issue};
+use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{BinaryOperator, Expr, Spanned, Statement};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -46,6 +46,28 @@ impl PreferredNotEqualStyle {
             Self::Ansi => "Use `<>` for not-equal comparisons.",
         }
     }
+
+    fn target_style(self, _occurrences: &[NotEqualOccurrence]) -> Option<NotEqualStyle> {
+        match self {
+            // Keep parity with the existing CLI fixer, which normalizes toward
+            // C-style (`!=`) operators by default.
+            Self::Consistent => Some(NotEqualStyle::Bang),
+            Self::CStyle => Some(NotEqualStyle::Bang),
+            Self::Ansi => Some(NotEqualStyle::Angle),
+        }
+    }
+
+    fn violating_occurrences(self, occurrences: &[NotEqualOccurrence]) -> Vec<NotEqualOccurrence> {
+        let Some(target_style) = self.target_style(occurrences) else {
+            return Vec::new();
+        };
+
+        occurrences
+            .iter()
+            .copied()
+            .filter(|occurrence| occurrence.style != target_style)
+            .collect()
+    }
 }
 
 pub struct ConventionNotEqual {
@@ -84,16 +106,40 @@ impl LintRule for ConventionNotEqual {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let tokens =
             tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
-        let usage = statement_not_equal_usage_with_tokens(
+        let mut occurrences = statement_not_equal_occurrences_with_tokens(
             statement,
             ctx.statement_sql(),
             tokens.as_deref(),
         );
+        occurrences.sort_by_key(|occurrence| (occurrence.start, occurrence.end));
+        let usage = usage_from_occurrences(&occurrences);
+
         if self.preferred_style.violation(&usage) {
-            vec![
-                Issue::info(issue_codes::LINT_CV_001, self.preferred_style.message())
-                    .with_statement(ctx.statement_index),
-            ]
+            let violating_occurrences = self.preferred_style.violating_occurrences(&occurrences);
+            let mut issue = Issue::info(issue_codes::LINT_CV_001, self.preferred_style.message())
+                .with_statement(ctx.statement_index);
+
+            if let (Some(target_style), Some(first_occurrence)) = (
+                self.preferred_style.target_style(&occurrences),
+                violating_occurrences.first().copied(),
+            ) {
+                let issue_span =
+                    ctx.span_from_statement_offset(first_occurrence.start, first_occurrence.end);
+                let edits = violating_occurrences
+                    .into_iter()
+                    .map(|occurrence| {
+                        IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(occurrence.start, occurrence.end),
+                            target_style.replacement(),
+                        )
+                    })
+                    .collect();
+                issue = issue
+                    .with_span(issue_span)
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            }
+
+            vec![issue]
         } else {
             Vec::new()
         }
@@ -106,25 +152,38 @@ struct NotEqualUsage {
     saw_bang_style: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NotEqualStyle {
     Angle,
     Bang,
 }
 
-fn statement_not_equal_usage_with_tokens(
+impl NotEqualStyle {
+    fn replacement(self) -> &'static str {
+        match self {
+            Self::Angle => "<>",
+            Self::Bang => "!=",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NotEqualOccurrence {
+    style: NotEqualStyle,
+    start: usize,
+    end: usize,
+}
+
+fn statement_not_equal_occurrences_with_tokens(
     statement: &Statement,
     sql: &str,
     tokens: Option<&[LocatedToken]>,
-) -> NotEqualUsage {
-    let mut usage = NotEqualUsage::default();
+) -> Vec<NotEqualOccurrence> {
+    let mut occurrences = Vec::new();
     visit_expressions(statement, &mut |expr| {
-        if usage.saw_angle_style && usage.saw_bang_style {
-            return;
-        }
-
-        let style = match expr {
+        let occurrence = match expr {
             Expr::BinaryOp { left, op, right } if *op == BinaryOperator::NotEq => {
-                not_equal_style_between(sql, left.as_ref(), right.as_ref(), tokens)
+                not_equal_occurrence_between(sql, left.as_ref(), right.as_ref(), tokens)
             }
             Expr::AnyOp {
                 left,
@@ -132,34 +191,43 @@ fn statement_not_equal_usage_with_tokens(
                 right,
                 ..
             } if *compare_op == BinaryOperator::NotEq => {
-                not_equal_style_between(sql, left.as_ref(), right.as_ref(), tokens)
+                not_equal_occurrence_between(sql, left.as_ref(), right.as_ref(), tokens)
             }
             Expr::AllOp {
                 left,
                 compare_op,
                 right,
             } if *compare_op == BinaryOperator::NotEq => {
-                not_equal_style_between(sql, left.as_ref(), right.as_ref(), tokens)
+                not_equal_occurrence_between(sql, left.as_ref(), right.as_ref(), tokens)
             }
             _ => None,
         };
 
-        match style {
-            Some(NotEqualStyle::Angle) => usage.saw_angle_style = true,
-            Some(NotEqualStyle::Bang) => usage.saw_bang_style = true,
-            None => {}
+        if let Some(occurrence) = occurrence {
+            occurrences.push(occurrence);
         }
     });
 
+    occurrences
+}
+
+fn usage_from_occurrences(occurrences: &[NotEqualOccurrence]) -> NotEqualUsage {
+    let mut usage = NotEqualUsage::default();
+    for occurrence in occurrences {
+        match occurrence.style {
+            NotEqualStyle::Angle => usage.saw_angle_style = true,
+            NotEqualStyle::Bang => usage.saw_bang_style = true,
+        }
+    }
     usage
 }
 
-fn not_equal_style_between(
+fn not_equal_occurrence_between(
     sql: &str,
     left: &Expr,
     right: &Expr,
     tokens: Option<&[LocatedToken]>,
-) -> Option<NotEqualStyle> {
+) -> Option<NotEqualOccurrence> {
     let left_end = left.span().end;
     let right_start = right.span().start;
     if left_end.line == 0
@@ -177,18 +245,18 @@ fn not_equal_style_between(
     }
 
     if let Some(tokens) = tokens {
-        return not_equal_style_in_tokens(sql, tokens, start, end);
+        return not_equal_occurrence_in_tokens(sql, tokens, start, end);
     }
 
     None
 }
 
-fn not_equal_style_in_tokens(
+fn not_equal_occurrence_in_tokens(
     sql: &str,
     tokens: &[LocatedToken],
     start: usize,
     end: usize,
-) -> Option<NotEqualStyle> {
+) -> Option<NotEqualOccurrence> {
     for token in tokens {
         if token.end <= start || token.start >= end {
             continue;
@@ -205,11 +273,17 @@ fn not_equal_style_in_tokens(
         }
 
         let raw = &sql[token.start..token.end];
-        return match raw {
+        let style = match raw {
             "<>" => Some(NotEqualStyle::Angle),
             "!=" => Some(NotEqualStyle::Bang),
             _ => None,
-        };
+        }?;
+
+        return Some(NotEqualOccurrence {
+            style,
+            start: token.start,
+            end: token.end,
+        });
     }
 
     None
@@ -252,9 +326,7 @@ fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<LocatedToken>> {
             tokens
                 .iter()
                 .filter_map(|token| {
-                    let Some((start, end)) = token_with_span_offsets(ctx.sql, token) else {
-                        return None;
-                    };
+                    let (start, end) = token_with_span_offsets(ctx.sql, token)?;
                     if start < ctx.statement_range.start || end > ctx.statement_range.end {
                         return None;
                     }
@@ -329,6 +401,7 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -351,9 +424,22 @@ mod tests {
 
     #[test]
     fn flags_mixed_not_equal_styles() {
-        let issues = run("SELECT * FROM t WHERE a <> b AND c != d");
+        let sql = "SELECT * FROM t WHERE a <> b AND c != d";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_001);
+
+        let angle_start = sql.find("<>").expect("angle operator");
+        let issue_span = issues[0].span.expect("issue span");
+        assert_eq!(issue_span.start, angle_start);
+        assert_eq!(issue_span.end, angle_start + 2);
+
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].span.start, angle_start);
+        assert_eq!(autofix.edits[0].span.end, angle_start + 2);
+        assert_eq!(autofix.edits[0].replacement, "!=");
     }
 
     #[test]
@@ -383,16 +469,71 @@ mod tests {
             )]),
         };
         let rule = ConventionNotEqual::from_config(&config);
-        let statements = parse_sql("SELECT * FROM t WHERE a <> b").expect("parse");
+        let sql = "SELECT * FROM t WHERE a <> b";
+        let statements = parse_sql(sql).expect("parse");
         let issues = rule.check(
             &statements[0],
             &LintContext {
-                sql: "SELECT * FROM t WHERE a <> b",
-                statement_range: 0.."SELECT * FROM t WHERE a <> b".len(),
+                sql,
+                statement_range: 0..sql.len(),
                 statement_index: 0,
             },
         );
         assert_eq!(issues.len(), 1);
+        let angle_start = sql.find("<>").expect("angle operator");
+        let issue_span = issues[0].span.expect("issue span");
+        assert_eq!(issue_span.start, angle_start);
+        assert_eq!(issue_span.end, angle_start + 2);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].span.start, angle_start);
+        assert_eq!(autofix.edits[0].span.end, angle_start + 2);
+        assert_eq!(autofix.edits[0].replacement, "!=");
+    }
+
+    #[test]
+    fn c_style_preference_includes_all_angle_operator_edits() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.not_equal".to_string(),
+                serde_json::json!({"preferred_not_equal_style": "c_style"}),
+            )]),
+        };
+        let rule = ConventionNotEqual::from_config(&config);
+        let sql = "SELECT * FROM t WHERE a <> b AND c <> d";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+
+        let first_start = sql.find("<>").expect("first angle operator");
+        let second_start = sql[first_start + 2..]
+            .find("<>")
+            .map(|offset| first_start + 2 + offset)
+            .expect("second angle operator");
+
+        let issue_span = issues[0].span.expect("issue span");
+        assert_eq!(issue_span.start, first_start);
+        assert_eq!(issue_span.end, first_start + 2);
+
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 2);
+        assert_eq!(autofix.edits[0].span.start, first_start);
+        assert_eq!(autofix.edits[0].span.end, first_start + 2);
+        assert_eq!(autofix.edits[0].replacement, "!=");
+        assert_eq!(autofix.edits[1].span.start, second_start);
+        assert_eq!(autofix.edits[1].span.end, second_start + 2);
+        assert_eq!(autofix.edits[1].replacement, "!=");
     }
 
     #[test]
@@ -406,15 +547,26 @@ mod tests {
             )]),
         };
         let rule = ConventionNotEqual::from_config(&config);
-        let statements = parse_sql("SELECT * FROM t WHERE a != b").expect("parse");
+        let sql = "SELECT * FROM t WHERE a != b";
+        let statements = parse_sql(sql).expect("parse");
         let issues = rule.check(
             &statements[0],
             &LintContext {
-                sql: "SELECT * FROM t WHERE a != b",
-                statement_range: 0.."SELECT * FROM t WHERE a != b".len(),
+                sql,
+                statement_range: 0..sql.len(),
                 statement_index: 0,
             },
         );
         assert_eq!(issues.len(), 1);
+        let bang_start = sql.find("!=").expect("bang operator");
+        let issue_span = issues[0].span.expect("issue span");
+        assert_eq!(issue_span.start, bang_start);
+        assert_eq!(issue_span.end, bang_start + 2);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].span.start, bang_start);
+        assert_eq!(autofix.edits[0].span.end, bang_start + 2);
+        assert_eq!(autofix.edits[0].replacement, "<>");
     }
 }

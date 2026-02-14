@@ -61,6 +61,58 @@ pub enum LintFallbackSource {
     HeuristicRule,
 }
 
+/// Autofix applicability metadata for an issue.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum IssueAutofixApplicability {
+    /// The fix is considered safe and should not change semantics.
+    Safe,
+    /// The fix may change semantics and should require explicit opt-in.
+    Unsafe,
+    /// The fix is presented for visibility only and should not be auto-applied.
+    DisplayOnly,
+}
+
+/// A text patch edit associated with an issue autofix.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuePatchEdit {
+    /// Byte range in the source SQL to replace.
+    pub span: Span,
+    /// Replacement text for the target span.
+    pub replacement: String,
+}
+
+impl IssuePatchEdit {
+    pub fn new(span: Span, replacement: impl Into<String>) -> Self {
+        Self {
+            span,
+            replacement: replacement.into(),
+        }
+    }
+}
+
+/// Autofix metadata attached to an issue.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueAutofix {
+    /// Applicability category for this fix.
+    pub applicability: IssueAutofixApplicability,
+    /// Edits required to apply this fix.
+    pub edits: Vec<IssuePatchEdit>,
+}
+
+impl IssueAutofix {
+    pub fn new(applicability: IssueAutofixApplicability, edits: Vec<IssuePatchEdit>) -> Self {
+        Self {
+            applicability,
+            edits,
+        }
+    }
+}
+
 /// An issue encountered during SQL analysis (error, warning, or info).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +153,10 @@ pub struct Issue {
     /// Optional: fallback mode used while evaluating this lint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lint_fallback_source: Option<LintFallbackSource>,
+
+    /// Optional: autofix metadata for this issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autofix: Option<IssueAutofix>,
 }
 
 impl Issue {
@@ -116,6 +172,7 @@ impl Issue {
             lint_engine: None,
             lint_confidence: None,
             lint_fallback_source: None,
+            autofix: None,
         }
     }
 
@@ -131,6 +188,7 @@ impl Issue {
             lint_engine: None,
             lint_confidence: None,
             lint_fallback_source: None,
+            autofix: None,
         }
     }
 
@@ -146,6 +204,7 @@ impl Issue {
             lint_engine: None,
             lint_confidence: None,
             lint_fallback_source: None,
+            autofix: None,
         }
     }
 
@@ -179,6 +238,22 @@ impl Issue {
         self
     }
 
+    /// Attach autofix metadata.
+    pub fn with_autofix(mut self, autofix: IssueAutofix) -> Self {
+        self.autofix = Some(autofix);
+        self
+    }
+
+    /// Attach autofix metadata from applicability and edit list.
+    pub fn with_autofix_edits(
+        mut self,
+        applicability: IssueAutofixApplicability,
+        edits: Vec<IssuePatchEdit>,
+    ) -> Self {
+        self.autofix = Some(IssueAutofix::new(applicability, edits));
+        self
+    }
+
     /// Attach a SQLFluff dotted rule name.
     pub fn with_sqlfluff_name(mut self, name: impl Into<String>) -> Self {
         self.sqlfluff_name = Some(name.into());
@@ -195,7 +270,9 @@ pub enum Severity {
 }
 
 /// A byte range in the source SQL string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct Span {
     /// Byte offset from start of SQL string (inclusive)
@@ -360,6 +437,8 @@ pub mod issue_codes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use schemars::schema_for;
+    use serde_json::json;
 
     #[test]
     fn test_issue_creation() {
@@ -367,12 +446,48 @@ mod tests {
             .with_span(Span::new(10, 20))
             .with_statement(0)
             .with_lint_engine(LintEngine::Semantic)
-            .with_lint_confidence(LintConfidence::High);
+            .with_lint_confidence(LintConfidence::High)
+            .with_autofix_edits(
+                IssueAutofixApplicability::Safe,
+                vec![IssuePatchEdit::new(Span::new(10, 20), "SELECT")],
+            );
 
         assert_eq!(issue.severity, Severity::Error);
         assert_eq!(issue.code, "PARSE_ERROR");
         assert_eq!(issue.span.unwrap().start, 10);
         assert_eq!(issue.statement_index, Some(0));
         assert_eq!(issue.lint_engine, Some(LintEngine::Semantic));
+        assert_eq!(
+            issue.autofix.as_ref().map(|fix| fix.applicability),
+            Some(IssueAutofixApplicability::Safe)
+        );
+    }
+
+    #[test]
+    fn test_issue_autofix_serde_and_schema() {
+        let issue = Issue::warning("LINT_X", "needs fix").with_autofix(IssueAutofix::new(
+            IssueAutofixApplicability::DisplayOnly,
+            vec![IssuePatchEdit::new(Span::new(2, 4), "ab")],
+        ));
+
+        let value = serde_json::to_value(&issue).expect("serialize issue");
+        assert_eq!(value["autofix"]["applicability"], json!("displayOnly"));
+        assert_eq!(value["autofix"]["edits"][0]["span"]["start"], json!(2));
+        assert_eq!(value["autofix"]["edits"][0]["replacement"], json!("ab"));
+
+        let roundtrip: Issue = serde_json::from_value(value).expect("deserialize issue");
+        assert_eq!(
+            roundtrip.autofix.as_ref().map(|fix| fix.applicability),
+            Some(IssueAutofixApplicability::DisplayOnly)
+        );
+
+        let schema = schema_for!(Issue);
+        let schema_json = serde_json::to_value(schema).expect("serialize issue schema");
+        let schema_text = schema_json.to_string();
+        assert!(schema_text.contains("\"autofix\""));
+        assert!(schema_text.contains("\"replacement\""));
+        assert!(schema_text.contains("\"safe\""));
+        assert!(schema_text.contains("\"unsafe\""));
+        assert!(schema_text.contains("\"displayOnly\""));
     }
 }

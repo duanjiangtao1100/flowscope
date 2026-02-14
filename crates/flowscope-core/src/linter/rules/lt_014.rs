@@ -81,7 +81,7 @@ fn keyword_newline_violation_span(
             .then_some(token.span.start.line)
     })?;
 
-    let clauses = major_clause_occurrences(sql, &tokens)?;
+    let clauses = major_clause_occurrences(sql, tokens)?;
 
     let mut clauses_on_select_line = clauses.iter().filter(|clause| clause.line == select_line);
     let first_clause_on_select_line = clauses_on_select_line.next()?;

@@ -74,6 +74,8 @@ Options:
                            [possible values: script, table, column, hybrid]
       --lint               Run SQL linter and report violations
       --fix                Apply deterministic SQL lint auto-fixes in place (requires --lint)
+      --unsafe-fixes       Include unsafe auto-fixes (requires --lint --fix)
+      --show-fixes         Show detailed skipped/blocked fix candidate stats (requires --lint)
       --exclude-rules <EXCLUDE_RULES>
                            Comma-separated lint rule codes to exclude
   -q, --quiet              Suppress warnings on stderr
@@ -96,11 +98,17 @@ flowscope --lint ./queries
 # Apply supported auto-fixes, then report remaining violations
 flowscope --lint --fix queries/*.sql
 
+# Include structural/unsafe fixes (opt-in)
+flowscope --lint --fix --unsafe-fixes queries/*.sql
+
+# Show detailed skipped/blocked fix candidate stats
+flowscope --lint --fix --show-fixes queries/*.sql
+
 # Exclude specific lint rules
 flowscope --lint --exclude-rules LINT_AM_001,LINT_ST_001 queries/*.sql
 ```
 
-`--fix` now applies deterministic rewrites across the full SQLFluff-mapped fix-rule set used by FlowScope parity checks, plus core deterministic fixes. Files containing SQL comments are linted but still skipped for auto-fix to avoid dropping comments during AST render.
+`--fix` applies deterministic **safe** rewrites by default. Comment and template regions are protected so files with comments are no longer globally skipped. Use `--unsafe-fixes` to include lower-confidence structural rewrites. Use `--show-fixes` to inspect skipped/blocked candidate counts.
 
 ### JSON Output
 
@@ -215,6 +223,7 @@ flowscope --serve --watch ./sql -d postgres --metadata-url postgres://user@local
 |----------|--------|-------------|
 | `/api/health` | GET | Health check with version |
 | `/api/analyze` | POST | Run lineage analysis |
+| `/api/lint-fix` | POST | Apply lint auto-fixes with safe/unsafe options |
 | `/api/completion` | POST | Get code completion items |
 | `/api/split` | POST | Split SQL into statements |
 | `/api/files` | GET | List watched files with content |

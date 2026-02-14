@@ -200,23 +200,18 @@ fn long_line_overflow_spans_from_tokens(
             && line_is_comment_only_tokenized(
                 line_start,
                 line_end,
-                &tokens,
+                tokens,
                 line,
                 sql,
-                &jinja_comment_spans,
+                jinja_comment_spans,
             )
         {
             continue;
         }
 
         let effective_end = if ignore_comment_clauses {
-            comment_clause_start_offset_tokenized(
-                line_start,
-                line_end,
-                &tokens,
-                &jinja_comment_spans,
-            )
-            .unwrap_or(line_end)
+            comment_clause_start_offset_tokenized(line_start, line_end, tokens, jinja_comment_spans)
+                .unwrap_or(line_end)
         } else {
             line_end
         };

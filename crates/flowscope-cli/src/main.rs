@@ -1,7 +1,7 @@
 //! FlowScope CLI - SQL lineage analyzer
 
 use flowscope_cli::cli;
-use flowscope_cli::fix::apply_lint_fixes_with_lint_config;
+use flowscope_cli::fix::{apply_lint_fixes_with_options, FixOptions, FixOutcome};
 use flowscope_cli::input;
 #[cfg(feature = "metadata-provider")]
 use flowscope_cli::metadata;
@@ -12,7 +12,9 @@ use flowscope_cli::server;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use flowscope_core::{analyze, AnalysisOptions, AnalyzeRequest, FileSource, LintConfig, Severity};
+use flowscope_core::{
+    analyze, AnalysisOptions, AnalyzeRequest, FileSource, LintConfig, ParseError, Severity,
+};
 use flowscope_export::{
     export_csv_bundle, export_duckdb, export_html, export_json, export_mermaid, export_sql,
     export_xlsx, ExportFormat, ExportNaming, MermaidView,
@@ -30,6 +32,96 @@ use output::{format_lint_json, format_lint_results, format_table, FileLintResult
 const EXIT_FAILURE: u8 = 1;
 /// Configuration error (e.g. unsupported format for the given mode).
 const EXIT_CONFIG_ERROR: u8 = 66;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LintFixRuntimeOptions {
+    include_unsafe_fixes: bool,
+    show_fixes: bool,
+}
+
+impl LintFixRuntimeOptions {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            include_unsafe_fixes: args.unsafe_fixes,
+            show_fixes: args.show_fixes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FixCandidateStats {
+    skipped: usize,
+    blocked: usize,
+    blocked_unsafe: usize,
+    blocked_display_only: usize,
+}
+
+impl FixCandidateStats {
+    fn total_skipped_or_blocked(self) -> usize {
+        self.skipped + self.blocked
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.skipped += other.skipped;
+        self.blocked += other.blocked;
+        self.blocked_unsafe += other.blocked_unsafe;
+        self.blocked_display_only += other.blocked_display_only;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LintFixExecution {
+    outcome: FixOutcome,
+    candidate_stats: FixCandidateStats,
+}
+
+fn apply_lint_fixes_with_runtime_options(
+    sql: &str,
+    dialect: flowscope_core::Dialect,
+    lint_config: &LintConfig,
+    runtime_options: LintFixRuntimeOptions,
+) -> std::result::Result<LintFixExecution, ParseError> {
+    let outcome = apply_lint_fixes_with_options(
+        sql,
+        dialect,
+        lint_config,
+        FixOptions {
+            include_unsafe_fixes: runtime_options.include_unsafe_fixes,
+        },
+    )?;
+    let candidate_stats = collect_fix_candidate_stats(&outcome, runtime_options);
+    Ok(LintFixExecution {
+        outcome,
+        candidate_stats,
+    })
+}
+
+fn collect_fix_candidate_stats(
+    outcome: &FixOutcome,
+    runtime_options: LintFixRuntimeOptions,
+) -> FixCandidateStats {
+    let blocked_unsafe = if runtime_options.include_unsafe_fixes {
+        0
+    } else {
+        outcome.skipped_counts.unsafe_skipped
+    };
+    let blocked_display_only = if runtime_options.show_fixes {
+        outcome.skipped_counts.display_only
+    } else {
+        0
+    };
+
+    let blocked = blocked_unsafe
+        + blocked_display_only
+        + outcome.skipped_counts.protected_range_blocked
+        + outcome.skipped_counts.overlap_conflict_blocked;
+    FixCandidateStats {
+        skipped: 0,
+        blocked,
+        blocked_unsafe,
+        blocked_display_only,
+    }
+}
 
 fn main() -> ExitCode {
     let args = Args::parse();
@@ -145,6 +237,7 @@ fn run_lint(args: Args) -> Result<bool> {
     use output::lint::offset_to_line_col;
 
     let started_at = Instant::now();
+    let fix_runtime_options = LintFixRuntimeOptions::from_args(&args);
 
     validate_lint_output_format(args.format)?;
 
@@ -172,17 +265,20 @@ fn run_lint(args: Args) -> Result<bool> {
         let mut skipped_due_to_comments = 0usize;
         let mut skipped_due_to_regression = 0usize;
         let mut skipped_due_to_parse_errors = 0usize;
+        let mut skipped_or_blocked_candidates = FixCandidateStats::default();
         let mut stdin_modified = false;
 
         for lint_input in &mut lint_inputs {
-            let outcome = match apply_lint_fixes_with_lint_config(
+            let lint_fix_execution = match apply_lint_fixes_with_runtime_options(
                 &lint_input.source.content,
                 dialect,
                 &lint_config,
+                fix_runtime_options,
             ) {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     skipped_due_to_parse_errors += 1;
+                    skipped_or_blocked_candidates.skipped += 1;
                     if !args.quiet {
                         eprintln!(
                             "flowscope: warning: unable to auto-fix {}: {err}",
@@ -192,14 +288,18 @@ fn run_lint(args: Args) -> Result<bool> {
                     continue;
                 }
             };
+            skipped_or_blocked_candidates.merge(lint_fix_execution.candidate_stats);
+            let outcome = lint_fix_execution.outcome;
 
             if outcome.skipped_due_to_comments {
                 skipped_due_to_comments += 1;
+                skipped_or_blocked_candidates.blocked += 1;
                 continue;
             }
 
             if outcome.skipped_due_to_regression {
                 skipped_due_to_regression += 1;
+                skipped_or_blocked_candidates.blocked += 1;
                 continue;
             }
 
@@ -242,6 +342,28 @@ fn run_lint(args: Args) -> Result<bool> {
             if stdin_modified {
                 eprintln!(
                     "flowscope: auto-fixes were applied to stdin input for linting output only (no file was written)"
+                );
+            }
+
+            let skipped_or_blocked_total = skipped_or_blocked_candidates.total_skipped_or_blocked();
+            if skipped_or_blocked_total > 0 {
+                if args.show_fixes {
+                    eprintln!(
+                        "flowscope: skipped/blocked fix candidates: {} (skipped: {}, blocked: {}, unsafe blocked: {}, display-only blocked: {})",
+                        skipped_or_blocked_total,
+                        skipped_or_blocked_candidates.skipped,
+                        skipped_or_blocked_candidates.blocked,
+                        skipped_or_blocked_candidates.blocked_unsafe,
+                        skipped_or_blocked_candidates.blocked_display_only,
+                    );
+                } else {
+                    eprintln!(
+                        "flowscope: skipped/blocked fix candidates: {skipped_or_blocked_total} (use --show-fixes for details)"
+                    );
+                }
+            } else if args.show_fixes {
+                eprintln!(
+                    "flowscope: skipped/blocked fix candidates: 0 (skipped: 0, blocked: 0, unsafe blocked: 0, display-only blocked: 0)"
                 );
             }
         }

@@ -103,7 +103,7 @@ fn has_misplaced_cte_closing_bracket_in_query(
         else {
             continue;
         };
-        let Some(open_idx) = matching_open_paren_index(&tokens, close_idx) else {
+        let Some(open_idx) = matching_open_paren_index(tokens, close_idx) else {
             continue;
         };
 
@@ -191,9 +191,7 @@ fn tokenize_with_offsets_for_context(ctx: &LintContext) -> Option<Vec<LocatedTok
         let mut out = Vec::new();
         let mut covered_ranges = Vec::new();
         for token in tokens {
-            let Some((start, end)) = token_with_span_offsets(ctx.sql, token) else {
-                return None;
-            };
+            let (start, end) = token_with_span_offsets(ctx.sql, token)?;
             if start < ctx.statement_range.start || end > ctx.statement_range.end {
                 continue;
             }
@@ -364,8 +362,8 @@ fn has_misplaced_cte_closing_bracket(
     }
 
     let mut index = 0usize;
-    while let Some(as_idx) = find_next_as_keyword(&tokens, index) {
-        let Some(open_idx) = next_non_trivia_index(&tokens, as_idx + 1) else {
+    while let Some(as_idx) = find_next_as_keyword(tokens, index) {
+        let Some(open_idx) = next_non_trivia_index(tokens, as_idx + 1) else {
             index = as_idx + 1;
             continue;
         };
@@ -374,7 +372,7 @@ fn has_misplaced_cte_closing_bracket(
             continue;
         }
 
-        let Some(close_idx) = matching_close_paren_index(&tokens, open_idx) else {
+        let Some(close_idx) = matching_close_paren_index(tokens, open_idx) else {
             index = open_idx + 1;
             continue;
         };

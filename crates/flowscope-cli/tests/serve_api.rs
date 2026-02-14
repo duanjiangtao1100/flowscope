@@ -12,6 +12,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    Router,
 };
 use flowscope_cli::server::{build_router, state::AppState, state::ServerConfig};
 use flowscope_core::{Dialect, FileSource};
@@ -42,6 +43,25 @@ fn default_config() -> ServerConfig {
         #[cfg(feature = "templating")]
         template_config: None,
     }
+}
+
+async fn post_json(app: &Router, path: &str, payload: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    (status, json)
 }
 
 // === Health endpoint tests ===
@@ -198,6 +218,167 @@ async fn split_multiple_statements() {
     // Should have statements array
     assert!(json["statements"].is_array());
     assert_eq!(json["statements"].as_array().unwrap().len(), 3);
+}
+
+// === Lint fix endpoint tests ===
+
+#[tokio::test]
+async fn lint_fix_applies_safe_fix_and_reports_counts() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT COUNT (1) FROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(json["skipped_due_to_regression"], false);
+    assert!(json["fix_counts"]["total"].as_u64().unwrap() > 0);
+
+    let fixed_sql = json["sql"].as_str().unwrap().to_ascii_uppercase();
+    assert!(fixed_sql.contains("COUNT(*)"), "fixed SQL was: {fixed_sql}");
+}
+
+#[tokio::test]
+async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+    let sql = "SELECT * FROM (SELECT 1) sub";
+
+    let (safe_status, safe_json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql,
+            "unsafe_fixes": false
+        }),
+    )
+    .await;
+    let (unsafe_status, unsafe_json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql,
+            "unsafe_fixes": true
+        }),
+    )
+    .await;
+
+    assert_eq!(safe_status, StatusCode::OK);
+    assert_eq!(unsafe_status, StatusCode::OK);
+
+    let safe_sql = safe_json["sql"].as_str().unwrap().to_ascii_uppercase();
+    let unsafe_sql = unsafe_json["sql"].as_str().unwrap().to_ascii_uppercase();
+
+    assert!(
+        !safe_sql.contains("WITH SUB AS"),
+        "safe mode should not apply ST_005 rewrite: {safe_sql}"
+    );
+    assert!(
+        unsafe_sql.contains("WITH SUB AS"),
+        "unsafe mode should apply ST_005 rewrite: {unsafe_sql}"
+    );
+    assert!(
+        safe_json["skipped_counts"]["unsafe_skipped"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(unsafe_json["skipped_counts"]["unsafe_skipped"], 0);
+}
+
+#[tokio::test]
+async fn lint_fix_preserves_comments_while_fixing_non_comment_regions() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "-- keep this comment\nSELECT COUNT (1) FROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["skipped_due_to_comments"], false);
+
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.contains("-- keep this comment"),
+        "comment must be preserved: {fixed_sql}"
+    );
+    assert!(
+        fixed_sql.to_ascii_uppercase().contains("COUNT (*)")
+            || fixed_sql.to_ascii_uppercase().contains("COUNT(*)"),
+        "non-comment fix should still apply: {fixed_sql}"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_respects_disabled_rules() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT * FROM (SELECT 1) sub",
+            "unsafe_fixes": true,
+            "disabled_rules": ["LINT_ST_005"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!json["sql"]
+        .as_str()
+        .unwrap()
+        .to_ascii_uppercase()
+        .contains("WITH SUB AS"));
+    assert_eq!(json["skipped_counts"]["unsafe_skipped"], 0);
+}
+
+#[tokio::test]
+async fn lint_fix_rejects_non_object_rule_config_entries() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let response = app
+        .oneshot(
+            Request::post("/api/lint-fix")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "sql": "SELECT 1",
+                        "rule_configs": {
+                            "structure.subquery": "both"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        message.contains("'rule_configs' entry for 'structure.subquery' must be a JSON object"),
+        "unexpected error message: {message}"
+    );
 }
 
 // === Files endpoint tests ===
