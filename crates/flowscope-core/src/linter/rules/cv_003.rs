@@ -5,7 +5,7 @@
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::rules::semantic_helpers::visit_selects_in_statement;
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{GroupByExpr, Select, SelectItem, Spanned, Statement};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -79,72 +79,136 @@ impl LintRule for ConventionSelectTrailingComma {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let tokens =
             tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
-        if has_select_trailing_comma_violation(
+        let violations = select_clause_policy_violations(
             statement,
             ctx.statement_sql(),
             self.policy,
             tokens.as_deref(),
-        ) {
-            vec![
-                Issue::warning(issue_codes::LINT_CV_003, self.policy.message())
-                    .with_statement(ctx.statement_index),
-            ]
-        } else {
-            Vec::new()
+        );
+        let Some(first_violation) = violations.first().copied() else {
+            return Vec::new();
+        };
+
+        let mut issue = Issue::warning(issue_codes::LINT_CV_003, self.policy.message())
+            .with_statement(ctx.statement_index)
+            .with_span(ctx.span_from_statement_offset(
+                first_violation.issue_start,
+                first_violation.issue_end,
+            ));
+
+        let edits: Vec<IssuePatchEdit> = violations
+            .iter()
+            .filter_map(|violation| violation.fix)
+            .map(|edit| {
+                IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit.start, edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect();
+        if !edits.is_empty() {
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
         }
+
+        vec![issue]
     }
 }
 
-fn has_select_trailing_comma_violation(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectClauseEdit {
+    start: usize,
+    end: usize,
+    replacement: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectClauseViolation {
+    issue_start: usize,
+    issue_end: usize,
+    fix: Option<SelectClauseEdit>,
+}
+
+fn select_clause_policy_violations(
     statement: &Statement,
     sql: &str,
     policy: SelectClauseTrailingCommaPolicy,
     tokens: Option<&[LocatedToken]>,
-) -> bool {
-    let mut violation = false;
+) -> Vec<SelectClauseViolation> {
+    let mut violations = Vec::new();
     visit_selects_in_statement(statement, &mut |select| {
-        if violation {
-            return;
-        }
-        if select_clause_violates_policy(select, sql, policy, tokens) {
-            violation = true;
+        if let Some(violation) = select_clause_violation(select, sql, policy, tokens) {
+            violations.push(violation);
         }
     });
-    violation
+    violations
 }
 
-fn select_clause_violates_policy(
+fn select_clause_violation(
     select: &Select,
     sql: &str,
     policy: SelectClauseTrailingCommaPolicy,
     tokens: Option<&[LocatedToken]>,
-) -> bool {
-    let Some(last_projection_end) = select_last_projection_end(select) else {
-        return false;
-    };
-    let Some(last_projection_end_offset) = line_col_to_offset(
+) -> Option<SelectClauseViolation> {
+    let last_projection_end = select_last_projection_end(select)?;
+    let last_projection_end_offset = line_col_to_offset(
         sql,
         last_projection_end.0 as usize,
         last_projection_end.1 as usize,
-    ) else {
-        return false;
-    };
+    )?;
 
-    let boundary = select_clause_boundary(select).or_else(|| span_end(select.span()));
-    let Some(boundary) = boundary else {
-        return false;
-    };
-    let Some(boundary_offset) = line_col_to_offset(sql, boundary.0 as usize, boundary.1 as usize)
-    else {
-        return false;
-    };
+    let boundary = select_clause_boundary(select).or_else(|| span_end(select.span()))?;
+    let boundary_offset = line_col_to_offset(sql, boundary.0 as usize, boundary.1 as usize)?;
     if boundary_offset < last_projection_end_offset {
-        return false;
+        return None;
     }
 
-    let has_trailing_comma =
-        first_significant_token_is_comma(tokens, sql, last_projection_end_offset, boundary_offset);
-    policy.violated(has_trailing_comma)
+    let significant_token =
+        first_significant_token_between(tokens, last_projection_end_offset, boundary_offset);
+    let has_trailing_comma = significant_token
+        .as_ref()
+        .is_some_and(|token| matches!(token.token, Token::Comma));
+    if !policy.violated(has_trailing_comma) {
+        return None;
+    }
+
+    match policy {
+        SelectClauseTrailingCommaPolicy::Forbid => {
+            let comma = significant_token
+                .as_ref()
+                .copied()
+                .filter(|token| matches!(token.token, Token::Comma))?;
+            Some(SelectClauseViolation {
+                issue_start: comma.start,
+                issue_end: comma.end,
+                fix: Some(SelectClauseEdit {
+                    start: comma.start,
+                    end: comma.end,
+                    replacement: "",
+                }),
+            })
+        }
+        SelectClauseTrailingCommaPolicy::Require => {
+            // Without a following clause boundary, adding a terminal comma may
+            // produce invalid SQL (`SELECT 1,`), so report-only in this shape.
+            if boundary_offset == last_projection_end_offset {
+                return Some(SelectClauseViolation {
+                    issue_start: last_projection_end_offset,
+                    issue_end: last_projection_end_offset,
+                    fix: None,
+                });
+            }
+
+            Some(SelectClauseViolation {
+                issue_start: last_projection_end_offset,
+                issue_end: last_projection_end_offset,
+                fix: Some(SelectClauseEdit {
+                    start: last_projection_end_offset,
+                    end: last_projection_end_offset,
+                    replacement: ",",
+                }),
+            })
+        }
+    }
 }
 
 fn select_last_projection_end(select: &Select) -> Option<(u64, u64)> {
@@ -250,15 +314,12 @@ fn span_end(span: sqlparser::tokenizer::Span) -> Option<(u64, u64)> {
     }
 }
 
-fn first_significant_token_is_comma(
+fn first_significant_token_between(
     tokens: Option<&[LocatedToken]>,
-    _sql: &str,
     start: usize,
     end: usize,
-) -> bool {
-    let Some(tokens) = tokens else {
-        return false;
-    };
+) -> Option<&LocatedToken> {
+    let tokens = tokens?;
 
     for token in tokens {
         if token.end <= start || token.start >= end {
@@ -267,9 +328,9 @@ fn first_significant_token_is_comma(
         if is_trivia_token(&token.token) {
             continue;
         }
-        return matches!(token.token, Token::Comma);
+        return Some(token);
     }
-    false
+    None
 }
 
 #[derive(Clone)]
@@ -382,6 +443,7 @@ mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         run_with_rule(sql, ConventionSelectTrailingComma::default())
@@ -405,11 +467,28 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_trailing_comma_before_from() {
         let issues = run("select a, from t");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_003);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "");
+        let fixed = apply_issue_autofix("select a, from t", &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "select a from t");
     }
 
     #[test]
@@ -457,6 +536,12 @@ mod tests {
         let rule = ConventionSelectTrailingComma::from_config(&config);
         let issues = run_with_rule("SELECT a FROM t", rule);
         assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, ",");
+        let fixed = apply_issue_autofix("SELECT a FROM t", &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a, FROM t");
     }
 
     #[test]
@@ -487,5 +572,9 @@ mod tests {
         let rule = ConventionSelectTrailingComma::from_config(&config);
         let issues = run_with_rule("SELECT 1", rule);
         assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_none(),
+            "require-mode SELECT without clause boundary should remain report-only"
+        );
     }
 }

@@ -703,9 +703,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_CV_001) {
         out = fix_not_equal_operator(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_CV_003) {
-        out = fix_trailing_select_comma(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_013) {
         out = fix_leading_blank_lines(&out);
     }
@@ -1782,40 +1779,6 @@ fn collapse_semicolon_runs_without_tokenizer(sql: &str) -> String {
 
 fn fix_not_equal_operator(sql: &str) -> String {
     replace_outside_single_quotes(sql, |segment| segment.replace("<>", "!="))
-}
-
-fn fix_trailing_select_comma(sql: &str) -> String {
-    replace_comma_before_from_keyword(sql)
-}
-
-fn replace_comma_before_from_keyword(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if bytes[i] != b',' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-
-        let mut j = i + 1;
-        while j < bytes.len() && is_ascii_whitespace_byte(bytes[j]) {
-            j += 1;
-        }
-
-        if let Some(from_end) = match_ascii_keyword_at(bytes, j, b"FROM") {
-            out.push(' ');
-            out.push_str(&sql[j..from_end]);
-            i = from_end;
-        } else {
-            out.push(',');
-            i += 1;
-        }
-    }
-
-    out
 }
 
 fn replace_outside_single_quotes<F>(sql: &str, mut transform: F) -> String

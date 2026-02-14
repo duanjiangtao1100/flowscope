@@ -300,6 +300,57 @@ async fn lint_fix_applies_cv002_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_cv003_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT a, FROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT a FROM t",
+        "expected CV003 core autofix to remove trailing comma"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_rule_config_enables_cv003_require_core_autofix() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT a FROM t",
+            "rule_configs": {
+                "convention.select_trailing_comma": {
+                    "select_clause_trailing_comma": "require"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT a, FROM t",
+        "expected CV003 require-mode core autofix to insert trailing comma"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
