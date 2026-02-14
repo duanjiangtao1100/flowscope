@@ -94,15 +94,39 @@ impl LintRule for ConventionTerminator {
         }
 
         if semicolon.semicolon_offset != ctx.statement_range.end {
-            return vec![Issue::info(
+            let mut issue = Issue::info(
                 issue_codes::LINT_CV_006,
                 "Statement terminator style is inconsistent.",
             )
-            .with_statement(ctx.statement_index)];
+            .with_statement(ctx.statement_index);
+            if let Some(edit) = spacing_before_semicolon_edit(ctx, semicolon.semicolon_offset) {
+                issue = issue
+                    .with_span(edit.span)
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, vec![edit]);
+            }
+            return vec![issue];
         }
 
         Vec::new()
     }
+}
+
+fn spacing_before_semicolon_edit(
+    ctx: &LintContext,
+    semicolon_offset: usize,
+) -> Option<IssuePatchEdit> {
+    if semicolon_offset <= ctx.statement_range.end {
+        return None;
+    }
+    let gap_start = ctx.statement_range.end;
+    let gap_end = semicolon_offset;
+    let gap = &ctx.sql[gap_start..gap_end];
+    if gap.contains('\n') || gap.contains('\r') || !gap.chars().all(char::is_whitespace) {
+        return None;
+    }
+
+    let span = Span::new(gap_start, gap_end);
+    Some(IssuePatchEdit::new(span, ""))
 }
 
 fn statement_is_multiline(ctx: &LintContext, tokens: Option<&[LocatedToken]>) -> bool {
@@ -389,6 +413,7 @@ mod tests {
     use super::*;
     use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let stmts = parse_sql(sql).expect("parse");
@@ -407,6 +432,17 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -507,6 +543,11 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_006);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a FROM foo;");
     }
 
     #[test]

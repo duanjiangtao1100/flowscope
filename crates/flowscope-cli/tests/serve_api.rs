@@ -277,6 +277,29 @@ async fn lint_fix_rule_config_enables_cv006_core_autofix() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_cv006_spacing_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT a FROM foo  ;"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT a FROM foo;",
+        "expected CV06 core autofix to remove whitespace before semicolon"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cv002_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

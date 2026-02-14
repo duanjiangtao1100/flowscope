@@ -95,7 +95,6 @@ impl Default for FixOptions {
 struct RuleFilter {
     disabled: HashSet<String>,
     am005_mode: Am005QualifyMode,
-    cv06_require_final_semicolon: bool,
     al007_force_enable: bool,
     al009_case_check: Al009AliasCaseCheck,
     al001_mode: Al001FixMode,
@@ -190,9 +189,6 @@ impl RuleFilter {
             "both" => Am005QualifyMode::Both,
             _ => Am005QualifyMode::Inner,
         };
-        let cv06_require_final_semicolon = lint_config
-            .rule_option_bool(issue_codes::LINT_CV_006, "require_final_semicolon")
-            .unwrap_or(false);
         let al007_force_enable = lint_config
             .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
             .unwrap_or(false);
@@ -255,7 +251,6 @@ impl RuleFilter {
         Self {
             disabled,
             am005_mode,
-            cv06_require_final_semicolon,
             al007_force_enable,
             al009_case_check,
             al001_mode,
@@ -691,9 +686,6 @@ fn try_core_only_fix_plan(
 fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
     let mut out = sql.to_string();
 
-    if rule_filter.allows(issue_codes::LINT_CV_006) {
-        out = fix_statement_terminators(&out, dialect, rule_filter.cv06_require_final_semicolon);
-    }
     if rule_filter.allows(issue_codes::LINT_CV_001) {
         out = fix_not_equal_operator(&out);
     }
@@ -1590,44 +1582,6 @@ fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
     !(ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn fix_statement_terminators(sql: &str, dialect: Dialect, require_final_semicolon: bool) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    if tokens.is_empty() {
-        return sql.to_string();
-    }
-
-    let mut edits = Vec::new();
-
-    for (idx, token) in tokens.iter().enumerate() {
-        if !matches!(token.token, Token::SemiColon) {
-            continue;
-        }
-        if let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) {
-            let gap_start = tokens[prev_idx].end;
-            let gap_end = token.start;
-            if gap_start < gap_end {
-                let gap = &sql[gap_start..gap_end];
-                if !gap.contains('\n') && gap.chars().all(char::is_whitespace) {
-                    edits.push(SpanEdit::replace(gap_start, gap_end, ""));
-                }
-            }
-        }
-    }
-
-    if require_final_semicolon {
-        if let Some(last_idx) = last_non_trivia_token(&tokens) {
-            if !matches!(tokens[last_idx].token, Token::SemiColon) {
-                let insert_at = tokens[last_idx].end;
-                edits.push(SpanEdit::replace(insert_at, insert_at, ";"));
-            }
-        }
-    }
-
-    apply_span_edits(sql, edits)
-}
-
 fn fix_not_equal_operator(sql: &str) -> String {
     replace_outside_single_quotes(sql, |segment| segment.replace("<>", "!="))
 }
@@ -2483,12 +2437,6 @@ fn prev_non_trivia_token(tokens: &[LocatedToken], start: usize) -> Option<usize>
         }
         idx -= 1;
     }
-}
-
-fn last_non_trivia_token(tokens: &[LocatedToken]) -> Option<usize> {
-    (0..tokens.len())
-        .rev()
-        .find(|idx| !is_trivia_token(&tokens[*idx].token))
 }
 
 fn token_matches_keyword(token: &Token, keyword: &str) -> bool {

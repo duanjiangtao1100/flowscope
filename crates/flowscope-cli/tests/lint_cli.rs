@@ -546,6 +546,31 @@ fn test_lint_fix_rule_configs_enable_cv006_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_cv006_spacing_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("terminator_spacing_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT a FROM foo  ;").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT a FROM foo;",
+        "Expected CV06 core autofix to remove whitespace before statement terminator"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_cv002_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("coalesce_patch_fix.sql");
