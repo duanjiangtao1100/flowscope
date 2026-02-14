@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -49,11 +49,17 @@ impl LintRule for ConventionTerminator {
             && is_last_statement(ctx, tokens.as_deref())
             && !has_terminal_semicolon
         {
+            let insert_span = Span::new(ctx.statement_range.end, ctx.statement_range.end);
             return vec![Issue::info(
                 issue_codes::LINT_CV_006,
                 "Final statement must end with a semi-colon.",
             )
-            .with_statement(ctx.statement_index)];
+            .with_statement(ctx.statement_index)
+            .with_span(insert_span)
+            .with_autofix_edits(
+                IssueAutofixApplicability::Safe,
+                vec![IssuePatchEdit::new(insert_span, ";")],
+            )];
         }
 
         let Some(semicolon) = semicolon else {
@@ -438,6 +444,28 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_006);
+        assert_eq!(
+            issues[0]
+                .autofix
+                .as_ref()
+                .map(|autofix| autofix.edits.len()),
+            Some(1)
+        );
+        assert_eq!(
+            issues[0]
+                .autofix
+                .as_ref()
+                .map(|autofix| autofix.applicability),
+            Some(IssueAutofixApplicability::Safe)
+        );
+        assert_eq!(
+            issues[0]
+                .autofix
+                .as_ref()
+                .and_then(|autofix| autofix.edits.first())
+                .map(|edit| edit.replacement.as_str()),
+            Some(";")
+        );
     }
 
     #[test]

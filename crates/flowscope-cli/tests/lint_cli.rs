@@ -515,6 +515,37 @@ fn test_lint_rule_configs_flag_applies_rule_options() {
 }
 
 #[test]
+fn test_lint_fix_rule_configs_enable_cv006_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("missing_final_semicolon.sql");
+    std::fs::write(&sql_path, "SELECT 1").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--rule-configs",
+            r#"{"convention.terminator":{"require_final_semicolon":true}}"#,
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix + rule configs");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert!(
+        after.trim_end().ends_with(';'),
+        "Expected CV06 core autofix to append a final semicolon in patch mode: {after}"
+    );
+}
+
+#[test]
 fn test_lint_multiple_files() {
     let dir = tempdir().expect("temp dir");
     let clean_path = dir.path().join("clean.sql");

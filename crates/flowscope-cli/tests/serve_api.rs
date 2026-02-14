@@ -249,6 +249,34 @@ async fn lint_fix_applies_safe_fix_and_reports_counts() {
 }
 
 #[tokio::test]
+async fn lint_fix_rule_config_enables_cv006_core_autofix() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1",
+            "rule_configs": {
+                "convention.terminator": {
+                    "require_final_semicolon": true
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.trim_end().ends_with(';'),
+        "expected CV06 core autofix to append final semicolon: {fixed_sql}"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
