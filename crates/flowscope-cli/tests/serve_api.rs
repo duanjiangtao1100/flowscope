@@ -400,6 +400,33 @@ async fn lint_fix_applies_cv007_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt006_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT COUNT (1) FROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.contains("COUNT("),
+        "expected LT06 core autofix to keep function call parenthesis tight: {fixed_sql}"
+    );
+    assert!(
+        !fixed_sql.contains("COUNT ("),
+        "expected LT06 core autofix to remove spacing before function parenthesis: {fixed_sql}"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cv003_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

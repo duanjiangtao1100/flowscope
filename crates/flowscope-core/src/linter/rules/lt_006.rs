@@ -5,7 +5,7 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::visit::visit_expressions;
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{Expr, Statement};
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::collections::HashSet;
@@ -26,20 +26,39 @@ impl LintRule for LayoutFunctions {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let Some((start, end)) = function_spacing_issue_span(statement, ctx) else {
+        let Some(issue_span) = function_spacing_issue_span(statement, ctx) else {
             return Vec::new();
         };
+
+        let function_span =
+            ctx.span_from_statement_offset(issue_span.function_start, issue_span.function_end);
+        let gap_span = ctx.span_from_statement_offset(issue_span.gap_start, issue_span.gap_end);
 
         vec![Issue::info(
             issue_codes::LINT_LT_006,
             "Function call spacing appears inconsistent.",
         )
         .with_statement(ctx.statement_index)
-        .with_span(ctx.span_from_statement_offset(start, end))]
+        .with_span(function_span)
+        .with_autofix_edits(
+            IssueAutofixApplicability::Safe,
+            vec![IssuePatchEdit::new(gap_span, "")],
+        )]
     }
 }
 
-fn function_spacing_issue_span(statement: &Statement, ctx: &LintContext) -> Option<(usize, usize)> {
+#[derive(Clone, Copy, Debug)]
+struct FunctionSpacingIssueSpan {
+    function_start: usize,
+    function_end: usize,
+    gap_start: usize,
+    gap_end: usize,
+}
+
+fn function_spacing_issue_span(
+    statement: &Statement,
+    ctx: &LintContext,
+) -> Option<FunctionSpacingIssueSpan> {
     let sql = ctx.statement_sql();
     let tracked_function_names = tracked_function_names(statement);
 
@@ -79,17 +98,31 @@ fn function_spacing_issue_span(statement: &Statement, ctx: &LintContext) -> Opti
             }
         }
 
-        let start = line_col_to_offset(
+        let function_start = line_col_to_offset(
             sql,
             token.span.start.line as usize,
             token.span.start.column as usize,
         )?;
-        let end = line_col_to_offset(
+        let function_end = line_col_to_offset(
             sql,
             token.span.end.line as usize,
             token.span.end.column as usize,
         )?;
-        return Some((start, end));
+        let gap_end = line_col_to_offset(
+            sql,
+            tokens[next_index].span.start.line as usize,
+            tokens[next_index].span.start.column as usize,
+        )?;
+        if function_end >= gap_end {
+            continue;
+        }
+
+        return Some(FunctionSpacingIssueSpan {
+            function_start,
+            function_end,
+            gap_start: function_end,
+            gap_end,
+        });
     }
 
     None
@@ -299,6 +332,7 @@ fn relative_location(
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -317,6 +351,18 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut edits = autofix.edits.clone();
+        edits.sort_by(|left, right| right.span.start.cmp(&left.span.start));
+
+        let mut out = sql.to_string();
+        for edit in edits {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -346,5 +392,20 @@ mod tests {
         let issues = run("SELECT CAST (1 AS INT)");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_006);
+    }
+
+    #[test]
+    fn emits_safe_autofix_patch_for_function_spacing() {
+        let sql = "SELECT COUNT (1) FROM t";
+        let issues = run(sql);
+        let issue = &issues[0];
+        let autofix = issue.autofix.as_ref().expect("autofix metadata");
+
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "");
+
+        let fixed = apply_issue_autofix(sql, issue).expect("apply autofix");
+        assert_eq!(fixed, "SELECT COUNT(1) FROM t");
     }
 }

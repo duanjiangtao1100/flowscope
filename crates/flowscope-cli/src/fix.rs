@@ -749,9 +749,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_004) {
         out = fix_comma_spacing(&out, dialect);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_006) {
-        out = fix_function_spacing(&out, dialect);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
@@ -1928,36 +1925,6 @@ fn fix_comma_spacing(sql: &str, dialect: Dialect) -> String {
                     edits.push(SpanEdit::replace(gap_start, gap_end, " "));
                 }
             }
-        }
-    }
-
-    apply_span_edits(sql, edits)
-}
-
-fn fix_function_spacing(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for (idx, token) in tokens.iter().enumerate() {
-        let Token::Word(word) = &token.token else {
-            continue;
-        };
-        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
-            continue;
-        };
-        if !matches!(tokens[next_idx].token, Token::LParen) {
-            continue;
-        }
-        if is_sql_keyword(&word.value) {
-            continue;
-        }
-
-        let gap_start = token.end;
-        let gap_end = tokens[next_idx].start;
-        if gap_start < gap_end {
-            edits.push(SpanEdit::replace(gap_start, gap_end, ""));
         }
     }
 
