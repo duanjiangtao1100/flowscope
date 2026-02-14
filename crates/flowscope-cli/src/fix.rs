@@ -761,9 +761,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> St
     if rule_filter.allows(issue_codes::LINT_LT_009) {
         out = fix_select_target_newline(&out, dialect);
     }
-    if rule_filter.allows(issue_codes::LINT_LT_010) {
-        out = fix_select_modifier_position(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_AL_005) {
         out = fix_unused_table_aliases(&out);
     }
@@ -983,6 +980,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_006)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_010)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_013)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
@@ -2136,46 +2134,6 @@ fn fix_select_target_newline(sql: &str, dialect: Dialect) -> String {
     }
 
     apply_span_edits(sql, edits)
-}
-
-fn fix_select_modifier_position(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let Some(select_end) = match_ascii_keyword_at(bytes, i, b"SELECT") else {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        };
-
-        let mut j = select_end;
-        let mut saw_newline = false;
-        while j < bytes.len() && is_ascii_whitespace_byte(bytes[j]) {
-            if bytes[j] == b'\n' {
-                saw_newline = true;
-            }
-            j += 1;
-        }
-
-        if saw_newline {
-            let modifier_end = match_ascii_keyword_at(bytes, j, b"DISTINCT")
-                .or_else(|| match_ascii_keyword_at(bytes, j, b"ALL"));
-            if let Some(modifier_end) = modifier_end {
-                out.push_str(&sql[i..select_end]);
-                out.push(' ');
-                out.push_str(&sql[j..modifier_end]);
-                i = modifier_end;
-                continue;
-            }
-        }
-
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-
-    out
 }
 
 fn fix_unused_table_aliases(sql: &str) -> String {

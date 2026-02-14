@@ -574,6 +574,29 @@ async fn lint_fix_applies_lt014_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt010_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT\nDISTINCT a\nFROM t"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT DISTINCT a\nFROM t\n",
+        "expected LT010 core autofix to place DISTINCT on SELECT line"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_lt015_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
