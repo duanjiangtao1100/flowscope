@@ -748,9 +748,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_RF_003) {
         out = fix_mixed_reference_qualification(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_CP_005) {
-        out = fix_case_style_consistency(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_TQ_002) {
         out = fix_tsql_procedure_begin_end(&out);
     }
@@ -929,6 +926,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_004)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CP_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_003)
@@ -2428,81 +2426,6 @@ fn can_unquote_identifier_safely(identifier: &str) -> bool {
     let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
 
     starts_ok && rest_ok && !is_sql_keyword(identifier)
-}
-
-/// Lowercase SQL keywords while preserving identifiers and string literals.
-///
-/// Only tokens that match `is_sql_keyword` are lowered; everything else is
-/// kept as-is. Content inside quoted literals/identifiers is never touched.
-fn fix_case_style_consistency(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if in_single {
-            out.push(chars[i]);
-            if chars[i] == '\'' {
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    out.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_double {
-            out.push(chars[i]);
-            if chars[i] == '"' {
-                if i + 1 < chars.len() && chars[i + 1] == '"' {
-                    out.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '\'' {
-            in_single = true;
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '"' {
-            in_double = true;
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        // Collect word tokens and lowercase only if they are SQL keywords
-        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
-            let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let token: String = chars[start..i].iter().collect();
-            if is_sql_keyword(&token) {
-                out.push_str(&token.to_ascii_lowercase());
-            } else {
-                out.push_str(&token);
-            }
-            continue;
-        }
-
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
 }
 
 fn fix_tsql_procedure_begin_end(sql: &str) -> String {
@@ -6584,19 +6507,6 @@ mod tests {
             has_c_style || has_ansi_style,
             "operator usage should still normalize to a single style: {}",
             out.sql
-        );
-    }
-
-    #[test]
-    fn case_style_fix_does_not_rewrite_double_quoted_identifiers() {
-        let fixed = fix_case_style_consistency("SELECT \"FROM\", \"CamelCase\" FROM t");
-        assert!(
-            fixed.contains("\"FROM\""),
-            "keyword-like quoted identifier should remain unchanged: {fixed}"
-        );
-        assert!(
-            fixed.contains("\"CamelCase\""),
-            "case-sensitive quoted identifier should remain unchanged: {fixed}"
         );
     }
 

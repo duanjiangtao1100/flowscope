@@ -636,6 +636,29 @@ async fn lint_fix_applies_cp004_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_cp005_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "CREATE TABLE t (a INT, b varchar(10))\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "CREATE TABLE t (a int, b varchar(10))\n",
+        "expected CP005 core autofix to normalize type capitalisation"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_rf006_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
