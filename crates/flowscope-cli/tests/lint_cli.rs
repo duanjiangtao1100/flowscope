@@ -773,6 +773,37 @@ fn test_lint_fix_applies_al005_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_am001_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("distinct_group_by_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT DISTINCT a FROM t GROUP BY a\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--exclude-rules",
+            "LINT_LT_014",
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT a FROM t GROUP BY a\n",
+        "Expected AM001 core autofix to remove DISTINCT when GROUP BY is present: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_am002_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("bare_union_patch_fix.sql");

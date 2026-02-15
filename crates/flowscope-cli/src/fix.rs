@@ -856,7 +856,8 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         return 2;
     };
 
-    if code.eq_ignore_ascii_case(issue_codes::LINT_CV_001)
+    if code.eq_ignore_ascii_case(issue_codes::LINT_AM_001)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_003)
@@ -2138,10 +2139,6 @@ fn fix_set_expr(body: &mut SetExpr, rule_filter: &RuleFilter) {
 }
 
 fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
-    if rule_filter.allows(issue_codes::LINT_AM_001) && has_distinct_and_group_by(select) {
-        select.distinct = None;
-    }
-
     if rule_filter.allows(issue_codes::LINT_AL_007) && rule_filter.al007_force_enable {
         let _ = apply_single_table_alias_rewrite(select);
     }
@@ -2785,18 +2782,6 @@ fn normalize_name_for_mode(name_ref: NameRef<'_>, mode: Al009AliasCaseCheck) -> 
         }
         _ => name_ref.name.to_string(),
     }
-}
-
-fn has_distinct_and_group_by(select: &Select) -> bool {
-    let has_distinct = matches!(
-        select.distinct,
-        Some(Distinct::Distinct) | Some(Distinct::On(_))
-    );
-    let has_group_by = match &select.group_by {
-        GroupByExpr::All(_) => true,
-        GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-    };
-    has_distinct && has_group_by
 }
 
 fn rewrite_simple_derived_subqueries_to_ctes(query: &mut Query, rule_filter: &RuleFilter) {

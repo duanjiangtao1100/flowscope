@@ -487,6 +487,30 @@ async fn lint_fix_applies_al005_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_am001_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT DISTINCT a FROM t GROUP BY a\n",
+            "disabled_rules": ["LINT_LT_014"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT a FROM t GROUP BY a\n",
+        "expected AM001 core autofix to remove DISTINCT when GROUP BY is present"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_am002_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
