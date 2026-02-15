@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{Ident, SelectItem, Spanned, Statement};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -103,13 +103,16 @@ impl LintRule for AliasingColumnStyle {
                     continue;
                 }
 
-                issues.push(
+                let mut issue =
                     Issue::info(issue_codes::LINT_AL_002, self.aliasing.message())
                         .with_statement(ctx.statement_index)
                         .with_span(
                             ctx.span_from_statement_offset(occurrence.start, occurrence.end),
-                        ),
-                );
+                        );
+                if let Some(edits) = autofix_edits_for_occurrence(occurrence, self.aliasing) {
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+                }
+                issues.push(issue);
             }
         });
 
@@ -122,7 +125,31 @@ struct AliasOccurrence {
     start: usize,
     end: usize,
     explicit_as: bool,
+    as_span: Option<Span>,
     tsql_equals_assignment: bool,
+}
+
+fn autofix_edits_for_occurrence(
+    occurrence: AliasOccurrence,
+    aliasing: AliasingPreference,
+) -> Option<Vec<IssuePatchEdit>> {
+    match aliasing {
+        AliasingPreference::Explicit if !occurrence.explicit_as => {
+            let insert = Span::new(occurrence.start, occurrence.start);
+            Some(vec![IssuePatchEdit::new(insert, "AS ")])
+        }
+        AliasingPreference::Implicit if occurrence.explicit_as => {
+            let as_span = occurrence.as_span?;
+            // Replace " AS " (leading whitespace + AS keyword + trailing whitespace)
+            // with a single space to preserve separation between expression and alias.
+            let delete_end = occurrence.start;
+            Some(vec![IssuePatchEdit::new(
+                Span::new(as_span.start, delete_end),
+                " ",
+            )])
+        }
+        _ => None,
+    }
 }
 
 fn alias_occurrence_in_statement(
@@ -161,23 +188,38 @@ fn alias_occurrence_in_statement(
     }
     let rel_item_end = abs_item_end - ctx.statement_range.start;
 
-    let explicit_as = explicit_as_before_alias_tokens(tokens, rel_start)?;
+    let (explicit_as, as_span) = explicit_as_before_alias_tokens(tokens, rel_start)?;
     let tsql_equals_assignment =
         tsql_assignment_after_alias_tokens(tokens, rel_end, rel_item_end).unwrap_or(false);
     Some(AliasOccurrence {
         start: rel_start,
         end: rel_end,
         explicit_as,
+        as_span,
         tsql_equals_assignment,
     })
 }
 
-fn explicit_as_before_alias_tokens(tokens: &[LocatedToken], alias_start: usize) -> Option<bool> {
+fn explicit_as_before_alias_tokens(
+    tokens: &[LocatedToken],
+    alias_start: usize,
+) -> Option<(bool, Option<Span>)> {
     let token = tokens
         .iter()
         .rev()
         .find(|token| token.end <= alias_start && !is_trivia_token(&token.token))?;
-    Some(is_as_token(&token.token))
+    if is_as_token(&token.token) {
+        // Include leading whitespace before AS in the span.
+        let leading_ws_start = tokens
+            .iter()
+            .rev()
+            .find(|t| t.end <= token.start && !is_trivia_token(&t.token))
+            .map(|t| t.end)
+            .unwrap_or(token.start);
+        Some((true, Some(Span::new(leading_ws_start, token.end))))
+    } else {
+        Some((false, None))
+    }
 }
 
 fn tsql_assignment_after_alias_tokens(
@@ -304,6 +346,7 @@ mod tests {
     use super::*;
     use crate::{
         parser::{parse_sql, parse_sql_with_dialect},
+        types::IssueAutofixApplicability,
         Dialect,
     };
 
@@ -364,6 +407,46 @@ mod tests {
     fn does_not_flag_alias_text_in_string_literal() {
         let issues = run("select 'a as label' as value from t");
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn explicit_mode_emits_safe_insert_as_autofix_patch() {
+        let sql = "select a + 1 total from t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AL002 core autofix");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "AS ");
+        assert_eq!(autofix.edits[0].span.start, autofix.edits[0].span.end);
+    }
+
+    #[test]
+    fn implicit_mode_emits_safe_remove_as_autofix_patch() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "aliasing.column".to_string(),
+                serde_json::json!({"aliasing": "implicit"}),
+            )]),
+        };
+        let rule = AliasingColumnStyle::from_config(&config);
+        let sql = "select a + 1 as total from t";
+        let issues = run_with_rule(sql, rule);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AL002 core autofix in implicit mode");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, " ");
+        // Span should cover " as " (leading whitespace + AS keyword + trailing whitespace).
+        assert_eq!(&sql[autofix.edits[0].span.start..autofix.edits[0].span.end], " as ");
     }
 
     #[test]

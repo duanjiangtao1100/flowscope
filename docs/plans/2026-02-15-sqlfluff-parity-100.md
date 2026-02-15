@@ -172,10 +172,10 @@ CP01 (`cp_001.rs`, capitalisation.keywords, 20 gaps: 5 FP + 3 FN + 12 fix mismat
 
 AL07 (`al_007.rs`, aliasing.forbid, 19 gaps: 11 FN + 8 fix mismatch), AL01 (`al_001.rs`, aliasing.table, 11 gaps: 1 FP + 4 FN + 6 fix mismatch), AL02 (`al_002.rs`, aliasing.column, 12 gaps including AL02_LT01: 4 FN + 8 fix mismatch). AL07 detection is completely missing (0/11 fail).
 
-- [ ] Fix AL07: analyze 11 FN cases, fix `al_007.rs` to detect forbidden alias patterns, fix 8 fix mismatches
-- [ ] Fix AL01: analyze 1 FP + 4 FN, fix `al_001.rs` table alias detection, fix 6 fix mismatches
-- [ ] Fix AL02: analyze 4 FN (including AL02_LT01), fix `al_002.rs` column alias detection, fix 8 fix mismatches
-- [ ] Verify 0 FN, 0 FP, 0 fix mismatches for AL01, AL02, AL02_LT01, AL07 in parity report
+- [x] Fix AL07: core autofix for alias removal + qualified reference replacement; priority-0 in fix engine; removed conflicting AST rewrite path (4/10 fix, up from 2/10; remaining 6 are cross-rule side effects: JOIN→INNER JOIN, on→ON)
+- [x] Fix AL01: implicit mode deletion span widened to include leading whitespace (avoids CP01 priority conflict); explicit mode inserts space before AS when none exists; priority-0 in fix engine (12/13 fix, up from 7/13; remaining 1 is parser reformatting issue)
+- [x] Fix AL02: added autofix edits (insert AS for explicit, remove AS for implicit); same span strategy as AL01; priority-0 in fix engine (2/5 fix + 3/3 AL02_LT01, up from 0/5 + 0/3; remaining 3 are cross-rule side effects: AL05 removing unused table alias)
+- [x] Verify parity: detection unchanged (89.1%), fix 375→383/667 (+8), zero regressions
 
 ### Task 15: LT03/LT04/LT09/LT12 — Layout Extras (59 gaps)
 

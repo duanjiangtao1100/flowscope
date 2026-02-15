@@ -110,6 +110,8 @@ struct AliasOccurrence {
     end: usize,
     explicit_as: bool,
     as_span: Option<Span>,
+    /// Whether there is whitespace before the alias position.
+    has_leading_whitespace: bool,
 }
 
 fn autofix_edits_for_occurrence(
@@ -119,10 +121,22 @@ fn autofix_edits_for_occurrence(
     match aliasing {
         AliasingPreference::Explicit if !occurrence.explicit_as => {
             let insert = Span::new(occurrence.start, occurrence.start);
-            Some(vec![IssuePatchEdit::new(insert, "AS ")])
+            let replacement = if occurrence.has_leading_whitespace {
+                "AS "
+            } else {
+                " AS "
+            };
+            Some(vec![IssuePatchEdit::new(insert, replacement)])
         }
         AliasingPreference::Implicit if occurrence.explicit_as => {
-            Some(vec![IssuePatchEdit::new(occurrence.as_span?, "")])
+            let as_span = occurrence.as_span?;
+            // Replace " AS " (leading whitespace + AS keyword + trailing whitespace)
+            // with a single space to preserve separation between table name and alias.
+            let delete_end = occurrence.start;
+            Some(vec![IssuePatchEdit::new(
+                Span::new(as_span.start, delete_end),
+                " ",
+            )])
         }
         _ => None,
     }
@@ -153,11 +167,13 @@ fn alias_occurrence_in_statement(
     let rel_start = abs_start - ctx.statement_range.start;
     let rel_end = abs_end - ctx.statement_range.start;
     let (explicit_as, as_span) = explicit_as_before_alias_tokens(tokens, rel_start)?;
+    let has_leading_whitespace = has_whitespace_before(tokens, rel_start);
     Some(AliasOccurrence {
         start: rel_start,
         end: rel_end,
         explicit_as,
         as_span,
+        has_leading_whitespace,
     })
 }
 
@@ -274,10 +290,26 @@ fn explicit_as_before_alias_tokens(
         .rev()
         .find(|token| token.end <= alias_start && !is_trivia_token(&token.token))?;
     if is_as_token(&token.token) {
-        Some((true, Some(Span::new(token.start, token.end))))
+        // Look for leading whitespace before AS to include in the span.
+        let leading_ws_start = tokens
+            .iter()
+            .rev()
+            .find(|t| t.end <= token.start && !is_trivia_token(&t.token))
+            .map(|t| t.end)
+            .unwrap_or(token.start);
+        Some((true, Some(Span::new(leading_ws_start, token.end))))
     } else {
         Some((false, None))
     }
+}
+
+/// Checks if there is whitespace immediately before the given position.
+fn has_whitespace_before(tokens: &[LocatedToken], pos: usize) -> bool {
+    tokens
+        .iter()
+        .rev()
+        .find(|t| t.end <= pos)
+        .is_some_and(|t| is_trivia_token(&t.token))
 }
 
 fn is_as_token(token: &Token) -> bool {
@@ -515,10 +547,11 @@ mod tests {
             .expect("expected AL001 core autofix metadata in implicit mode");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         assert_eq!(autofix.edits.len(), 1);
-        assert_eq!(autofix.edits[0].replacement, "");
+        assert_eq!(autofix.edits[0].replacement, " ");
+        // Span should cover " as " (leading whitespace + AS keyword + trailing whitespace).
         assert_eq!(
-            &sql[autofix.edits[0].span.start..autofix.edits[0].span.end].to_ascii_uppercase(),
-            "AS"
+            &sql[autofix.edits[0].span.start..autofix.edits[0].span.end],
+            " as "
         );
     }
 }
