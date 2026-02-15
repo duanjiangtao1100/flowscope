@@ -6,7 +6,7 @@
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
-use sqlparser::ast::{BinaryOperator, Expr, Spanned, Statement};
+use sqlparser::ast::{BinaryOperator, Expr, Spanned, Statement, TableFactor};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::semantic_helpers::{
@@ -87,48 +87,16 @@ impl LintRule for StructureJoinConditionOrder {
         let mut issues = Vec::new();
 
         visit_selects_in_statement(statement, &mut |select| {
-            let mut seen_sources: Vec<String> = Vec::new();
-
             for table in &select.from {
-                if let Some(base) = table_factor_reference_name(&table.relation) {
-                    seen_sources.push(base);
-                }
-
-                for join in &table.joins {
-                    let join_name = table_factor_reference_name(&join.relation);
-                    let previous_source = seen_sources.last().cloned();
-
-                    if let (Some(current), Some(previous), Some(on_expr)) = (
-                        join_name.as_ref(),
-                        previous_source.as_ref(),
-                        join_on_expr(&join.join_operator),
-                    ) {
-                        let left = self.preferred_first_table.left_source(current, previous);
-                        let right = self.preferred_first_table.right_source(current, previous);
-                        if has_join_pair(on_expr, left, right) {
-                            let mut issue = Issue::info(
-                                issue_codes::LINT_ST_009,
-                                "Join condition ordering appears inconsistent with configured preference.",
-                            )
-                            .with_statement(ctx.statement_index);
-
-                            if let Some((span, replacement)) =
-                                join_condition_autofix(ctx, on_expr, left, right)
-                            {
-                                issue = issue.with_span(span).with_autofix_edits(
-                                    IssueAutofixApplicability::Safe,
-                                    vec![IssuePatchEdit::new(span, replacement)],
-                                );
-                            }
-
-                            issues.push(issue);
-                        }
-                    }
-
-                    if let Some(name) = join_name {
-                        seen_sources.push(name);
-                    }
-                }
+                let mut seen_sources: Vec<String> = Vec::new();
+                check_table_factor_joins(
+                    &table.relation,
+                    &table.joins,
+                    &mut seen_sources,
+                    self.preferred_first_table,
+                    ctx,
+                    &mut issues,
+                );
             }
         });
 
@@ -136,10 +104,100 @@ impl LintRule for StructureJoinConditionOrder {
     }
 }
 
+fn check_table_factor_joins(
+    relation: &TableFactor,
+    joins: &[sqlparser::ast::Join],
+    seen_sources: &mut Vec<String>,
+    preference: PreferredFirstTableInJoinClause,
+    ctx: &LintContext,
+    issues: &mut Vec<Issue>,
+) {
+    // For NestedJoin, recurse into the inner table_with_joins.
+    if let TableFactor::NestedJoin {
+        table_with_joins, ..
+    } = relation
+    {
+        check_table_factor_joins(
+            &table_with_joins.relation,
+            &table_with_joins.joins,
+            seen_sources,
+            preference,
+            ctx,
+            issues,
+        );
+    } else if let Some(base) = table_factor_reference_name(relation) {
+        seen_sources.push(base);
+    }
+
+    for join in joins {
+        // Recurse into nested join relations on the right side.
+        if let TableFactor::NestedJoin {
+            table_with_joins, ..
+        } = &join.relation
+        {
+            check_table_factor_joins(
+                &table_with_joins.relation,
+                &table_with_joins.joins,
+                seen_sources,
+                preference,
+                ctx,
+                issues,
+            );
+        }
+
+        let join_name = table_factor_reference_name(&join.relation);
+        let previous_source = seen_sources.last().cloned();
+
+        if let (Some(current), Some(previous), Some(on_expr)) = (
+            join_name.as_ref(),
+            previous_source.as_ref(),
+            join_on_expr(&join.join_operator),
+        ) {
+            let left = preference.left_source(current, previous);
+            let right = preference.right_source(current, previous);
+            if has_join_pair(on_expr, left, right) {
+                let mut issue = Issue::info(
+                    issue_codes::LINT_ST_009,
+                    "Join condition ordering appears inconsistent with configured preference.",
+                )
+                .with_statement(ctx.statement_index);
+
+                if let Some((span, replacement)) =
+                    join_condition_autofix(ctx, on_expr, left, right)
+                {
+                    issue = issue.with_span(span).with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        vec![IssuePatchEdit::new(span, replacement)],
+                    );
+                }
+
+                issues.push(issue);
+            }
+        }
+
+        if let Some(name) = join_name {
+            seen_sources.push(name);
+        }
+    }
+}
+
+fn is_comparison_operator(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::LtEq
+            | BinaryOperator::GtEq
+            | BinaryOperator::Spaceship
+    )
+}
+
 fn has_join_pair(expr: &Expr, left_source_name: &str, right_source_name: &str) -> bool {
     match expr {
         Expr::BinaryOp { left, op, right } => {
-            let direct = if *op == BinaryOperator::Eq {
+            let direct = if is_comparison_operator(op) {
                 if let (Some(left_prefix), Some(right_prefix)) =
                     (expr_qualified_prefix(left), expr_qualified_prefix(right))
                 {
@@ -217,16 +275,30 @@ fn join_condition_autofix(
     Some((span, rewritten.to_string()))
 }
 
+fn flip_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Spaceship => Some(op.clone()),
+        BinaryOperator::Lt => Some(BinaryOperator::Gt),
+        BinaryOperator::Gt => Some(BinaryOperator::Lt),
+        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
+        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
+        _ => None,
+    }
+}
+
 fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_source: &str) {
     match expr {
         Expr::BinaryOp { left, op, right } => {
-            if *op == BinaryOperator::Eq {
+            if is_comparison_operator(op) {
                 let left_prefix = expr_qualified_prefix(left);
                 let right_prefix = expr_qualified_prefix(right);
                 if left_prefix.as_deref() == Some(current_source)
                     && right_prefix.as_deref() == Some(previous_source)
                 {
                     std::mem::swap(left, right);
+                    if let Some(flipped) = flip_comparison_operator(op) {
+                        *op = flipped;
+                    }
                 }
             }
 
@@ -555,5 +627,32 @@ mod tests {
             issues[0].autofix.is_none(),
             "comment-bearing join condition should not emit ST009 safe patch metadata"
         );
+    }
+
+    #[test]
+    fn flags_reversed_non_equality_comparison_operators() {
+        // SQLFluff: test_fail_later_table_first_multiple_comparison_operators
+        let sql = "select foo.a, bar.b from foo left join bar on bar.a != foo.a and bar.b > foo.b and bar.c <= foo.c";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_ST_009);
+    }
+
+    #[test]
+    fn flags_reversed_join_inside_bracketed_from() {
+        // SQLFluff: test_fail_later_table_first_brackets_after_from
+        let sql = "select foo.a, bar.b from (foo left join bar on bar.a = foo.a)";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_ST_009);
+    }
+
+    #[test]
+    fn flags_spaceship_operator_reversed() {
+        // SQLFluff: test_fail_sparksql_lt_eq_gt_operator
+        let sql = "SELECT bt.test FROM base_table AS bt INNER JOIN second_table AS st ON st.test <=> bt.test";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_ST_009);
     }
 }

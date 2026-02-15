@@ -162,6 +162,14 @@ def extract_rule_configs(configs: dict | None) -> dict | None:
             if isinstance(clause_obj, dict):
                 lt14_cfg[clause_type] = clause_obj
 
+    # Map layout.type.binary_operator/comparison_operator.line_position → layout.operators.line_position for LT03.
+    if layout_type and isinstance(layout_type, dict):
+        for op_type in ("binary_operator", "comparison_operator"):
+            op_cfg = layout_type.get(op_type, {})
+            if isinstance(op_cfg, dict) and "line_position" in op_cfg:
+                lt03_cfg = result.setdefault("layout.operators", {})
+                lt03_cfg.setdefault("line_position", op_cfg["line_position"])
+
     return result if result else None
 
 

@@ -547,6 +547,56 @@ mod tests {
     }
 
     #[test]
+    fn trailing_config_flags_leading_operator_with_comments() {
+        // SQLFluff: fails_on_before_override_with_comment_order
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.operators".to_string(),
+                serde_json::json!({"line_position": "trailing"}),
+            )]),
+        };
+        let sql = "select\n    a -- comment1!\n    -- comment2!\n    -- comment3!\n    + b\nfrom foo";
+        let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+    }
+
+    #[test]
+    fn trailing_config_allows_trailing_operator() {
+        // SQLFluff: passes_on_after_override
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.operators".to_string(),
+                serde_json::json!({"line_position": "trailing"}),
+            )]),
+        };
+        let sql = "select\n    a +\n    b\nfrom foo";
+        let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn trailing_config_flags_leading_operator() {
+        // SQLFluff: fails_on_before_override
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.operators".to_string(),
+                serde_json::json!({"line_position": "trailing"}),
+            )]),
+        };
+        let sql = "select\n    a\n    + b\nfrom foo";
+        let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+    }
+
+    #[test]
     fn legacy_operator_new_lines_before_maps_to_trailing_style() {
         let config = LintConfig {
             enabled: true,

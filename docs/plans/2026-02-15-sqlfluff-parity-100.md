@@ -206,8 +206,11 @@ Covers all remaining rules with smaller individual gaps. AM05 (20 gaps: 1 FP + 8
 - [x] Fix AL09: 2 FP + 1 FN in `al_009.rs`, fix 5 fix mismatches — detection 9/9 pass + 5/6 fail, dialect-aware NormalizationStrategy + different-quote guard, 1 FN is parser limitation (BigQuery backtick escape)
 - [x] Fix AM07: 1 FN in `am_007.rs` — detection 27/27 pass + 10/10 fail, UPDATE FROM subquery set-operation traversal
 - [x] Fix AM02: 1 FP in `am_002.rs` — Postgres bare UNION exemption, detection 4/4 pass + 4/4 fail (full parity)
-- [ ] Fix remaining small-gap rules: CP04, CV02, CV03, CV05, CV07, RF01, RF02, RF03, AM04, AM08, LT07, LT08, LT10, LT11, LT13, LT15 — remaining gaps are parser limitations, template issues, complex CTE resolution, struct semantics, or correlated subquery tracking
-- [ ] Verify all remaining rules show 0 gaps in parity report
+- [x] Fix ST09: 4 FN in `st_009.rs` — detection 8/8 pass + 19/20 fail, non-equality comparison operators (!=, <, >, <=, >=, <=>) + NestedJoin bracketed FROM + operator flip in autofix. 1 FN is Jinja template limitation
+- [x] Fix LT03: config mapping gap in parity script — `layout.type.binary_operator.line_position` → `layout.operators.line_position`. Detection 5/5 pass + 11/12 fail. 1 FN is Jinja template limitation
+- [ ] Fix RF03: 9 FP + 1 FN in `rf_003.rs`, fix 7 fix mismatches — struct fields, TSQL parameters, correlated subqueries. Complex semantic analysis required
+- [ ] Remaining parser/template/config limitations (not fixable without major infrastructure): TQ01 (3 FN — TSQL procedure parsing), TQ02 (4 FN + 1 FP — TSQL ALTER/CREATE OR ALTER parsing), AL07 (1 FN — TSQL DECLARE+CREATE TABLE), AL08 (1 FN — per-location violation emission), AM04 (2 FP + 1 FN — CTE resolution chain), AM08 (1 FP — DuckDB positional join), LT13 (3 FP — Jinja templates), LT15 (2 FP — T-SQL batch separator config), CP01 (1 FP — Jinja), CP03 (1 FP — Jinja), CV09 (1 FN — Jinja), CV10 (3 FN + 4 FP — Jinja/BigQuery templates), ST02 (1 FN — Jinja), ST04 (5 FN — parser/comments/Jinja), LT12 (2 FN + 1 FP — Jinja whitespace), RF01 (1 FP — SparkSQL), RF05 (1 FN — parser), RF06 (1 FN — SparkSQL), CV06 (1 FN — block comment)
+- [ ] Verify all remaining rules show 0 gaps in parity report (blocked: 154 remaining gaps are parser/template/config limitations)
 
 ### Task 17: Final Verification and Cleanup
 
