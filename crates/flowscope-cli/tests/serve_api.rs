@@ -427,6 +427,62 @@ async fn lint_fix_applies_lt006_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_lt005_core_autofix_in_patch_mode_with_config() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+    let sql = format!("SELECT {} FROM t\n", vec!["column_name"; 60].join(" "));
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql,
+            "rule_configs": {
+                "layout.long_lines": {
+                    "max_line_length": 300
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    let fixed_sql = json["sql"].as_str().unwrap();
+    assert!(
+        fixed_sql.lines().all(|line| line.len() <= 300),
+        "expected LT005 core autofix output lines to stay under configured threshold: {fixed_sql:?}"
+    );
+    assert!(
+        fixed_sql.lines().count() > 1,
+        "expected LT005 core autofix to split an extremely long line: {fixed_sql:?}"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_applies_al005_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT users.name FROM users AS u JOIN orders AS o ON users.id = orders.user_id\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT users.name FROM users JOIN orders ON users.id = orders.user_id\n",
+        "expected AL005 core autofix to remove unused table aliases"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_lt004_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

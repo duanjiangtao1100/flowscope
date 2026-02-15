@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, Span};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -83,22 +83,38 @@ impl LintRule for LayoutLongLines {
             return Vec::new();
         }
 
-        long_line_overflow_spans_for_context(
+        let overflow_spans = long_line_overflow_spans_for_context(
             ctx,
             max_line_length,
             self.ignore_comment_lines,
             self.ignore_comment_clauses,
-        )
-        .into_iter()
-        .map(|(start, end)| {
-            Issue::info(
-                issue_codes::LINT_LT_005,
-                "SQL contains excessively long lines.",
-            )
-            .with_statement(ctx.statement_index)
-            .with_span(Span::new(start, end))
-        })
-        .collect()
+        );
+        if overflow_spans.is_empty() {
+            return Vec::new();
+        }
+
+        let mut issues: Vec<Issue> = overflow_spans
+            .into_iter()
+            .map(|(start, end)| {
+                Issue::info(
+                    issue_codes::LINT_LT_005,
+                    "SQL contains excessively long lines.",
+                )
+                .with_statement(ctx.statement_index)
+                .with_span(Span::new(start, end))
+            })
+            .collect();
+
+        let autofix_edits = legacy_long_line_autofix_edits(ctx.sql);
+        if let Some(first_issue) = issues.first_mut() {
+            if !autofix_edits.is_empty() {
+                *first_issue = first_issue
+                    .clone()
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+            }
+        }
+
+        issues
     }
 }
 
@@ -265,6 +281,63 @@ fn line_ranges(sql: &str) -> Vec<(usize, usize)> {
     }
     ranges.push((line_start, line_end));
     ranges
+}
+
+/// Legacy LT005 rewrite parity:
+/// split only extremely long lines (>300 bytes) around the 280-byte target.
+const LEGACY_MAX_LINE_LENGTH: usize = 300;
+const LEGACY_LINE_SPLIT_TARGET: usize = 280;
+
+fn legacy_long_line_autofix_edits(sql: &str) -> Vec<IssuePatchEdit> {
+    let mut edits = Vec::new();
+
+    for (line_start, line_end) in line_ranges(sql) {
+        let line = &sql[line_start..line_end];
+        let Some(replacement) = legacy_split_long_line(line) else {
+            continue;
+        };
+        if replacement == line {
+            continue;
+        }
+
+        edits.push(IssuePatchEdit::new(
+            Span::new(line_start, line_end),
+            replacement,
+        ));
+    }
+
+    edits
+}
+
+fn legacy_split_long_line(line: &str) -> Option<String> {
+    if line.len() <= LEGACY_MAX_LINE_LENGTH {
+        return None;
+    }
+
+    let mut rewritten = String::new();
+    let mut remaining = line.trim_start();
+    let mut first_segment = true;
+
+    while remaining.len() > LEGACY_MAX_LINE_LENGTH {
+        let probe = remaining
+            .char_indices()
+            .take_while(|(index, _)| *index <= LEGACY_LINE_SPLIT_TARGET)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(LEGACY_LINE_SPLIT_TARGET.min(remaining.len()));
+        let split_at = remaining[..probe].rfind(' ').unwrap_or(probe);
+
+        if !first_segment {
+            rewritten.push('\n');
+        }
+        rewritten.push_str(remaining[..split_at].trim_end());
+        rewritten.push('\n');
+        remaining = remaining[split_at..].trim_start();
+        first_segment = false;
+    }
+
+    rewritten.push_str(remaining);
+    Some(rewritten)
 }
 
 fn line_is_comment_only_tokenized(
@@ -588,6 +661,7 @@ fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, u
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run_with_rule(sql: &str, rule: &LayoutLongLines) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -609,6 +683,17 @@ mod tests {
 
     fn run(sql: &str) -> Vec<Issue> {
         run_with_rule(sql, &LayoutLongLines::default())
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        let mut rewritten = sql.to_string();
+        for edit in edits.into_iter().rev() {
+            rewritten.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(rewritten)
     }
 
     #[test]
@@ -784,5 +869,34 @@ mod tests {
         let sql = "SELECT this_is_a_very_long_column_name_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx FROM t";
         let issues = run_with_rule(sql, &LayoutLongLines::from_config(&config));
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn emits_safe_autofix_patch_for_very_long_line() {
+        let projections = (0..120)
+            .map(|index| format!("col_{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {projections} FROM t");
+        let issues = run(&sql);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_005);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+
+        let fixed = apply_issue_autofix(&sql, &issues[0]).expect("apply autofix");
+        let expected = legacy_split_long_line(&sql).expect("legacy split result");
+        assert_eq!(fixed, expected);
+        assert_ne!(fixed, sql);
+    }
+
+    #[test]
+    fn does_not_emit_autofix_when_line_is_below_legacy_split_threshold() {
+        let sql = format!("SELECT {} FROM t", "x".repeat(120));
+        let issues = run(&sql);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_005);
+        assert!(
+            issues[0].autofix.is_none(),
+            "LT005 legacy split only rewrites lines longer than 300 bytes"
+        );
     }
 }

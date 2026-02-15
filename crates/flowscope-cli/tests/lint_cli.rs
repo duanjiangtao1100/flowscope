@@ -708,6 +708,71 @@ fn test_lint_fix_applies_lt006_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_lt005_core_autofix_in_patch_mode_with_config() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("long_line_patch_fix.sql");
+    let sql = format!("SELECT {} FROM t\n", vec!["column_name"; 60].join(" "));
+    std::fs::write(&sql_path, sql).expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--rule-configs",
+            r#"{"layout.long_lines":{"max_line_length":300}}"#,
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert!(
+        after.lines().all(|line| line.len() <= 300),
+        "Expected LT005 core autofix output lines to stay under configured threshold: {after:?}"
+    );
+    assert!(
+        after.lines().count() > 1,
+        "Expected LT005 core autofix to split an extremely long line: {after:?}"
+    );
+}
+
+#[test]
+fn test_lint_fix_applies_al005_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("unused_table_alias_patch_fix.sql");
+    std::fs::write(
+        &sql_path,
+        "SELECT users.name FROM users AS u JOIN orders AS o ON users.id = orders.user_id\n",
+    )
+    .expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT users.name FROM users JOIN orders ON users.id = orders.user_id\n",
+        "Expected AL005 core autofix to remove unused table aliases: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_lt004_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("comma_spacing_patch_fix.sql");

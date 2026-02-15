@@ -5,8 +5,9 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::*;
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +104,22 @@ impl LintRule for UnusedTableAlias {
             }
             _ => {}
         }
+
+        if let Some(first_issue) = issues.first_mut() {
+            let autofix_edits: Vec<IssuePatchEdit> =
+                al005_legacy_autofix_edits(ctx.statement_sql())
+                    .into_iter()
+                    .map(|(start, end)| {
+                        IssuePatchEdit::new(ctx.span_from_statement_offset(start, end), "")
+                    })
+                    .collect();
+            if !autofix_edits.is_empty() {
+                *first_issue = first_issue
+                    .clone()
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+            }
+        }
+
         issues
     }
 }
@@ -1078,13 +1095,381 @@ fn check_table_factor_subqueries(
     }
 }
 
+#[derive(Debug, Clone)]
+struct LegacySimpleTableAliasDecl {
+    table_end: usize,
+    alias_end: usize,
+    alias: String,
+}
+
+#[derive(Clone)]
+struct LegacyLocatedToken {
+    token: Token,
+    end: usize,
+}
+
+fn al005_legacy_autofix_edits(sql: &str) -> Vec<(usize, usize)> {
+    let Some(decls) = legacy_collect_simple_table_alias_declarations(sql, Dialect::Generic) else {
+        return Vec::new();
+    };
+    if decls.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen_aliases = HashSet::new();
+    let mut removals = Vec::new();
+    for decl in &decls {
+        let alias_key = decl.alias.to_ascii_lowercase();
+        if !seen_aliases.insert(alias_key.clone()) {
+            continue;
+        }
+        if legacy_is_sql_keyword(&decl.alias) || legacy_is_generated_alias_identifier(&decl.alias) {
+            continue;
+        }
+        if legacy_contains_alias_qualifier(sql, &decl.alias) {
+            continue;
+        }
+
+        removals.extend(
+            decls
+                .iter()
+                .filter(|candidate| candidate.alias.eq_ignore_ascii_case(&alias_key))
+                .map(|candidate| (candidate.table_end, candidate.alias_end)),
+        );
+    }
+
+    removals.sort_unstable();
+    removals.dedup();
+    removals.retain(|(start, end)| start < end);
+    removals
+}
+
+fn legacy_collect_simple_table_alias_declarations(
+    sql: &str,
+    dialect: Dialect,
+) -> Option<Vec<LegacySimpleTableAliasDecl>> {
+    let tokens = legacy_tokenize_with_offsets(sql, dialect)?;
+    let mut out = Vec::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if !legacy_token_matches_keyword(&tokens[index].token, "FROM")
+            && !legacy_token_matches_keyword(&tokens[index].token, "JOIN")
+        {
+            index += 1;
+            continue;
+        }
+
+        let Some(mut cursor) = legacy_next_non_trivia_token(&tokens, index + 1) else {
+            index += 1;
+            continue;
+        };
+        if legacy_token_simple_identifier(&tokens[cursor].token).is_none() {
+            index += 1;
+            continue;
+        }
+
+        let mut table_end = tokens[cursor].end;
+        cursor += 1;
+
+        loop {
+            let Some(dot_index) = legacy_next_non_trivia_token(&tokens, cursor) else {
+                break;
+            };
+            if !matches!(tokens[dot_index].token, Token::Period) {
+                break;
+            }
+            let Some(next_index) = legacy_next_non_trivia_token(&tokens, dot_index + 1) else {
+                break;
+            };
+            if legacy_token_simple_identifier(&tokens[next_index].token).is_none() {
+                break;
+            }
+            table_end = tokens[next_index].end;
+            cursor = next_index + 1;
+        }
+
+        let Some(mut alias_index) = legacy_next_non_trivia_token(&tokens, cursor) else {
+            index += 1;
+            continue;
+        };
+        if legacy_token_matches_keyword(&tokens[alias_index].token, "AS") {
+            let Some(next_index) = legacy_next_non_trivia_token(&tokens, alias_index + 1) else {
+                index += 1;
+                continue;
+            };
+            alias_index = next_index;
+        }
+
+        let Some(alias_value) = legacy_token_simple_identifier(&tokens[alias_index].token) else {
+            index += 1;
+            continue;
+        };
+
+        out.push(LegacySimpleTableAliasDecl {
+            table_end,
+            alias_end: tokens[alias_index].end,
+            alias: alias_value.to_string(),
+        });
+        index = alias_index + 1;
+    }
+
+    Some(out)
+}
+
+fn legacy_tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LegacyLocatedToken>> {
+    let dialect = dialect.to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
+    let tokens = tokenizer.tokenize_with_location().ok()?;
+
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let (_, end) = legacy_token_with_span_offsets(sql, &token)?;
+        out.push(LegacyLocatedToken {
+            token: token.token,
+            end,
+        });
+    }
+    Some(out)
+}
+
+fn legacy_token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
+    let start = legacy_line_col_to_offset(
+        sql,
+        token.span.start.line as usize,
+        token.span.start.column as usize,
+    )?;
+    let end = legacy_line_col_to_offset(
+        sql,
+        token.span.end.line as usize,
+        token.span.end.column as usize,
+    )?;
+    Some((start, end))
+}
+
+fn legacy_line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1usize;
+    let mut current_col = 1usize;
+
+    for (offset, ch) in sql.char_indices() {
+        if current_line == line && current_col == column {
+            return Some(offset);
+        }
+
+        if ch == '\n' {
+            current_line += 1;
+            current_col = 1;
+        } else {
+            current_col += 1;
+        }
+    }
+
+    if current_line == line && current_col == column {
+        return Some(sql.len());
+    }
+
+    None
+}
+
+fn legacy_next_non_trivia_token(tokens: &[LegacyLocatedToken], mut start: usize) -> Option<usize> {
+    while start < tokens.len() {
+        if !legacy_is_trivia_token(&tokens[start].token) {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
+fn legacy_is_trivia_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(
+            Whitespace::Space
+                | Whitespace::Newline
+                | Whitespace::Tab
+                | Whitespace::SingleLineComment { .. }
+                | Whitespace::MultiLineComment(_)
+        )
+    )
+}
+
+fn legacy_token_matches_keyword(token: &Token, keyword: &str) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(keyword))
+}
+
+fn legacy_token_simple_identifier(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(word) if legacy_is_simple_identifier(&word.value) => Some(&word.value),
+        _ => None,
+    }
+}
+
+fn legacy_contains_alias_qualifier(sql: &str, alias: &str) -> bool {
+    let alias_bytes = alias.as_bytes();
+    if alias_bytes.is_empty() {
+        return false;
+    }
+
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+    while index + alias_bytes.len() < bytes.len() {
+        if !legacy_is_word_boundary_for_keyword(bytes, index.saturating_sub(1)) {
+            index += 1;
+            continue;
+        }
+
+        let end = index + alias_bytes.len();
+        if end < bytes.len()
+            && bytes[end] == b'.'
+            && bytes[index..end]
+                .iter()
+                .zip(alias_bytes.iter())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn legacy_is_word_boundary_for_keyword(bytes: &[u8], index: usize) -> bool {
+    index == 0 || index >= bytes.len() || !legacy_is_ascii_ident_continue(bytes[index])
+}
+
+fn legacy_is_generated_alias_identifier(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    match chars.next() {
+        Some('t') => {}
+        _ => return false,
+    }
+    let mut saw_digit = false;
+    for ch in chars {
+        if !ch.is_ascii_digit() {
+            return false;
+        }
+        saw_digit = true;
+    }
+    saw_digit
+}
+
+fn legacy_is_sql_keyword(token: &str) -> bool {
+    matches!(
+        token.to_ascii_uppercase().as_str(),
+        "ALL"
+            | "ALTER"
+            | "AND"
+            | "ANY"
+            | "AS"
+            | "ASC"
+            | "BEGIN"
+            | "BETWEEN"
+            | "BOOLEAN"
+            | "BY"
+            | "CASE"
+            | "CAST"
+            | "CHECK"
+            | "COLUMN"
+            | "CONSTRAINT"
+            | "CREATE"
+            | "CROSS"
+            | "DEFAULT"
+            | "DELETE"
+            | "DESC"
+            | "DISTINCT"
+            | "DROP"
+            | "ELSE"
+            | "END"
+            | "EXCEPT"
+            | "EXISTS"
+            | "FALSE"
+            | "FETCH"
+            | "FOR"
+            | "FOREIGN"
+            | "FROM"
+            | "FULL"
+            | "GROUP"
+            | "HAVING"
+            | "IF"
+            | "IN"
+            | "INDEX"
+            | "INNER"
+            | "INSERT"
+            | "INT"
+            | "INTEGER"
+            | "INTERSECT"
+            | "INTO"
+            | "IS"
+            | "JOIN"
+            | "KEY"
+            | "LEFT"
+            | "LIKE"
+            | "LIMIT"
+            | "NOT"
+            | "NULL"
+            | "OFFSET"
+            | "ON"
+            | "OR"
+            | "ORDER"
+            | "OUTER"
+            | "OVER"
+            | "PARTITION"
+            | "PRIMARY"
+            | "REFERENCES"
+            | "RIGHT"
+            | "SELECT"
+            | "SET"
+            | "TABLE"
+            | "TEXT"
+            | "THEN"
+            | "TRUE"
+            | "UNION"
+            | "UNIQUE"
+            | "UPDATE"
+            | "USING"
+            | "VALUES"
+            | "VARCHAR"
+            | "VIEW"
+            | "WHEN"
+            | "WHERE"
+            | "WINDOW"
+            | "WITH"
+    )
+}
+
+fn legacy_is_simple_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !legacy_is_ascii_ident_start(bytes[0]) {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .copied()
+        .all(legacy_is_ascii_ident_continue)
+}
+
+fn legacy_is_ascii_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn legacy_is_ascii_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
     use crate::linter::rule::with_active_dialect;
     use crate::parser::{parse_sql, parse_sql_with_dialect};
-    use crate::types::Dialect;
+    use crate::types::{Dialect, IssueAutofixApplicability};
 
     fn check_sql(sql: &str) -> Vec<Issue> {
         let stmts = parse_sql(sql).unwrap();
@@ -1099,6 +1484,17 @@ mod tests {
             issues.extend(rule.check(stmt, &ctx));
         }
         issues
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        let mut rewritten = sql.to_string();
+        for edit in edits.into_iter().rev() {
+            rewritten.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(rewritten)
     }
 
     fn check_sql_in_dialect(sql: &str, dialect: Dialect) -> Vec<Issue> {
@@ -1124,6 +1520,31 @@ mod tests {
         // Both aliases u and o are unused (full table names used instead)
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].code, "LINT_AL_005");
+    }
+
+    #[test]
+    fn test_unused_alias_emits_safe_autofix_patch() {
+        let sql = "SELECT users.name FROM users AS u JOIN orders AS o ON users.id = orders.user_id";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 2);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT users.name FROM users JOIN orders ON users.id = orders.user_id"
+        );
+    }
+
+    #[test]
+    fn test_generated_alias_does_not_emit_autofix() {
+        let sql = "SELECT * FROM users AS t1";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_none(),
+            "legacy AL005 parity skips generated aliases like t1"
+        );
     }
 
     #[test]

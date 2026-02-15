@@ -323,7 +323,6 @@ pub fn apply_lint_fixes_with_options(
         }
 
         let mut rewritten_sql = render_statements(&statements, sql);
-        rewritten_sql = apply_text_fixes(&rewritten_sql, &safe_rule_filter, dialect);
         rewritten_sql = apply_am005_full_outer_keyword_fix(&rewritten_sql, &safe_rule_filter);
         rewritten_sql =
             apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
@@ -340,7 +339,6 @@ pub fn apply_lint_fixes_with_options(
                 fix_statement(stmt, &rule_filter);
             }
             let mut unsafe_sql = render_statements(&unsafe_statements, sql);
-            unsafe_sql = apply_text_fixes(&unsafe_sql, &rule_filter, dialect);
             unsafe_sql = apply_am005_full_outer_keyword_fix(&unsafe_sql, &rule_filter);
             unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
             if unsafe_sql != rewritten_sql {
@@ -698,19 +696,6 @@ fn try_core_only_fix_plan(
     })
 }
 
-fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> String {
-    let mut out = sql.to_string();
-
-    if rule_filter.allows(issue_codes::LINT_LT_005) {
-        out = fix_long_lines(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_AL_005) {
-        out = fix_unused_table_aliases(&out);
-    }
-
-    out
-}
-
 fn apply_am005_full_outer_keyword_fix(sql: &str, rule_filter: &RuleFilter) -> String {
     if !rule_filter.allows(issue_codes::LINT_AM_005) {
         return sql.to_string();
@@ -884,10 +869,12 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_004)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_005)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_AL_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_004)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_007)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_008)
@@ -1558,97 +1545,19 @@ fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
     !(ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// Maximum line length before `fix_long_lines` will attempt to split.
-const MAX_LINE_LENGTH: usize = 300;
-/// Target split position when breaking long lines.
-const LINE_SPLIT_TARGET: usize = 280;
-
-fn fix_long_lines(sql: &str) -> String {
-    let mut out = String::new();
-    for (idx, line) in sql.lines().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        if line.len() <= MAX_LINE_LENGTH {
-            out.push_str(line);
-            continue;
-        }
-
-        let mut remaining = line.trim_start();
-        let mut first_segment = true;
-        while remaining.len() > MAX_LINE_LENGTH {
-            let probe = remaining
-                .char_indices()
-                .take_while(|(i, _)| *i <= LINE_SPLIT_TARGET)
-                .map(|(i, _)| i)
-                .last()
-                .unwrap_or(LINE_SPLIT_TARGET.min(remaining.len()));
-            let split_at = remaining[..probe].rfind(' ').unwrap_or(probe);
-            if !first_segment {
-                out.push('\n');
-            }
-            out.push_str(remaining[..split_at].trim_end());
-            out.push('\n');
-            remaining = remaining[split_at..].trim_start();
-            first_segment = false;
-        }
-        out.push_str(remaining);
-    }
-    out
-}
-
-fn fix_unused_table_aliases(sql: &str) -> String {
-    let Some(decls) = collect_simple_table_alias_declarations(sql, Dialect::Generic) else {
-        return sql.to_string();
-    };
-    if decls.is_empty() {
-        return sql.to_string();
-    }
-
-    let mut seen_aliases = HashSet::new();
-    let mut removals = Vec::new();
-    for decl in &decls {
-        let alias_key = decl.alias.to_ascii_lowercase();
-        if !seen_aliases.insert(alias_key.clone()) {
-            continue;
-        }
-        if is_sql_keyword(&decl.alias) || is_generated_alias_identifier(&decl.alias) {
-            continue;
-        }
-        if contains_alias_qualifier(sql, &decl.alias) {
-            continue;
-        }
-
-        removals.extend(
-            decls
-                .iter()
-                .filter(|candidate| candidate.alias.eq_ignore_ascii_case(&alias_key))
-                .map(|candidate| (candidate.table_end, candidate.alias_end)),
-        );
-    }
-
-    apply_byte_removals(sql, removals)
-}
-
 #[cfg(test)]
 fn is_ascii_whitespace_byte(byte: u8) -> bool {
     matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c)
 }
 
+#[cfg(test)]
 fn is_ascii_ident_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_'
 }
 
+#[cfg(test)]
 fn is_ascii_ident_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn is_simple_identifier(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || !is_ascii_ident_start(bytes[0]) {
-        return false;
-    }
-    bytes[1..].iter().copied().all(is_ascii_ident_continue)
 }
 
 #[cfg(test)]
@@ -1671,6 +1580,7 @@ fn consume_ascii_identifier(bytes: &[u8], start: usize) -> Option<usize> {
     Some(idx)
 }
 
+#[cfg(test)]
 fn is_word_boundary_for_keyword(bytes: &[u8], idx: usize) -> bool {
     idx == 0 || idx >= bytes.len() || !is_ascii_ident_continue(bytes[idx])
 }
@@ -1695,150 +1605,6 @@ fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> O
     } else {
         None
     }
-}
-
-#[derive(Debug, Clone)]
-struct SimpleTableAliasDecl {
-    table_end: usize,
-    alias_end: usize,
-    alias: String,
-}
-
-fn collect_simple_table_alias_declarations(
-    sql: &str,
-    dialect: Dialect,
-) -> Option<Vec<SimpleTableAliasDecl>> {
-    let tokens = tokenize_with_offsets(sql, dialect)?;
-    let mut out = Vec::new();
-    let mut i = 0usize;
-
-    while i < tokens.len() {
-        if !token_matches_keyword(&tokens[i].token, "FROM")
-            && !token_matches_keyword(&tokens[i].token, "JOIN")
-        {
-            i += 1;
-            continue;
-        }
-
-        let Some(mut cursor) = next_non_trivia_token(&tokens, i + 1) else {
-            i += 1;
-            continue;
-        };
-        let Some(_) = token_simple_identifier(&tokens[cursor].token) else {
-            i += 1;
-            continue;
-        };
-        let mut table_end = tokens[cursor].end;
-        cursor += 1;
-
-        loop {
-            let Some(dot_idx) = next_non_trivia_token(&tokens, cursor) else {
-                break;
-            };
-            if !matches!(tokens[dot_idx].token, Token::Period) {
-                break;
-            }
-            let Some(next_idx) = next_non_trivia_token(&tokens, dot_idx + 1) else {
-                break;
-            };
-            if token_simple_identifier(&tokens[next_idx].token).is_none() {
-                break;
-            }
-            table_end = tokens[next_idx].end;
-            cursor = next_idx + 1;
-        }
-
-        let Some(mut alias_idx) = next_non_trivia_token(&tokens, cursor) else {
-            i += 1;
-            continue;
-        };
-        if token_matches_keyword(&tokens[alias_idx].token, "AS") {
-            let Some(next_idx) = next_non_trivia_token(&tokens, alias_idx + 1) else {
-                i += 1;
-                continue;
-            };
-            alias_idx = next_idx;
-        }
-
-        let Some(alias_value) = token_simple_identifier(&tokens[alias_idx].token) else {
-            i += 1;
-            continue;
-        };
-
-        out.push(SimpleTableAliasDecl {
-            table_end,
-            alias_end: tokens[alias_idx].end,
-            alias: alias_value.to_string(),
-        });
-        i = alias_idx + 1;
-    }
-
-    Some(out)
-}
-
-fn next_non_trivia_token(tokens: &[LocatedToken], mut start: usize) -> Option<usize> {
-    while start < tokens.len() {
-        if !is_trivia_token(&tokens[start].token) {
-            return Some(start);
-        }
-        start += 1;
-    }
-    None
-}
-
-fn token_matches_keyword(token: &Token, keyword: &str) -> bool {
-    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(keyword))
-}
-
-fn token_simple_identifier(token: &Token) -> Option<&str> {
-    match token {
-        Token::Word(word) if is_simple_identifier(&word.value) => Some(&word.value),
-        _ => None,
-    }
-}
-
-fn contains_alias_qualifier(sql: &str, alias: &str) -> bool {
-    let alias_bytes = alias.as_bytes();
-    if alias_bytes.is_empty() {
-        return false;
-    }
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    while i + alias_bytes.len() < bytes.len() {
-        if !is_word_boundary_for_keyword(bytes, i.saturating_sub(1)) {
-            i += 1;
-            continue;
-        }
-
-        let end = i + alias_bytes.len();
-        if end < bytes.len()
-            && bytes[end] == b'.'
-            && bytes[i..end]
-                .iter()
-                .zip(alias_bytes.iter())
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-fn is_generated_alias_identifier(alias: &str) -> bool {
-    let mut chars = alias.chars();
-    match chars.next() {
-        Some('t') => {}
-        _ => return false,
-    }
-    let mut saw_digit = false;
-    for ch in chars {
-        if !ch.is_ascii_digit() {
-            return false;
-        }
-        saw_digit = true;
-    }
-    saw_digit
 }
 
 #[cfg(test)]
