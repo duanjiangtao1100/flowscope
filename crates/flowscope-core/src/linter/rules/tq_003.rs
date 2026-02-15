@@ -4,9 +4,9 @@
 //! `GO` separators.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
-use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct TsqlEmptyBatch;
@@ -25,18 +25,38 @@ impl LintRule for TsqlEmptyBatch {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let tokens = tokenized_for_context(ctx);
-        let has_violation =
-            has_empty_go_batch_separator(ctx.statement_sql(), ctx.dialect(), tokens.as_deref());
-        if has_violation {
-            vec![Issue::warning(
-                issue_codes::LINT_TQ_003,
-                "Empty TSQL batch detected between GO separators.",
-            )
-            .with_statement(ctx.statement_index)]
-        } else {
-            Vec::new()
+        // TQ003 is document-level: GO separators can sit outside statement
+        // spans, so evaluate once against the full SQL document.
+        if ctx.statement_index != 0 {
+            return Vec::new();
         }
+
+        let has_violation = has_empty_go_batch_separator(ctx.sql, ctx.dialect(), None);
+        if !has_violation {
+            return Vec::new();
+        }
+
+        let mut issue = Issue::warning(
+            issue_codes::LINT_TQ_003,
+            "Empty TSQL batch detected between GO separators.",
+        )
+        .with_statement(ctx.statement_index);
+
+        let autofix_edits = empty_go_batch_separator_edits(ctx.sql)
+            .into_iter()
+            .map(|edit| {
+                IssuePatchEdit::new(
+                    crate::types::Span::new(edit.start, edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if !autofix_edits.is_empty() {
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+        }
+
+        vec![issue]
     }
 }
 
@@ -95,51 +115,6 @@ fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
     tokenizer.tokenize_with_location().ok()
 }
 
-fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<TokenWithSpan>> {
-    let (statement_start_line, statement_start_column) =
-        offset_to_line_col(ctx.sql, ctx.statement_range.start)?;
-
-    ctx.with_document_tokens(|tokens| {
-        if tokens.is_empty() {
-            return None;
-        }
-
-        let mut out = Vec::new();
-        for token in tokens {
-            let Some((start, end)) = token_with_span_offsets(ctx.sql, token) else {
-                continue;
-            };
-            if start < ctx.statement_range.start || end > ctx.statement_range.end {
-                continue;
-            }
-
-            let Some(start_loc) = relative_location(
-                token.span.start,
-                statement_start_line,
-                statement_start_column,
-            ) else {
-                continue;
-            };
-            let Some(end_loc) =
-                relative_location(token.span.end, statement_start_line, statement_start_column)
-            else {
-                continue;
-            };
-
-            out.push(TokenWithSpan::new(
-                token.token.clone(),
-                Span::new(start_loc, end_loc),
-            ));
-        }
-
-        if out.is_empty() {
-            None
-        } else {
-            Some(out)
-        }
-    })
-}
-
 #[derive(Default, Clone, Copy)]
 struct LineSummary {
     go_count: usize,
@@ -193,114 +168,94 @@ fn lines_between_are_empty(
     ((first_line + 1)..second_line).all(|line_number| !line_summary.contains_key(&line_number))
 }
 
-fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
-    if line == 0 || column == 0 {
-        return None;
-    }
-
-    let mut current_line = 1usize;
-    let mut current_col = 1usize;
-
-    for (offset, ch) in sql.char_indices() {
-        if current_line == line && current_col == column {
-            return Some(offset);
-        }
-
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 1;
-        } else {
-            current_col += 1;
-        }
-    }
-
-    if current_line == line && current_col == column {
-        return Some(sql.len());
-    }
-
-    None
+struct Tq003AutofixEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
 }
 
-fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
-    let start = line_col_to_offset(
-        sql,
-        token.span.start.line as usize,
-        token.span.start.column as usize,
-    )?;
-    let end = line_col_to_offset(
-        sql,
-        token.span.end.line as usize,
-        token.span.end.column as usize,
-    )?;
-    Some((start, end))
-}
+fn empty_go_batch_separator_edits(sql: &str) -> Vec<Tq003AutofixEdit> {
+    let bytes = sql.as_bytes();
+    let mut edits = Vec::new();
+    let mut index = 0usize;
 
-fn offset_to_line_col(sql: &str, offset: usize) -> Option<(usize, usize)> {
-    if offset > sql.len() {
-        return None;
-    }
-    if offset == sql.len() {
-        let mut line = 1usize;
-        let mut column = 1usize;
-        for ch in sql.chars() {
-            if ch == '\n' {
-                line += 1;
-                column = 1;
-            } else {
-                column += 1;
+    while index < bytes.len() {
+        if bytes[index] != b'\n' {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index;
+        let mut batch_count = 0usize;
+        while cursor < bytes.len() && bytes[cursor] == b'\n' {
+            let mut go_start = cursor + 1;
+            while go_start < bytes.len() && is_ascii_whitespace_non_newline_byte(bytes[go_start]) {
+                go_start += 1;
             }
+            let Some(go_end) = match_ascii_keyword_at(bytes, go_start, b"GO") else {
+                break;
+            };
+            let mut after_go = go_end;
+            while after_go < bytes.len() && is_ascii_whitespace_non_newline_byte(bytes[after_go]) {
+                after_go += 1;
+            }
+            batch_count += 1;
+            cursor = after_go;
         }
-        return Some((line, column));
-    }
 
-    let mut line = 1usize;
-    let mut column = 1usize;
-    for (index, ch) in sql.char_indices() {
-        if index == offset {
-            return Some((line, column));
-        }
-        if ch == '\n' {
-            line += 1;
-            column = 1;
+        if batch_count >= 2 {
+            edits.push(Tq003AutofixEdit {
+                start: index,
+                end: cursor,
+                replacement: "\nGO".to_string(),
+            });
+            index = cursor;
         } else {
-            column += 1;
+            index += 1;
         }
     }
 
-    None
+    edits
 }
 
-fn relative_location(
-    location: Location,
-    statement_start_line: usize,
-    statement_start_column: usize,
-) -> Option<Location> {
-    let line = location.line as usize;
-    let column = location.column as usize;
-    if line < statement_start_line {
+fn is_ascii_whitespace_non_newline_byte(byte: u8) -> bool {
+    byte.is_ascii_whitespace() && byte != b'\n'
+}
+
+fn is_ascii_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_word_boundary_for_keyword(bytes: &[u8], idx: usize) -> bool {
+    idx == 0 || idx >= bytes.len() || !is_ascii_ident_continue(bytes[idx])
+}
+
+fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> Option<usize> {
+    let end = start.checked_add(keyword_upper.len())?;
+    if end > bytes.len() {
         return None;
     }
-
-    if line == statement_start_line {
-        if column < statement_start_column {
-            return None;
-        }
-        return Some(Location::new(
-            1,
-            (column - statement_start_column + 1) as u64,
-        ));
+    if !is_word_boundary_for_keyword(bytes, start.saturating_sub(1))
+        || !is_word_boundary_for_keyword(bytes, end)
+    {
+        return None;
     }
-
-    Some(Location::new(
-        (line - statement_start_line + 1) as u64,
-        column as u64,
-    ))
+    let matches = bytes[start..end]
+        .iter()
+        .zip(keyword_upper.iter())
+        .all(|(actual, expected)| actual.to_ascii_uppercase() == *expected);
+    if matches {
+        Some(end)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -319,6 +274,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn run_for_statement_sql(sql: &str) -> Vec<Issue> {
+        let statements = parse_sql("SELECT 1").expect("parse placeholder statement");
+        let rule = TsqlEmptyBatch;
+        rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        )
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -351,6 +330,26 @@ mod tests {
             Dialect::Generic,
             None,
         ));
+    }
+
+    #[test]
+    fn detects_empty_go_batches_between_statements() {
+        assert!(has_empty_go_batch_separator(
+            "SELECT 1\nGO\nGO\nSELECT 2\n",
+            Dialect::Generic,
+            None,
+        ));
+    }
+
+    #[test]
+    fn emits_safe_autofix_for_empty_go_batches() {
+        let sql = "SELECT 1\nGO\nGO\nSELECT 2\n";
+        let issues = run_for_statement_sql(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT 1\nGO\nSELECT 2\n");
     }
 
     #[test]

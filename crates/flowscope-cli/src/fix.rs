@@ -766,9 +766,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_TQ_002) {
         out = fix_tsql_procedure_begin_end(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_TQ_003) {
-        out = fix_tsql_empty_batches(&out);
-    }
 
     out
 }
@@ -955,6 +952,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
     {
         0
@@ -1724,10 +1722,6 @@ fn fix_unused_table_aliases(sql: &str) -> String {
 
 fn is_ascii_whitespace_byte(byte: u8) -> bool {
     matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c)
-}
-
-fn is_ascii_whitespace_non_newline_byte(byte: u8) -> bool {
-    is_ascii_whitespace_byte(byte) && byte != b'\n'
 }
 
 fn is_ascii_ident_start(byte: u8) -> bool {
@@ -2720,48 +2714,6 @@ fn fix_tsql_procedure_begin_end(sql: &str) -> String {
         out.push_str(" BEGIN END");
         out.push_str(&sql[ident_end..quote_start + 1]);
         i = quote_start + 1;
-    }
-
-    out
-}
-
-fn fix_tsql_empty_batches(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if bytes[i] != b'\n' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-
-        let mut cursor = i;
-        let mut batch_count = 0usize;
-        while cursor < bytes.len() && bytes[cursor] == b'\n' {
-            let mut go_start = cursor + 1;
-            while go_start < bytes.len() && is_ascii_whitespace_non_newline_byte(bytes[go_start]) {
-                go_start += 1;
-            }
-            let Some(go_end) = match_ascii_keyword_at(bytes, go_start, b"GO") else {
-                break;
-            };
-            let mut after_go = go_end;
-            while after_go < bytes.len() && is_ascii_whitespace_non_newline_byte(bytes[after_go]) {
-                after_go += 1;
-            }
-            batch_count += 1;
-            cursor = after_go;
-        }
-
-        if batch_count >= 2 {
-            out.push_str("\nGO\n");
-            i = cursor;
-        } else {
-            out.push('\n');
-            i += 1;
-        }
     }
 
     out

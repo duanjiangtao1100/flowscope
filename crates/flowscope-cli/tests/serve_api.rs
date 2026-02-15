@@ -519,6 +519,31 @@ async fn lint_fix_applies_lt002_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_tq003_core_autofix_in_patch_mode() {
+    let mut config = default_config();
+    config.dialect = Dialect::Mssql;
+    let state = test_state(config, vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1\nGO\nGO\nSELECT 2\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1\nGO\nSELECT 2\n",
+        "expected TQ003 core autofix to collapse redundant GO batch separators"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cv003_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
