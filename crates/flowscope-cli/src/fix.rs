@@ -240,15 +240,6 @@ impl RuleFilter {
         }
     }
 
-    #[cfg(test)]
-    fn new(disabled_rules: &[String]) -> Self {
-        Self::from_lint_config(&LintConfig {
-            enabled: true,
-            disabled_rules: disabled_rules.to_vec(),
-            rule_configs: BTreeMap::new(),
-        })
-    }
-
     fn allows(&self, code: &str) -> bool {
         let canonical =
             canonicalize_rule_code(code).unwrap_or_else(|| code.trim().to_ascii_uppercase());
@@ -716,9 +707,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_AL_005) {
         out = fix_unused_table_aliases(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_RF_004) {
-        out = fix_table_alias_keywords(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_ST_005) {
         out = fix_subquery_to_cte(&out);
     }
@@ -921,6 +909,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_RF_004)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
     {
@@ -1733,13 +1722,9 @@ fn find_ascii_keyword(bytes: &[u8], keyword_upper: &[u8], from: usize) -> Option
 
 #[derive(Debug, Clone)]
 struct SimpleTableAliasDecl {
-    keyword_start: usize,
-    keyword_end: usize,
-    table_start: usize,
     table_end: usize,
     alias_end: usize,
     alias: String,
-    explicit_as: bool,
 }
 
 fn collect_simple_table_alias_declarations(
@@ -1758,9 +1743,6 @@ fn collect_simple_table_alias_declarations(
             continue;
         }
 
-        let keyword_start = tokens[i].start;
-        let keyword_end = tokens[i].end;
-
         let Some(mut cursor) = next_non_trivia_token(&tokens, i + 1) else {
             i += 1;
             continue;
@@ -1769,7 +1751,6 @@ fn collect_simple_table_alias_declarations(
             i += 1;
             continue;
         };
-        let table_start = tokens[cursor].start;
         let mut table_end = tokens[cursor].end;
         cursor += 1;
 
@@ -1794,9 +1775,7 @@ fn collect_simple_table_alias_declarations(
             i += 1;
             continue;
         };
-        let mut explicit_as = false;
         if token_matches_keyword(&tokens[alias_idx].token, "AS") {
-            explicit_as = true;
             let Some(next_idx) = next_non_trivia_token(&tokens, alias_idx + 1) else {
                 i += 1;
                 continue;
@@ -1810,13 +1789,9 @@ fn collect_simple_table_alias_declarations(
         };
 
         out.push(SimpleTableAliasDecl {
-            keyword_start,
-            keyword_end,
-            table_start,
             table_end,
             alias_end: tokens[alias_idx].end,
             alias: alias_value.to_string(),
-            explicit_as,
         });
         i = alias_idx + 1;
     }
@@ -1887,29 +1862,6 @@ fn is_generated_alias_identifier(alias: &str) -> bool {
         saw_digit = true;
     }
     saw_digit
-}
-
-fn is_alias_keyword_token(alias: &str) -> bool {
-    matches!(
-        alias.to_ascii_uppercase().as_str(),
-        "SELECT" | "FROM" | "WHERE" | "GROUP" | "ORDER" | "JOIN" | "ON"
-    )
-}
-
-fn apply_byte_replacements(sql: &str, mut replacements: Vec<(usize, usize, String)>) -> String {
-    if replacements.is_empty() {
-        return sql.to_string();
-    }
-    replacements.sort_by_key(|(start, _, _)| *start);
-    replacements.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
-
-    let mut out = sql.to_string();
-    for (start, end, replacement) in replacements.into_iter().rev() {
-        if start < end && end <= out.len() {
-            out.replace_range(start..end, &replacement);
-        }
-    }
-    out
 }
 
 fn parse_subquery_alias_suffix(suffix: &str) -> Option<String> {
@@ -2048,31 +2000,6 @@ fn is_sql_keyword(token: &str) -> bool {
             | "WINDOW"
             | "WITH"
     )
-}
-
-fn fix_table_alias_keywords(sql: &str) -> String {
-    let Some(decls) = collect_simple_table_alias_declarations(sql, Dialect::Generic) else {
-        return sql.to_string();
-    };
-
-    let mut replacements = Vec::new();
-    for decl in decls {
-        if !decl.explicit_as || !is_alias_keyword_token(&decl.alias) {
-            continue;
-        }
-        let clause = &sql[decl.keyword_start..decl.keyword_end];
-        let table = &sql[decl.table_start..decl.table_end];
-        replacements.push((
-            decl.keyword_start,
-            decl.alias_end,
-            format!(
-                "{clause} {table} AS alias_{}",
-                decl.alias.to_ascii_lowercase()
-            ),
-        ));
-    }
-
-    apply_byte_replacements(sql, replacements)
 }
 
 fn fix_subquery_to_cte(sql: &str) -> String {
@@ -6449,27 +6376,30 @@ mod tests {
     }
 
     #[test]
-    fn alias_keyword_fix_respects_rf_004_rule_filter() {
+    fn rf004_core_autofix_respects_rule_filter() {
         let sql = "select a from users as select";
 
-        let rf_disabled = RuleFilter::new(&[
-            issue_codes::LINT_LT_014.to_string(),
-            issue_codes::LINT_RF_004.to_string(),
-        ]);
-        let out_rf_disabled = apply_text_fixes(sql, &rf_disabled, Dialect::Generic);
+        let out_rf_disabled = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_RF_004.to_string()],
+        )
+        .expect("fix result");
         assert_eq!(
-            out_rf_disabled, sql,
-            "excluding RF_004 should block alias-keyword rewrite"
+            out_rf_disabled.sql, sql,
+            "excluding RF_004 should block alias-keyword core autofix"
         );
 
-        let al_disabled = RuleFilter::new(&[
-            issue_codes::LINT_LT_014.to_string(),
-            issue_codes::LINT_AL_005.to_string(),
-        ]);
-        let out_al_disabled = apply_text_fixes(sql, &al_disabled, Dialect::Generic);
+        let out_al_disabled = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_AL_005.to_string()],
+        )
+        .expect("fix result");
         assert!(
-            out_al_disabled.contains("alias_select"),
-            "excluding AL_005 must not block RF_004 rewrite: {out_al_disabled}"
+            out_al_disabled.sql.contains("alias_select"),
+            "excluding AL_005 must not block RF_004 core autofix: {}",
+            out_al_disabled.sql
         );
     }
 

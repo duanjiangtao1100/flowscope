@@ -7,12 +7,13 @@ use std::collections::HashSet;
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use regex::{Regex, RegexBuilder};
 use sqlparser::ast::Statement;
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::identifier_candidates_helpers::{
-    collect_identifier_candidates, IdentifierCandidate, IdentifierPolicy,
+    collect_identifier_candidates, IdentifierCandidate, IdentifierKind, IdentifierPolicy,
 };
 
 pub struct ReferencesKeywords {
@@ -79,15 +80,288 @@ impl LintRule for ReferencesKeywords {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if statement_contains_keyword_identifier(statement, self) {
-            vec![
-                Issue::info(issue_codes::LINT_RF_004, "Keyword used as identifier.")
-                    .with_statement(ctx.statement_index),
-            ]
+        if !statement_contains_keyword_identifier(statement, self) {
+            return Vec::new();
+        }
+
+        let mut issue = Issue::info(issue_codes::LINT_RF_004, "Keyword used as identifier.")
+            .with_statement(ctx.statement_index);
+
+        let autofix_edits =
+            keyword_table_alias_autofix_edits(ctx.statement_sql(), ctx.dialect(), self)
+                .into_iter()
+                .map(|edit| {
+                    IssuePatchEdit::new(
+                        ctx.span_from_statement_offset(edit.start, edit.end),
+                        edit.replacement,
+                    )
+                })
+                .collect::<Vec<_>>();
+        if !autofix_edits.is_empty() {
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+        }
+
+        vec![issue]
+    }
+}
+
+struct Rf004AutofixEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+#[derive(Clone)]
+struct SimpleTableAliasDecl {
+    keyword_start: usize,
+    keyword_end: usize,
+    table_start: usize,
+    table_end: usize,
+    alias_end: usize,
+    alias: String,
+    explicit_as: bool,
+}
+
+#[derive(Clone)]
+struct LocatedToken {
+    token: Token,
+    start: usize,
+    end: usize,
+}
+
+fn keyword_table_alias_autofix_edits(
+    sql: &str,
+    dialect: Dialect,
+    rule: &ReferencesKeywords,
+) -> Vec<Rf004AutofixEdit> {
+    if !rule.unquoted_policy.allows(IdentifierKind::TableAlias) {
+        return Vec::new();
+    }
+
+    let Some(decls) = collect_simple_table_alias_declarations(sql, dialect) else {
+        return Vec::new();
+    };
+
+    let mut edits = Vec::new();
+    for decl in decls {
+        if !decl.explicit_as
+            || !is_alias_keyword_token(&decl.alias)
+            || is_ignored_token(&decl.alias, rule)
+        {
+            continue;
+        }
+        let clause = &sql[decl.keyword_start..decl.keyword_end];
+        let table = &sql[decl.table_start..decl.table_end];
+        edits.push(Rf004AutofixEdit {
+            start: decl.keyword_start,
+            end: decl.alias_end,
+            replacement: format!(
+                "{clause} {table} AS alias_{}",
+                decl.alias.to_ascii_lowercase()
+            ),
+        });
+    }
+
+    edits
+}
+
+fn collect_simple_table_alias_declarations(
+    sql: &str,
+    dialect: Dialect,
+) -> Option<Vec<SimpleTableAliasDecl>> {
+    let tokens = tokenize_with_offsets(sql, dialect)?;
+    let mut out = Vec::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        if !token_matches_keyword(&tokens[index].token, "FROM")
+            && !token_matches_keyword(&tokens[index].token, "JOIN")
+        {
+            index += 1;
+            continue;
+        }
+
+        let keyword_start = tokens[index].start;
+        let keyword_end = tokens[index].end;
+
+        let Some(mut cursor) = next_non_trivia_token(&tokens, index + 1) else {
+            index += 1;
+            continue;
+        };
+        if token_simple_identifier(&tokens[cursor].token).is_none() {
+            index += 1;
+            continue;
+        }
+
+        let table_start = tokens[cursor].start;
+        let mut table_end = tokens[cursor].end;
+        cursor += 1;
+
+        loop {
+            let Some(dot_index) = next_non_trivia_token(&tokens, cursor) else {
+                break;
+            };
+            if !matches!(tokens[dot_index].token, Token::Period) {
+                break;
+            }
+            let Some(next_index) = next_non_trivia_token(&tokens, dot_index + 1) else {
+                break;
+            };
+            if token_simple_identifier(&tokens[next_index].token).is_none() {
+                break;
+            }
+            table_end = tokens[next_index].end;
+            cursor = next_index + 1;
+        }
+
+        let Some(mut alias_index) = next_non_trivia_token(&tokens, cursor) else {
+            index += 1;
+            continue;
+        };
+        let mut explicit_as = false;
+        if token_matches_keyword(&tokens[alias_index].token, "AS") {
+            explicit_as = true;
+            let Some(next_index) = next_non_trivia_token(&tokens, alias_index + 1) else {
+                index += 1;
+                continue;
+            };
+            alias_index = next_index;
+        }
+
+        let Some(alias) = token_simple_identifier(&tokens[alias_index].token) else {
+            index += 1;
+            continue;
+        };
+
+        out.push(SimpleTableAliasDecl {
+            keyword_start,
+            keyword_end,
+            table_start,
+            table_end,
+            alias_end: tokens[alias_index].end,
+            alias: alias.to_string(),
+            explicit_as,
+        });
+        index = alias_index + 1;
+    }
+
+    Some(out)
+}
+
+fn tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LocatedToken>> {
+    let dialect = dialect.to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
+    let tokens = tokenizer.tokenize_with_location().ok()?;
+
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let (start, end) = token_with_span_offsets(sql, &token)?;
+        out.push(LocatedToken {
+            token: token.token,
+            start,
+            end,
+        });
+    }
+    Some(out)
+}
+
+fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
+    let start = line_col_to_offset(
+        sql,
+        token.span.start.line as usize,
+        token.span.start.column as usize,
+    )?;
+    let end = line_col_to_offset(
+        sql,
+        token.span.end.line as usize,
+        token.span.end.column as usize,
+    )?;
+    Some((start, end))
+}
+
+fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1usize;
+    let mut current_col = 1usize;
+
+    for (offset, ch) in sql.char_indices() {
+        if current_line == line && current_col == column {
+            return Some(offset);
+        }
+
+        if ch == '\n' {
+            current_line += 1;
+            current_col = 1;
         } else {
-            Vec::new()
+            current_col += 1;
         }
     }
+
+    if current_line == line && current_col == column {
+        return Some(sql.len());
+    }
+
+    None
+}
+
+fn next_non_trivia_token(tokens: &[LocatedToken], mut start: usize) -> Option<usize> {
+    while start < tokens.len() {
+        if !is_trivia_token(&tokens[start].token) {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
+fn is_trivia_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(
+            Whitespace::Space
+                | Whitespace::Newline
+                | Whitespace::Tab
+                | Whitespace::SingleLineComment { .. }
+                | Whitespace::MultiLineComment(_)
+        )
+    )
+}
+
+fn token_matches_keyword(token: &Token, keyword: &str) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(keyword))
+}
+
+fn token_simple_identifier(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(word) if is_simple_identifier(&word.value) => Some(&word.value),
+        _ => None,
+    }
+}
+
+fn is_simple_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !is_ascii_ident_start(bytes[0]) {
+        return false;
+    }
+    bytes[1..].iter().copied().all(is_ascii_ident_continue)
+}
+
+fn is_ascii_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ascii_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_alias_keyword_token(alias: &str) -> bool {
+    matches!(
+        alias.to_ascii_uppercase().as_str(),
+        "SELECT" | "FROM" | "WHERE" | "GROUP" | "ORDER" | "JOIN" | "ON"
+    )
 }
 
 fn statement_contains_keyword_identifier(statement: &Statement, rule: &ReferencesKeywords) -> bool {
@@ -182,6 +456,7 @@ fn is_keyword(token: &str) -> bool {
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         run_with_config(sql, LintConfig::default())
@@ -206,11 +481,33 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_unquoted_keyword_table_alias() {
         let issues = run("SELECT sum.id FROM users AS sum");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_RF_004);
+    }
+
+    #[test]
+    fn emits_safe_autofix_for_explicit_keyword_table_alias() {
+        let sql = "select a from users as select";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "select a from users AS alias_select");
     }
 
     #[test]

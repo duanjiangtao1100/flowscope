@@ -683,6 +683,29 @@ async fn lint_fix_applies_cv010_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_rf004_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "select a from users as select\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "select a from users AS alias_select\n",
+        "expected RF004 core autofix to rewrite keyword table alias safely"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_rf006_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
