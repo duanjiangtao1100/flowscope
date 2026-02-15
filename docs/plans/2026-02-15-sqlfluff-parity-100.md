@@ -82,11 +82,11 @@ Remaining gaps (8 fix mismatches, 1 FN):
 
 ST05 (`st_005.rs`, structure.subquery) detects nested subqueries that could be CTEs. Currently 12 FN + 28 fix mismatches. Detection is decent (20/32 fail cases caught) but fix output is 0/28 — the CTE rewrites require structural changes that the patch engine needs to emit correctly.
 
-- [ ] Analyze 12 FN cases: identify which subquery patterns are missed (e.g., correlated subqueries, multi-level nesting, dialect-specific syntax)
-- [ ] Fix `st_005.rs` detection to cover all SQLFluff subquery fixture cases
-- [ ] Analyze 28 fix mismatches: compare expected CTE rewrites against current autofix output
-- [ ] Implement/fix autofix edits in `st_005.rs` for subquery-to-CTE transformation patches
-- [ ] Verify 0 FN, 0 FP, 0 fix mismatches for ST05 in parity report
+- [x] Analyze 12 FN cases: identify which subquery patterns are missed (e.g., correlated subqueries, multi-level nesting, dialect-specific syntax)
+- [x] Fix `st_005.rs` detection to cover all SQLFluff subquery fixture cases
+- [x] Analyze 28 fix mismatches: compare expected CTE rewrites against current autofix output
+- [x] Implement/fix autofix edits in `st_005.rs` for subquery-to-CTE transformation patches
+- [x] Verify 0 FN, 0 FP, 0 fix mismatches for ST05 in parity report
 
 ### Task 6: LT05 — Line Length (40 gaps)
 

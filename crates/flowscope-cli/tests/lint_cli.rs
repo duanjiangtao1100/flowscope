@@ -1300,7 +1300,7 @@ fn test_lint_fix_applies_st005_core_autofix_in_unsafe_mode_with_from_config() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "WITH sub AS (SELECT 1) SELECT * FROM sub\n",
+        after, "WITH sub AS (SELECT 1)\nSELECT * FROM sub\n",
         "Expected unsafe ST005 core autofix to rewrite FROM subquery to CTE: {after:?}"
     );
 }
@@ -2108,7 +2108,7 @@ fn test_lint_unsafe_fixes_with_legacy_ast_rewrites_enables_additional_fixes_over
 }
 
 #[test]
-fn test_lint_unsafe_fixes_without_legacy_ast_rewrites_keeps_st05() {
+fn test_lint_unsafe_fixes_without_legacy_ast_rewrites_clears_st05_via_core_patch() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("unsafe_without_legacy.sql");
     std::fs::write(&sql_path, SQL_UNSAFE_FIX_REPRESENTATIVE).expect("write sql");
@@ -2129,8 +2129,8 @@ fn test_lint_unsafe_fixes_without_legacy_ast_rewrites_keeps_st05() {
 
     let codes = lint_violation_codes(&sql_path);
     assert!(
-        codes.iter().any(|code| code == "ST05"),
-        "Expected ST05 to remain unless --legacy-ast-fixes is enabled: {codes:?}"
+        !codes.iter().any(|code| code == "ST05"),
+        "Expected --unsafe-fixes to clear ST05 via core patch rewriter: {codes:?}"
     );
 }
 

@@ -101,7 +101,7 @@ impl LintRule for StructureSubquery {
         }
 
         let autofix_edits =
-            st005_subquery_to_cte_rewrite(ctx.statement_sql(), self.forbid_subquery_in)
+            st005_subquery_to_cte_rewrite(ctx.statement_sql(), statement, self.forbid_subquery_in)
                 .filter(|rewritten| rewritten != ctx.statement_sql())
                 .map(|rewritten| {
                     vec![IssuePatchEdit::new(
@@ -130,75 +130,1062 @@ impl LintRule for StructureSubquery {
     }
 }
 
-fn st005_subquery_to_cte_rewrite(
-    sql: &str,
-    forbid_subquery_in: ForbidSubqueryIn,
-) -> Option<String> {
-    if !forbid_subquery_in.forbid_from() {
-        return None;
-    }
+// ---------------------------------------------------------------------------
+// Comprehensive text-preserving subquery-to-CTE rewriter
+// ---------------------------------------------------------------------------
 
-    let bytes = sql.as_bytes();
-    let mut index = skip_ascii_whitespace(bytes, 0);
-    let select_end = match_ascii_keyword_at(bytes, index, b"SELECT")?;
-    index = skip_ascii_whitespace(bytes, select_end);
-    if index == select_end || index >= bytes.len() || bytes[index] != b'*' {
-        return None;
-    }
-    index += 1;
-
-    let from_start = skip_ascii_whitespace(bytes, index);
-    if from_start == index {
-        return None;
-    }
-    let from_end = match_ascii_keyword_at(bytes, from_start, b"FROM")?;
-    let open_paren_index = skip_ascii_whitespace(bytes, from_end);
-    if open_paren_index == from_end
-        || open_paren_index >= bytes.len()
-        || bytes[open_paren_index] != b'('
-    {
-        return None;
-    }
-
-    let close_paren_index = find_matching_parenthesis_outside_quotes(sql, open_paren_index)?;
-    let subquery = sql[open_paren_index + 1..close_paren_index].trim();
-    if !subquery.to_ascii_lowercase().starts_with("select") {
-        return None;
-    }
-
-    let suffix = &sql[close_paren_index + 1..];
-    let alias = parse_subquery_alias_suffix(suffix)?;
-
-    let mut rewritten = format!("WITH {alias} AS ({subquery}) SELECT * FROM {alias}");
-    if suffix.trim_end().ends_with(';') {
-        rewritten.push(';');
-    }
-    Some(rewritten)
+/// A subquery found in a FROM/JOIN clause that should be extracted to a CTE.
+#[derive(Debug, Clone)]
+struct SubqueryExtraction {
+    /// Byte offset of the open parenthesis.
+    open_paren: usize,
+    /// Byte offset of the close parenthesis.
+    close_paren: usize,
+    /// Alias name (explicit or auto-generated).
+    alias: String,
+    /// Byte offset past the end of the alias region.
+    alias_region_end: usize,
 }
 
-fn parse_subquery_alias_suffix(suffix: &str) -> Option<String> {
-    let bytes = suffix.as_bytes();
-    let mut index = skip_ascii_whitespace(bytes, 0);
-    if let Some(as_end) = match_ascii_keyword_at(bytes, index, b"AS") {
-        let after_as = skip_ascii_whitespace(bytes, as_end);
-        if after_as == as_end {
-            return None;
-        }
-        index = after_as;
-    }
-
-    let alias_start = index;
-    let alias_end = consume_ascii_identifier(bytes, alias_start)?;
-    index = skip_ascii_whitespace(bytes, alias_end);
-    if index < bytes.len() && bytes[index] == b';' {
-        index += 1;
-        index = skip_ascii_whitespace(bytes, index);
-    }
-    if index != bytes.len() {
+/// Rewrite the SQL statement by extracting all subqueries in FROM/JOIN clauses
+/// to CTEs. Returns the rewritten SQL, or None if no rewrite is possible.
+fn st005_subquery_to_cte_rewrite(
+    sql: &str,
+    stmt: &Statement,
+    forbid_subquery_in: ForbidSubqueryIn,
+) -> Option<String> {
+    // Collect all non-correlated subqueries from the AST.
+    let mut subquery_aliases: Vec<(String, bool)> = Vec::new();
+    collect_extractable_subqueries(stmt, forbid_subquery_in, &mut subquery_aliases);
+    if subquery_aliases.is_empty() {
         return None;
     }
 
-    Some(suffix[alias_start..alias_end].to_string())
+    // Find subquery positions in the SQL text using the AST-derived alias info.
+    let extractions = find_subquery_positions(sql, forbid_subquery_in, &subquery_aliases);
+    if extractions.is_empty() {
+        return None;
+    }
+
+    apply_cte_extractions(sql, &extractions)
+}
+
+/// Walk the AST to collect info about each extractable (non-correlated) subquery.
+/// Collects (alias_name, is_correlated) in document order.
+fn collect_extractable_subqueries(
+    stmt: &Statement,
+    forbid_in: ForbidSubqueryIn,
+    out: &mut Vec<(String, bool)>,
+) {
+    visit_selects_in_statement(stmt, &mut |select| {
+        let outer_source_names = source_names_in_select(select);
+        for table in &select.from {
+            if forbid_in.forbid_from() {
+                collect_from_table_factor(&table.relation, &outer_source_names, out);
+            }
+            if forbid_in.forbid_join() {
+                for join in &table.joins {
+                    collect_from_table_factor(&join.relation, &outer_source_names, out);
+                }
+            }
+        }
+    });
+}
+
+/// Recursively collect extractable subqueries from a table factor.
+fn collect_from_table_factor(
+    tf: &TableFactor,
+    outer_names: &HashSet<String>,
+    out: &mut Vec<(String, bool)>,
+) {
+    match tf {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let is_correlated = query_references_outer_sources(subquery, outer_names);
+            if !is_correlated {
+                let alias_name = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_default();
+                out.push((alias_name, is_correlated));
+            }
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_from_table_factor(&table_with_joins.relation, outer_names, out);
+            for join in &table_with_joins.joins {
+                collect_from_table_factor(&join.relation, outer_names, out);
+            }
+        }
+        TableFactor::Pivot { table, .. }
+        | TableFactor::Unpivot { table, .. }
+        | TableFactor::MatchRecognize { table, .. } => {
+            collect_from_table_factor(table, outer_names, out);
+        }
+        _ => {}
+    }
+}
+
+/// Scan the SQL text to locate subquery parenthesized expressions in FROM/JOIN
+/// clauses. Returns extractions sorted by position (for correct processing order).
+fn find_subquery_positions(
+    sql: &str,
+    forbid_in: ForbidSubqueryIn,
+    ast_aliases: &[(String, bool)],
+) -> Vec<SubqueryExtraction> {
+    let bytes = sql.as_bytes();
+    let mut extractions = Vec::new();
+    let mut ast_idx = 0usize;
+    let mut auto_name_counter = 0usize;
+    // Collect all used names to avoid clashes.
+    let mut used_names: HashSet<String> = HashSet::new();
+    for (alias, _) in ast_aliases {
+        if !alias.is_empty() {
+            used_names.insert(alias.to_ascii_uppercase());
+        }
+    }
+    // Also collect CTE names from existing WITH clause.
+    collect_existing_cte_names(sql, &mut used_names);
+
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        // Skip quoted regions.
+        if let Some(end) = skip_quoted_region(bytes, pos) {
+            pos = end;
+            continue;
+        }
+        // Skip line comments.
+        if bytes[pos] == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        // Skip block comments.
+        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+            pos += 2;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                    pos += 2;
+                    break;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+
+        // Look for FROM or JOIN keywords followed by a parenthesized subquery.
+        let is_from =
+            forbid_in.forbid_from() && match_ascii_keyword_at(bytes, pos, b"FROM").is_some();
+        let is_join = forbid_in.forbid_join()
+            && (match_ascii_keyword_at(bytes, pos, b"JOIN").is_some()
+                || match_join_keyword_sequence(bytes, pos).is_some());
+
+        if is_from || is_join {
+            let keyword_end = if is_from {
+                match_ascii_keyword_at(bytes, pos, b"FROM").unwrap()
+            } else if let Some(end) = match_join_keyword_sequence(bytes, pos) {
+                end
+            } else {
+                match_ascii_keyword_at(bytes, pos, b"JOIN").unwrap()
+            };
+
+            let after_keyword = skip_ascii_whitespace(bytes, keyword_end);
+
+            // Check for open parenthesis (could be `FROM(` or `FROM (` or `JOIN\n(`).
+            if after_keyword < bytes.len() && bytes[after_keyword] == b'(' {
+                if let Some(close) = find_matching_parenthesis_outside_quotes(sql, after_keyword) {
+                    let inner = sql[after_keyword + 1..close].trim();
+                    let inner_lower = inner.to_ascii_lowercase();
+                    // Only extract if inner content starts with SELECT or WITH,
+                    // and we still have AST aliases to consume.
+                    if (inner_lower.starts_with("select") || inner_lower.starts_with("with"))
+                        && ast_idx < ast_aliases.len()
+                    {
+                        let (ref ast_alias, _) = ast_aliases[ast_idx];
+                        ast_idx += 1;
+
+                        let alias = if ast_alias.is_empty() {
+                            let name = generate_prep_name(&mut auto_name_counter, &used_names);
+                            used_names.insert(name.to_ascii_uppercase());
+                            name
+                        } else {
+                            ast_alias.clone()
+                        };
+
+                        // Parse alias region after close paren.
+                        let (_alias_start, alias_end) =
+                            parse_alias_region_after_close_paren(bytes, close);
+
+                        extractions.push(SubqueryExtraction {
+                            open_paren: after_keyword,
+                            close_paren: close,
+                            alias: alias.clone(),
+                            alias_region_end: alias_end,
+                        });
+
+                        // Skip past the subquery.
+                        pos = alias_end;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        pos += 1;
+    }
+
+    extractions
+}
+
+/// Generate a unique prep_N name that doesn't clash with used_names.
+fn generate_prep_name(counter: &mut usize, used_names: &HashSet<String>) -> String {
+    loop {
+        *counter += 1;
+        let name = format!("prep_{counter}");
+        if !used_names.contains(&name.to_ascii_uppercase()) {
+            return name;
+        }
+    }
+}
+
+/// Collect CTE names from existing WITH clause in the SQL text.
+fn collect_existing_cte_names(sql: &str, names: &mut HashSet<String>) {
+    let bytes = sql.as_bytes();
+    let mut pos = skip_ascii_whitespace(bytes, 0);
+
+    // Check for INSERT ... WITH or CREATE TABLE ... AS WITH patterns.
+    // Skip past INSERT INTO ... or CREATE TABLE ... AS to find WITH.
+    if let Some(end) = match_ascii_keyword_at(bytes, pos, b"INSERT") {
+        pos = skip_to_with_or_select(bytes, end);
+    } else if let Some(end) = match_ascii_keyword_at(bytes, pos, b"CREATE") {
+        pos = skip_to_with_or_select(bytes, end);
+    }
+
+    if match_ascii_keyword_at(bytes, pos, b"WITH").is_none() {
+        return;
+    }
+
+    let with_end = match_ascii_keyword_at(bytes, pos, b"WITH").unwrap();
+    pos = skip_ascii_whitespace(bytes, with_end);
+
+    // Skip RECURSIVE keyword if present.
+    if let Some(end) = match_ascii_keyword_at(bytes, pos, b"RECURSIVE") {
+        pos = skip_ascii_whitespace(bytes, end);
+    }
+
+    // Parse CTE names: name AS (...), name AS (...), ...
+    loop {
+        // Parse CTE name.
+        let name_start = pos;
+        if let Some(quoted_end) = consume_quoted_identifier(bytes, pos) {
+            let raw = &sql[name_start..quoted_end];
+            let unquoted = raw.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+            names.insert(unquoted.to_ascii_uppercase());
+            pos = skip_ascii_whitespace(bytes, quoted_end);
+        } else if let Some(name_end) = consume_ascii_identifier(bytes, pos) {
+            names.insert(sql[name_start..name_end].to_ascii_uppercase());
+            pos = skip_ascii_whitespace(bytes, name_end);
+        } else {
+            break;
+        }
+
+        // Expect AS keyword.
+        if let Some(as_end) = match_ascii_keyword_at(bytes, pos, b"AS") {
+            pos = skip_ascii_whitespace(bytes, as_end);
+        } else {
+            break;
+        }
+
+        // Skip the CTE body parenthesized expression.
+        if pos < bytes.len() && bytes[pos] == b'(' {
+            if let Some(close) = find_matching_parenthesis_outside_quotes(sql, pos) {
+                pos = skip_ascii_whitespace(bytes, close + 1);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        // Check for comma (more CTEs follow).
+        if pos < bytes.len() && bytes[pos] == b',' {
+            pos += 1;
+            pos = skip_ascii_whitespace(bytes, pos);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Skip forward in bytes to find the position of WITH or SELECT keyword.
+fn skip_to_with_or_select(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() {
+        let ws = skip_ascii_whitespace(bytes, pos);
+        if ws > pos {
+            pos = ws;
+        }
+        if match_ascii_keyword_at(bytes, pos, b"WITH").is_some() {
+            return pos;
+        }
+        if match_ascii_keyword_at(bytes, pos, b"SELECT").is_some() {
+            return pos;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+/// Parse the alias region (optional `AS` + identifier) after a close parenthesis.
+/// Returns (region_start, region_end) where region_start is close_paren + 1.
+fn parse_alias_region_after_close_paren(bytes: &[u8], close_paren: usize) -> (usize, usize) {
+    let start = close_paren + 1;
+    let mut pos = start;
+    let ws_pos = skip_ascii_whitespace(bytes, pos);
+
+    // Check for AS keyword.
+    if let Some(as_end) = match_ascii_keyword_at(bytes, ws_pos, b"AS") {
+        let after_as = skip_ascii_whitespace(bytes, as_end);
+        if let Some(quoted_end) = consume_quoted_identifier(bytes, after_as) {
+            return (start, quoted_end);
+        }
+        if let Some(ident_end) = consume_ascii_identifier(bytes, after_as) {
+            return (start, ident_end);
+        }
+    }
+
+    // No AS keyword; check for bare identifier alias.
+    // An identifier here is an alias only if it's not a SQL keyword that would
+    // indicate the start of the next clause (ON, USING, WHERE, JOIN, etc.).
+    if let Some(quoted_end) = consume_quoted_identifier(bytes, ws_pos) {
+        return (start, quoted_end);
+    }
+    if let Some(ident_end) = consume_ascii_identifier(bytes, ws_pos) {
+        let word = &bytes[ws_pos..ident_end];
+        if !is_clause_keyword(word) {
+            pos = ident_end;
+            return (start, pos);
+        }
+    }
+
+    (start, start)
+}
+
+/// Check if a word is a SQL clause keyword that should not be treated as an alias.
+fn is_clause_keyword(word: &[u8]) -> bool {
+    let upper: Vec<u8> = word.iter().map(|b| b.to_ascii_uppercase()).collect();
+    matches!(
+        upper.as_slice(),
+        b"ON"
+            | b"USING"
+            | b"WHERE"
+            | b"JOIN"
+            | b"INNER"
+            | b"LEFT"
+            | b"RIGHT"
+            | b"FULL"
+            | b"OUTER"
+            | b"CROSS"
+            | b"NATURAL"
+            | b"GROUP"
+            | b"ORDER"
+            | b"HAVING"
+            | b"LIMIT"
+            | b"UNION"
+            | b"INTERSECT"
+            | b"EXCEPT"
+            | b"MINUS"
+            | b"FROM"
+            | b"SELECT"
+            | b"INSERT"
+            | b"UPDATE"
+            | b"DELETE"
+            | b"SET"
+            | b"INTO"
+            | b"VALUES"
+            | b"WITH"
+    )
+}
+
+/// Apply the subquery extractions: build CTE definitions, replace subqueries
+/// with alias references, and insert the WITH clause.
+fn apply_cte_extractions(sql: &str, extractions: &[SubqueryExtraction]) -> Option<String> {
+    if extractions.is_empty() {
+        return None;
+    }
+
+    let case_pref = detect_case_preference(sql);
+
+    // Find if there's an existing WITH clause and where each existing CTE lives.
+    let existing_ctes = parse_existing_cte_ranges(sql);
+
+    // For each extraction, determine if it's inside an existing CTE body.
+    // Build (cte_def, insert_before_cte_index) pairs.
+    struct CteInsertion {
+        definition: String,
+        /// None = append at end / prepend for new WITH. Some(i) = insert before existing CTE i.
+        insert_before: Option<usize>,
+    }
+
+    let mut insertions: Vec<CteInsertion> = Vec::new();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for ext in extractions {
+        let subquery_text = &sql[ext.open_paren + 1..ext.close_paren];
+        let as_kw = if case_pref == CasePref::Upper {
+            "AS"
+        } else {
+            "as"
+        };
+        let cte_def = format!("{} {} ({})", ext.alias, as_kw, subquery_text);
+
+        // Check if this extraction is inside an existing CTE body.
+        let containing_cte = existing_ctes
+            .iter()
+            .position(|cte| ext.open_paren >= cte.body_start && ext.close_paren <= cte.body_end);
+
+        insertions.push(CteInsertion {
+            definition: cte_def,
+            insert_before: containing_cte,
+        });
+
+        replacements.push((ext.open_paren, ext.alias_region_end, ext.alias.clone()));
+    }
+
+    // Apply text replacements in reverse order to preserve positions.
+    let mut result = sql.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        result.replace_range(start..end, &replacement);
+    }
+
+    // Now insert CTEs. Separate into two groups:
+    // 1. CTEs that need to be inserted before an existing CTE (dependency ordering)
+    // 2. CTEs that are new top-level (no existing WITH, or appended)
+    let mut before_insertions: Vec<(usize, String)> = Vec::new(); // (cte_index, definition)
+    let mut top_level_defs: Vec<String> = Vec::new();
+
+    for insertion in insertions {
+        match insertion.insert_before {
+            Some(cte_idx) => before_insertions.push((cte_idx, insertion.definition)),
+            None => top_level_defs.push(insertion.definition),
+        }
+    }
+
+    if !before_insertions.is_empty() && !existing_ctes.is_empty() {
+        // We need to rebuild the WITH clause with reordered CTEs.
+        result = rebuild_with_clause_with_insertions(
+            &result,
+            sql,
+            &existing_ctes,
+            &before_insertions,
+            &top_level_defs,
+            case_pref,
+        );
+        return Some(result);
+    }
+
+    // Simple case: just insert/append new CTEs.
+    insert_cte_clause(&result, &top_level_defs, case_pref)
+}
+
+/// Range info for an existing CTE in the WITH clause.
+#[derive(Debug, Clone)]
+struct ExistingCteRange {
+    /// Byte offset of the CTE body open paren.
+    body_start: usize,
+    /// Byte offset of the CTE body close paren.
+    body_end: usize,
+}
+
+/// Parse the existing CTE definitions in a WITH clause.
+fn parse_existing_cte_ranges(sql: &str) -> Vec<ExistingCteRange> {
+    let bytes = sql.as_bytes();
+    let mut pos = skip_ascii_whitespace(bytes, 0);
+    let mut ranges = Vec::new();
+
+    // Skip INSERT/CREATE prefix.
+    if match_ascii_keyword_at(bytes, pos, b"INSERT").is_some()
+        || match_ascii_keyword_at(bytes, pos, b"CREATE").is_some()
+    {
+        pos = skip_to_with_or_select(bytes, pos + 6);
+    }
+
+    let with_end = match match_ascii_keyword_at(bytes, pos, b"WITH") {
+        Some(end) => end,
+        None => return ranges,
+    };
+    pos = skip_ascii_whitespace(bytes, with_end);
+
+    // Skip RECURSIVE.
+    if let Some(end) = match_ascii_keyword_at(bytes, pos, b"RECURSIVE") {
+        pos = skip_ascii_whitespace(bytes, end);
+    }
+
+    loop {
+        // CTE name.
+        if let Some(quoted_end) = consume_quoted_identifier(bytes, pos) {
+            pos = skip_ascii_whitespace(bytes, quoted_end);
+        } else if let Some(name_end) = consume_ascii_identifier(bytes, pos) {
+            pos = skip_ascii_whitespace(bytes, name_end);
+        } else {
+            break;
+        }
+
+        // AS keyword.
+        if let Some(as_end) = match_ascii_keyword_at(bytes, pos, b"AS") {
+            pos = skip_ascii_whitespace(bytes, as_end);
+        } else {
+            break;
+        }
+
+        // CTE body paren.
+        if pos < bytes.len() && bytes[pos] == b'(' {
+            if let Some(close) = find_matching_parenthesis_outside_quotes(sql, pos) {
+                ranges.push(ExistingCteRange {
+                    body_start: pos,
+                    body_end: close,
+                });
+                pos = skip_ascii_whitespace(bytes, close + 1);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        // Comma.
+        if pos < bytes.len() && bytes[pos] == b',' {
+            pos += 1;
+            pos = skip_ascii_whitespace(bytes, pos);
+        } else {
+            break;
+        }
+    }
+
+    ranges
+}
+
+/// Rebuild the WITH clause with new CTEs inserted before their containing CTEs.
+fn rebuild_with_clause_with_insertions(
+    modified_sql: &str,
+    _original_sql: &str,
+    _existing_ctes: &[ExistingCteRange],
+    before_insertions: &[(usize, String)],
+    top_level_defs: &[String],
+    case_pref: CasePref,
+) -> String {
+    // The modified_sql has already had subquery text replaced with alias names.
+    // We need to reconstruct the WITH clause with CTEs in dependency order.
+    //
+    // Strategy: find the WITH clause region in modified_sql, extract each CTE text,
+    // then rebuild with new CTEs inserted at the right positions.
+
+    let bytes = modified_sql.as_bytes();
+    let mut pos = skip_ascii_whitespace(bytes, 0);
+
+    // Skip INSERT/CREATE prefix.
+    if match_ascii_keyword_at(bytes, pos, b"INSERT").is_some()
+        || match_ascii_keyword_at(bytes, pos, b"CREATE").is_some()
+    {
+        pos = skip_to_with_or_select(bytes, pos + 6);
+    }
+
+    let with_kw_start = pos;
+    let with_end = match match_ascii_keyword_at(bytes, pos, b"WITH") {
+        Some(end) => end,
+        None => return modified_sql.to_string(),
+    };
+    pos = skip_ascii_whitespace(bytes, with_end);
+
+    // Skip RECURSIVE.
+    if let Some(end) = match_ascii_keyword_at(bytes, pos, b"RECURSIVE") {
+        pos = skip_ascii_whitespace(bytes, end);
+    }
+
+    // Parse CTE texts from modified SQL.
+    let mut cte_texts: Vec<String> = Vec::new();
+    let mut last_cte_end = pos;
+
+    loop {
+        let cte_start = pos;
+
+        if let Some(quoted_end) = consume_quoted_identifier(bytes, pos) {
+            pos = skip_ascii_whitespace(bytes, quoted_end);
+        } else if let Some(name_end) = consume_ascii_identifier(bytes, pos) {
+            pos = skip_ascii_whitespace(bytes, name_end);
+        } else {
+            break;
+        }
+
+        if let Some(as_end) = match_ascii_keyword_at(bytes, pos, b"AS") {
+            pos = skip_ascii_whitespace(bytes, as_end);
+        } else {
+            break;
+        }
+
+        if pos < bytes.len() && bytes[pos] == b'(' {
+            if let Some(close) = find_matching_parenthesis_outside_quotes(modified_sql, pos) {
+                let cte_text = modified_sql[cte_start..close + 1].to_string();
+                cte_texts.push(cte_text);
+                last_cte_end = close + 1;
+                pos = skip_ascii_whitespace(bytes, close + 1);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        if pos < bytes.len() && bytes[pos] == b',' {
+            pos += 1;
+            pos = skip_ascii_whitespace(bytes, pos);
+        } else {
+            break;
+        }
+    }
+
+    // Build new CTE list with insertions at the right positions.
+    let mut new_cte_list: Vec<String> = Vec::new();
+    for (i, cte_text) in cte_texts.iter().enumerate() {
+        // Insert any new CTEs that should go before this existing CTE.
+        for (before_idx, def) in before_insertions {
+            if *before_idx == i {
+                new_cte_list.push(def.clone());
+            }
+        }
+        new_cte_list.push(cte_text.clone());
+    }
+
+    // Append top-level defs at end.
+    for def in top_level_defs {
+        new_cte_list.push(def.clone());
+    }
+
+    // Rebuild the SQL.
+    let with_kw = if case_pref == CasePref::Upper {
+        "WITH"
+    } else {
+        "with"
+    };
+    let remainder = &modified_sql[last_cte_end..];
+
+    let mut result = String::with_capacity(modified_sql.len() + 200);
+    result.push_str(&modified_sql[..with_kw_start]);
+    result.push_str(with_kw);
+    result.push(' ');
+    for (i, cte) in new_cte_list.iter().enumerate() {
+        if i > 0 {
+            result.push_str(",\n");
+        }
+        result.push_str(cte);
+    }
+    result.push_str(remainder);
+
+    result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CasePref {
+    Upper,
+    Lower,
+}
+
+/// Detect whether the SQL uses uppercase or lowercase keywords.
+fn detect_case_preference(sql: &str) -> CasePref {
+    let bytes = sql.as_bytes();
+    let pos = skip_ascii_whitespace(bytes, 0);
+    // Check the first keyword.
+    for kw in &[b"WITH" as &[u8], b"SELECT", b"INSERT", b"CREATE"] {
+        if pos + kw.len() <= bytes.len() {
+            let word = &bytes[pos..pos + kw.len()];
+            if word
+                .iter()
+                .zip(kw.iter())
+                .all(|(a, b)| a.to_ascii_uppercase() == *b)
+                && is_word_boundary_for_keyword(bytes, pos + kw.len())
+            {
+                return if word[0].is_ascii_uppercase() {
+                    CasePref::Upper
+                } else {
+                    CasePref::Lower
+                };
+            }
+        }
+    }
+    CasePref::Upper
+}
+
+/// Insert CTE definitions into the SQL, handling existing WITH clauses,
+/// INSERT...SELECT, and CTAS patterns.
+fn insert_cte_clause(sql: &str, cte_defs: &[String], case_pref: CasePref) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let with_kw = if case_pref == CasePref::Upper {
+        "WITH"
+    } else {
+        "with"
+    };
+
+    // Check for INSERT...SELECT or CREATE TABLE...AS patterns.
+    let scan_pos = skip_ascii_whitespace(bytes, 0);
+
+    let is_insert = match_ascii_keyword_at(bytes, scan_pos, b"INSERT").is_some();
+    let is_create = match_ascii_keyword_at(bytes, scan_pos, b"CREATE").is_some();
+    let is_tsql_insert = is_insert && sql_appears_tsql_insert(sql);
+
+    if is_tsql_insert {
+        // T-SQL: WITH goes before INSERT.
+        return Some(insert_with_before_position(sql, 0, cte_defs, with_kw));
+    }
+
+    if is_insert || is_create {
+        // For non-TSQL INSERT/CREATE: find where SELECT starts and insert WITH there.
+        let select_pos = find_main_select_position(sql);
+        if let Some(pos) = select_pos {
+            return insert_with_at_select(sql, pos, cte_defs, with_kw);
+        }
+        return None;
+    }
+
+    // Look for existing WITH clause.
+    if let Some(with_info) = find_existing_with_clause(sql) {
+        // Append new CTEs to existing WITH clause.
+        return Some(append_to_existing_with(sql, &with_info, cte_defs));
+    }
+
+    // No existing WITH: prepend.
+    let insert_pos = skip_ascii_whitespace(bytes, 0);
+    Some(insert_with_before_position(
+        sql, insert_pos, cte_defs, with_kw,
+    ))
+}
+
+struct ExistingWithInfo {
+    /// Byte position just after the last CTE definition's closing paren.
+    last_cte_end: usize,
+}
+
+/// Find the existing WITH clause and return info about where to append.
+fn find_existing_with_clause(sql: &str) -> Option<ExistingWithInfo> {
+    let bytes = sql.as_bytes();
+    let mut pos = skip_ascii_whitespace(bytes, 0);
+
+    // Skip INSERT/CREATE prefix.
+    if match_ascii_keyword_at(bytes, pos, b"INSERT").is_some()
+        || match_ascii_keyword_at(bytes, pos, b"CREATE").is_some()
+    {
+        pos = skip_to_with_or_select(bytes, pos + 6);
+    }
+
+    let _with_end = match_ascii_keyword_at(bytes, pos, b"WITH")?;
+    let mut cursor = skip_ascii_whitespace(bytes, _with_end);
+
+    // Skip RECURSIVE.
+    if let Some(end) = match_ascii_keyword_at(bytes, cursor, b"RECURSIVE") {
+        cursor = skip_ascii_whitespace(bytes, end);
+    }
+
+    // Walk through CTE definitions to find the last one.
+    let mut last_cte_end = cursor;
+    loop {
+        // Skip CTE name.
+        if let Some(quoted_end) = consume_quoted_identifier(bytes, cursor) {
+            cursor = skip_ascii_whitespace(bytes, quoted_end);
+        } else if let Some(name_end) = consume_ascii_identifier(bytes, cursor) {
+            cursor = skip_ascii_whitespace(bytes, name_end);
+        } else {
+            break;
+        }
+
+        // AS keyword.
+        if let Some(as_end) = match_ascii_keyword_at(bytes, cursor, b"AS") {
+            cursor = skip_ascii_whitespace(bytes, as_end);
+        } else {
+            break;
+        }
+
+        // CTE body.
+        if cursor < bytes.len() && bytes[cursor] == b'(' {
+            if let Some(close) = find_matching_parenthesis_outside_quotes(sql, cursor) {
+                last_cte_end = close + 1;
+                cursor = skip_ascii_whitespace(bytes, close + 1);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        // Comma means more CTEs.
+        if cursor < bytes.len() && bytes[cursor] == b',' {
+            cursor += 1;
+            cursor = skip_ascii_whitespace(bytes, cursor);
+        } else {
+            break;
+        }
+    }
+
+    Some(ExistingWithInfo { last_cte_end })
+}
+
+/// Append new CTE definitions after the last existing CTE.
+fn append_to_existing_with(sql: &str, with_info: &ExistingWithInfo, cte_defs: &[String]) -> String {
+    let insert_pos = with_info.last_cte_end;
+    let mut result =
+        String::with_capacity(sql.len() + cte_defs.iter().map(|d| d.len() + 4).sum::<usize>());
+    result.push_str(&sql[..insert_pos]);
+    for def in cte_defs {
+        result.push_str(",\n");
+        result.push_str(def);
+    }
+    result.push_str(&sql[insert_pos..]);
+    result
+}
+
+/// Insert WITH clause before a given position.
+fn insert_with_before_position(
+    sql: &str,
+    pos: usize,
+    cte_defs: &[String],
+    with_kw: &str,
+) -> String {
+    let mut result = String::with_capacity(sql.len() + 100);
+    result.push_str(&sql[..pos]);
+    result.push_str(with_kw);
+    result.push(' ');
+    for (i, def) in cte_defs.iter().enumerate() {
+        if i > 0 {
+            result.push_str(",\n");
+        }
+        result.push_str(def);
+    }
+    result.push('\n');
+    result.push_str(&sql[pos..]);
+    result
+}
+
+/// Insert WITH clause before a SELECT that is preceded by INSERT/CREATE.
+fn insert_with_at_select(
+    sql: &str,
+    select_pos: usize,
+    cte_defs: &[String],
+    with_kw: &str,
+) -> Option<String> {
+    // Check if there's already a WITH clause at this position.
+    let bytes = sql.as_bytes();
+    if match_ascii_keyword_at(bytes, select_pos, b"WITH").is_some() {
+        // Existing WITH at select position — append to it.
+        if let Some(with_info) = find_existing_with_clause_at(sql, select_pos) {
+            return Some(append_to_existing_with(sql, &with_info, cte_defs));
+        }
+    }
+
+    Some(insert_with_before_position(
+        sql, select_pos, cte_defs, with_kw,
+    ))
+}
+
+/// Find existing WITH clause starting at a specific position.
+fn find_existing_with_clause_at(sql: &str, start: usize) -> Option<ExistingWithInfo> {
+    let bytes = sql.as_bytes();
+    let _with_end = match_ascii_keyword_at(bytes, start, b"WITH")?;
+    let mut cursor = skip_ascii_whitespace(bytes, _with_end);
+
+    // Skip RECURSIVE.
+    if let Some(end) = match_ascii_keyword_at(bytes, cursor, b"RECURSIVE") {
+        cursor = skip_ascii_whitespace(bytes, end);
+    }
+
+    let mut last_cte_end = cursor;
+    loop {
+        if let Some(quoted_end) = consume_quoted_identifier(bytes, cursor) {
+            cursor = skip_ascii_whitespace(bytes, quoted_end);
+        } else if let Some(name_end) = consume_ascii_identifier(bytes, cursor) {
+            cursor = skip_ascii_whitespace(bytes, name_end);
+        } else {
+            break;
+        }
+
+        if let Some(as_end) = match_ascii_keyword_at(bytes, cursor, b"AS") {
+            cursor = skip_ascii_whitespace(bytes, as_end);
+        } else {
+            break;
+        }
+
+        if cursor < bytes.len() && bytes[cursor] == b'(' {
+            if let Some(close) = find_matching_parenthesis_outside_quotes(sql, cursor) {
+                last_cte_end = close + 1;
+                cursor = skip_ascii_whitespace(bytes, close + 1);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+
+        if cursor < bytes.len() && bytes[cursor] == b',' {
+            cursor += 1;
+            cursor = skip_ascii_whitespace(bytes, cursor);
+        } else {
+            break;
+        }
+    }
+
+    Some(ExistingWithInfo { last_cte_end })
+}
+
+/// Find the position of the main SELECT keyword in an INSERT or CREATE statement.
+fn find_main_select_position(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut pos = 0usize;
+    let mut depth = 0usize;
+
+    while pos < bytes.len() {
+        if let Some(end) = skip_quoted_region(bytes, pos) {
+            pos = end;
+            continue;
+        }
+        if bytes[pos] == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+            pos += 2;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                    pos += 2;
+                    break;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+
+        if bytes[pos] == b'(' {
+            depth += 1;
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b')' {
+            depth = depth.saturating_sub(1);
+            pos += 1;
+            continue;
+        }
+
+        // Only at depth 0, look for SELECT or WITH keyword.
+        if depth == 0 {
+            if match_ascii_keyword_at(bytes, pos, b"WITH").is_some() {
+                return Some(pos);
+            }
+            if match_ascii_keyword_at(bytes, pos, b"SELECT").is_some() {
+                return Some(pos);
+            }
+        }
+
+        pos += 1;
+    }
+    None
+}
+
+/// Check if an INSERT statement appears to be TSQL-style (no WITH between INSERT and SELECT).
+fn sql_appears_tsql_insert(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let pos = skip_ascii_whitespace(bytes, 0);
+
+    // Must start with WITH (existing CTEs before INSERT = TSQL pattern)
+    // or INSERT.
+    if match_ascii_keyword_at(bytes, pos, b"WITH").is_some() {
+        // WITH ... INSERT pattern = TSQL
+        return true;
+    }
+
+    if match_ascii_keyword_at(bytes, pos, b"INSERT").is_none() {
+        return false;
+    }
+
+    // TSQL insert: the SELECT is at depth 0 without a WITH between INSERT and SELECT.
+    // Non-TSQL (postgres, mariadb): INSERT ... WITH sub AS (...) SELECT ...
+    // We detect TSQL by checking the dialect hint in the SQL context.
+    // Since we don't have dialect info here, we use a heuristic:
+    // If there's no WITH keyword between INSERT and the main SELECT, it's potentially TSQL.
+    // But actually, for the parity fixtures, TSQL cases explicitly use the tsql dialect.
+    // Since the check() function passes the statement, not the dialect, we'll handle this
+    // by just checking if there's an existing WITH before INSERT.
+    false
+}
+
+/// Skip a quoted region (single quote, double quote, backtick, bracket).
+/// Returns the position after the closing quote, or None if not in a quoted region.
+fn skip_quoted_region(bytes: &[u8], pos: usize) -> Option<usize> {
+    let b = bytes[pos];
+    if b == b'\'' {
+        return Some(skip_to_close_quote(bytes, pos + 1, b'\''));
+    }
+    if b == b'"' {
+        return Some(skip_to_close_quote(bytes, pos + 1, b'"'));
+    }
+    if b == b'`' {
+        return Some(skip_to_close_quote(bytes, pos + 1, b'`'));
+    }
+    if b == b'[' {
+        return Some(skip_to_close_quote(bytes, pos + 1, b']'));
+    }
+    None
+}
+
+fn skip_to_close_quote(bytes: &[u8], mut pos: usize, close: u8) -> usize {
+    while pos < bytes.len() {
+        if bytes[pos] == close {
+            if bytes.get(pos + 1) == Some(&close) {
+                pos += 2; // Escaped quote.
+            } else {
+                return pos + 1;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    pos
+}
+
+/// Consume a quoted identifier (double-quoted, backtick-quoted, or bracket-quoted).
+fn consume_quoted_identifier(bytes: &[u8], pos: usize) -> Option<usize> {
+    if pos >= bytes.len() {
+        return None;
+    }
+    match bytes[pos] {
+        b'"' => Some(skip_to_close_quote(bytes, pos + 1, b'"')),
+        b'`' => Some(skip_to_close_quote(bytes, pos + 1, b'`')),
+        b'[' => Some(skip_to_close_quote(bytes, pos + 1, b']')),
+        _ => None,
+    }
+}
+
+/// Match a multi-word JOIN keyword sequence like INNER JOIN, LEFT JOIN, etc.
+/// Returns the byte position after the final JOIN keyword.
+fn match_join_keyword_sequence(bytes: &[u8], pos: usize) -> Option<usize> {
+    // Check for: INNER JOIN, LEFT [OUTER] JOIN, RIGHT [OUTER] JOIN,
+    // FULL [OUTER] JOIN, CROSS JOIN, LEFT OUTER JOIN, etc.
+    let prefixes: &[&[u8]] = &[b"INNER", b"LEFT", b"RIGHT", b"FULL", b"CROSS", b"NATURAL"];
+
+    for prefix in prefixes {
+        if let Some(prefix_end) = match_ascii_keyword_at(bytes, pos, prefix) {
+            let mut cursor = skip_ascii_whitespace(bytes, prefix_end);
+
+            // Optional OUTER keyword.
+            if let Some(outer_end) = match_ascii_keyword_at(bytes, cursor, b"OUTER") {
+                cursor = skip_ascii_whitespace(bytes, outer_end);
+            }
+
+            if let Some(join_end) = match_ascii_keyword_at(bytes, cursor, b"JOIN") {
+                return Some(join_end);
+            }
+        }
+    }
+    None
 }
 
 fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_index: usize) -> Option<usize> {
@@ -671,7 +1658,7 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Unsafe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "WITH sub AS (SELECT 1) SELECT * FROM sub");
+        assert_eq!(fixed, "WITH sub AS (SELECT 1)\nSELECT * FROM sub");
     }
 
     #[test]
@@ -741,5 +1728,155 @@ mod tests {
             },
         );
         assert_eq!(issues.len(), 2);
+    }
+
+    // --- Fixture-based rewriter tests ---
+
+    fn run_fix(sql: &str, forbid_in: &str) -> Option<String> {
+        let statements = parse_sql(sql).expect("parse sql");
+        let rule = StructureSubquery::from_config(&LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "structure.subquery".to_string(),
+                serde_json::json!({"forbid_subquery_in": forbid_in}),
+            )]),
+        });
+        let ctx = LintContext {
+            sql,
+            statement_range: 0..sql.len(),
+            statement_index: 0,
+        };
+        let issues = rule.check(&statements[0], &ctx);
+        if issues.is_empty() {
+            return None;
+        }
+        let st05_issue = issues
+            .iter()
+            .find(|i| i.code == issue_codes::LINT_ST_005 && i.autofix.is_some())?;
+        apply_issue_autofix(sql, st05_issue)
+    }
+
+    fn assert_fix_whitespace_eq(actual: &str, expected: &str) {
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            norm(actual),
+            norm(expected),
+            "\n--- actual ---\n{actual}\n--- expected ---\n{expected}\n"
+        );
+    }
+
+    #[test]
+    fn fixture_select_fail() {
+        let sql = "select\n    a.x, a.y, b.z\nfrom a\njoin (\n    select x, z from b\n) as b on (a.x = b.x)\n";
+        let expected = "with b as (\n    select x, z from b\n)\nselect\n    a.x, a.y, b.z\nfrom a\njoin b on (a.x = b.x)\n";
+        let fixed = run_fix(sql, "join").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_cte_select_fail() {
+        let sql = "with prep as (\n  select 1 as x, 2 as z\n)\nselect\n    a.x, a.y, b.z\nfrom a\njoin (\n    select x, z from b\n) as b on (a.x = b.x)\n";
+        let expected = "with prep as (\n  select 1 as x, 2 as z\n),\nb as (\n    select x, z from b\n)\nselect\n    a.x, a.y, b.z\nfrom a\njoin b on (a.x = b.x)\n";
+        let fixed = run_fix(sql, "join").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_from_clause_fail() {
+        let sql = "select\n    a.x, a.y\nfrom (\n    select * from b\n) as a\n";
+        let expected = "with a as (\n    select * from b\n)\nselect\n    a.x, a.y\nfrom a\n";
+        let fixed = run_fix(sql, "from").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_both_clause_fail() {
+        let sql = "select\n    a.x, a.y\nfrom (\n    select * from b\n) as a\n";
+        let expected = "with a as (\n    select * from b\n)\nselect\n    a.x, a.y\nfrom a\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_cte_with_clashing_name_generates_prep() {
+        let sql = "with prep_1 as (\n  select 1 as x, 2 as z\n)\nselect\n    a.x, a.y, z\nfrom a\njoin (\n    select x, z from b\n) on a.x = z\n";
+        let fixed = run_fix(sql, "join").expect("should produce fix");
+        // Should generate prep_2 since prep_1 exists.
+        assert!(
+            fixed.contains("prep_2"),
+            "expected prep_2 in output: {fixed}"
+        );
+    }
+
+    #[test]
+    fn fixture_set_subquery_in_second_query() {
+        let sql = "SELECT 1 AS value_name\nUNION\nSELECT value\nFROM (SELECT 2 AS value_name);\n";
+        let expected = "WITH prep_1 AS (SELECT 2 AS value_name)\nSELECT 1 AS value_name\nUNION\nSELECT value\nFROM prep_1;\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_set_subquery_in_second_query_join() {
+        let sql = "SELECT 1 AS value_name\nUNION\nSELECT value\nFROM (SELECT 2 AS value_name)\nCROSS JOIN (SELECT 1 as v2);\n";
+        let expected = "WITH prep_1 AS (SELECT 2 AS value_name),\nprep_2 AS (SELECT 1 as v2)\nSELECT 1 AS value_name\nUNION\nSELECT value\nFROM prep_1\nCROSS JOIN prep_2;\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_with_fail_generates_prep_for_unnamed_subquery() {
+        let sql = "select\n    a.x, a.y, b.z\nfrom a\njoin (\n    with d as (\n        select x, z from b\n    )\n    select * from d\n) using (x)\n";
+        let fixed = run_fix(sql, "join").expect("should produce fix");
+        assert!(
+            fixed.contains("prep_1"),
+            "expected prep_1 in output: {fixed}"
+        );
+    }
+
+    #[test]
+    fn fixture_set_fail() {
+        let sql = "SELECT\n    a.x, a.y, b.z\nFROM a\nJOIN (\n    select x, z from b\n    union\n    select x, z from d\n) USING (x)\n";
+        let fixed = run_fix(sql, "join").expect("should produce fix");
+        assert!(
+            fixed.contains("prep_1"),
+            "expected prep_1 in output: {fixed}"
+        );
+    }
+
+    #[test]
+    fn fixture_subquery_in_cte_both() {
+        let sql = "with b as (\n  select x, z from (\n    select x, z from p_cte\n  )\n)\nselect b.z\nfrom b\n";
+        let expected = "with prep_1 as (\n    select x, z from p_cte\n  ),\nb as (\n  select x, z from prep_1\n)\nselect b.z\nfrom b\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_issue_3598_avoid_looping_1() {
+        let sql = "WITH cte1 AS (\n    SELECT a\n    FROM (SELECT a)\n)\nSELECT a FROM cte1\n";
+        let expected = "WITH prep_1 AS (SELECT a),\ncte1 AS (\n    SELECT a\n    FROM prep_1\n)\nSELECT a FROM cte1\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_issue_3598_avoid_looping_2() {
+        let sql = "WITH cte1 AS (\n    SELECT *\n    FROM (SELECT * FROM mongo.temp)\n)\nSELECT * FROM cte1\n";
+        let expected = "WITH prep_1 AS (SELECT * FROM mongo.temp),\ncte1 AS (\n    SELECT *\n    FROM prep_1\n)\nSELECT * FROM cte1\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        assert_fix_whitespace_eq(&fixed, expected);
+    }
+
+    #[test]
+    fn fixture_multijoin_both() {
+        let sql = "select\n    a.x, d.x as foo, a.y, b.z\nfrom (select a, x from foo) a\njoin d using(x)\njoin (\n    select x, z from b\n) as b using (x)\n";
+        let fixed = run_fix(sql, "both").expect("should produce fix");
+        // Should extract both subqueries.
+        assert!(
+            fixed.to_ascii_lowercase().contains("with"),
+            "expected WITH in output: {fixed}"
+        );
     }
 }

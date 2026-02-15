@@ -932,7 +932,7 @@ async fn lint_fix_applies_st005_core_autofix_in_unsafe_mode_with_from_config() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "WITH sub AS (SELECT 1) SELECT * FROM sub\n",
+        "WITH sub AS (SELECT 1)\nSELECT * FROM sub\n",
         "expected unsafe ST005 core autofix to rewrite FROM subquery to CTE"
     );
 }

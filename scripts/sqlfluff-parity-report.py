@@ -204,7 +204,7 @@ def run_flowscope_fix(
         f.flush()
         try:
             cmd = _build_flowscope_cmd(
-                ["--lint", "--fix", "--format", "json"],
+                ["--lint", "--fix", "--unsafe-fixes", "--format", "json"],
                 dialect,
                 f.name,
                 rule_configs,
