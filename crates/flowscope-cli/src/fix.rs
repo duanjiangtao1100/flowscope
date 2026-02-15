@@ -18,7 +18,7 @@ use flowscope_core::{
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[must_use]
@@ -95,17 +95,8 @@ impl Default for FixOptions {
 struct RuleFilter {
     disabled: HashSet<String>,
     al007_force_enable: bool,
-    al001_mode: Al001FixMode,
     cv011_style: Cv011CastingStyle,
     st005_forbid_subquery_in: St005ForbidSubqueryIn,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum Al001FixMode {
-    #[default]
-    Explicit,
-    Implicit,
-    PreserveOriginal,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -153,19 +144,6 @@ impl RuleFilter {
         let al007_force_enable = lint_config
             .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
             .unwrap_or(false);
-        let al001_mode = if disabled.contains(issue_codes::LINT_AL_001) {
-            Al001FixMode::PreserveOriginal
-        } else {
-            match lint_config
-                .rule_option_str(issue_codes::LINT_AL_001, "aliasing")
-                .unwrap_or("explicit")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "implicit" => Al001FixMode::Implicit,
-                _ => Al001FixMode::Explicit,
-            }
-        };
         let cv011_style = match lint_config
             .rule_option_str(issue_codes::LINT_CV_011, "preferred_type_casting_style")
             .unwrap_or("consistent")
@@ -190,7 +168,6 @@ impl RuleFilter {
         Self {
             disabled,
             al007_force_enable,
-            al001_mode,
             cv011_style,
             st005_forbid_subquery_in,
         }
@@ -278,9 +255,12 @@ pub fn apply_lint_fixes_with_options(
             fix_statement(stmt, &safe_rule_filter);
         }
 
-        let mut rewritten_sql = render_statements(&statements, sql);
-        rewritten_sql =
-            apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
+        let rewritten_sql = render_statements(&statements, sql);
+        let rewritten_sql = if safe_rule_filter.allows(issue_codes::LINT_AL_001) {
+            rewritten_sql
+        } else {
+            preserve_original_table_alias_style(sql, &rewritten_sql, dialect)
+        };
 
         let mut rewrite_candidates = build_fix_candidates_from_rewrite(
             sql,
@@ -293,8 +273,12 @@ pub fn apply_lint_fixes_with_options(
             for stmt in &mut unsafe_statements {
                 fix_statement(stmt, &rule_filter);
             }
-            let mut unsafe_sql = render_statements(&unsafe_statements, sql);
-            unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
+            let unsafe_sql = render_statements(&unsafe_statements, sql);
+            let unsafe_sql = if rule_filter.allows(issue_codes::LINT_AL_001) {
+                unsafe_sql
+            } else {
+                preserve_original_table_alias_style(sql, &unsafe_sql, dialect)
+            };
             if unsafe_sql != rewritten_sql {
                 rewrite_candidates.extend(build_fix_candidates_from_rewrite(
                     sql,
@@ -650,21 +634,6 @@ fn try_core_only_fix_plan(
     })
 }
 
-fn apply_al001_alias_style_fix(
-    original_sql: &str,
-    fixed_sql: &str,
-    dialect: Dialect,
-    rule_filter: &RuleFilter,
-) -> String {
-    match rule_filter.al001_mode {
-        Al001FixMode::Explicit => fixed_sql.to_string(),
-        Al001FixMode::Implicit => rewrite_table_aliases_to_implicit(fixed_sql, dialect),
-        Al001FixMode::PreserveOriginal => {
-            preserve_original_table_alias_style(original_sql, fixed_sql, dialect)
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct TableAliasOccurrence {
     alias_key: String,
@@ -685,7 +654,7 @@ fn preserve_original_table_alias_style(
         return fixed_sql.to_string();
     };
 
-    let mut desired_by_alias: HashMap<String, VecDeque<bool>> = HashMap::new();
+    let mut desired_by_alias: BTreeMap<String, VecDeque<bool>> = BTreeMap::new();
     for alias in original_aliases {
         desired_by_alias
             .entry(alias.alias_key)
@@ -708,25 +677,6 @@ fn preserve_original_table_alias_style(
     }
 
     apply_byte_removals(fixed_sql, removals)
-}
-
-fn rewrite_table_aliases_to_implicit(sql: &str, dialect: Dialect) -> String {
-    let Some(aliases) = table_alias_occurrences(sql, dialect) else {
-        return sql.to_string();
-    };
-
-    let removals = aliases
-        .into_iter()
-        .filter_map(|alias| {
-            if alias.explicit_as {
-                alias.as_start.map(|as_start| (as_start, alias.alias_start))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    apply_byte_removals(sql, removals)
 }
 
 fn apply_byte_removals(sql: &str, mut removals: Vec<(usize, usize)>) -> String {
@@ -1384,7 +1334,7 @@ fn char_to_byte_offsets(text: &str) -> Vec<usize> {
 
 fn table_alias_occurrences(sql: &str, dialect: Dialect) -> Option<Vec<TableAliasOccurrence>> {
     let statements = parse_sql_with_dialect(sql, dialect).ok()?;
-    let tokens = tokenize_with_offsets(sql, dialect)?;
+    let tokens = alias_tokenize_with_offsets(sql, dialect)?;
 
     let mut aliases = Vec::new();
     for statement in &statements {
@@ -1395,11 +1345,11 @@ fn table_alias_occurrences(sql: &str, dialect: Dialect) -> Option<Vec<TableAlias
 
     let mut occurrences = Vec::with_capacity(aliases.len());
     for alias in aliases {
-        let (alias_start, _alias_end) = ident_span_offsets(sql, &alias)?;
+        let (alias_start, _alias_end) = alias_ident_span_offsets(sql, &alias)?;
         let previous_token = tokens
             .iter()
             .rev()
-            .find(|token| token.end <= alias_start && !is_trivia_token(&token.token));
+            .find(|token| token.end <= alias_start && !is_alias_trivia_token(&token.token));
 
         let (explicit_as, as_start) = match previous_token {
             Some(token) if is_as_token(&token.token) => (true, Some(token.start)),
@@ -1417,13 +1367,13 @@ fn table_alias_occurrences(sql: &str, dialect: Dialect) -> Option<Vec<TableAlias
     Some(occurrences)
 }
 
-fn ident_span_offsets(sql: &str, ident: &Ident) -> Option<(usize, usize)> {
-    let start = line_col_to_offset(
+fn alias_ident_span_offsets(sql: &str, ident: &Ident) -> Option<(usize, usize)> {
+    let start = alias_line_col_to_offset(
         sql,
         ident.span.start.line as usize,
         ident.span.start.column as usize,
     )?;
-    let end = line_col_to_offset(
+    let end = alias_line_col_to_offset(
         sql,
         ident.span.end.line as usize,
         ident.span.end.column as usize,
@@ -1433,6 +1383,173 @@ fn ident_span_offsets(sql: &str, ident: &Ident) -> Option<(usize, usize)> {
 
 fn is_as_token(token: &Token) -> bool {
     matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("AS"))
+}
+
+#[derive(Clone)]
+struct AliasLocatedToken {
+    token: Token,
+    start: usize,
+    end: usize,
+}
+
+fn alias_tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<AliasLocatedToken>> {
+    let dialect = dialect.to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
+    let tokens = tokenizer.tokenize_with_location().ok()?;
+
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let Some((start, end)) = alias_token_with_span_offsets(sql, &token) else {
+            continue;
+        };
+        out.push(AliasLocatedToken {
+            token: token.token,
+            start,
+            end,
+        });
+    }
+
+    Some(out)
+}
+
+fn alias_token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
+    let start = alias_line_col_to_offset(
+        sql,
+        token.span.start.line as usize,
+        token.span.start.column as usize,
+    )?;
+    let end = alias_line_col_to_offset(
+        sql,
+        token.span.end.line as usize,
+        token.span.end.column as usize,
+    )?;
+    Some((start, end))
+}
+
+fn alias_line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1usize;
+    let mut current_col = 1usize;
+    for (offset, ch) in sql.char_indices() {
+        if current_line == line && current_col == column {
+            return Some(offset);
+        }
+        if ch == '\n' {
+            current_line += 1;
+            current_col = 1;
+        } else {
+            current_col += 1;
+        }
+    }
+    if current_line == line && current_col == column {
+        return Some(sql.len());
+    }
+    None
+}
+
+fn is_alias_trivia_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(
+            Whitespace::Space
+                | Whitespace::Newline
+                | Whitespace::Tab
+                | Whitespace::SingleLineComment { .. }
+                | Whitespace::MultiLineComment(_)
+        )
+    )
+}
+
+fn collect_table_alias_idents_in_statement<F: FnMut(&Ident)>(
+    statement: &Statement,
+    visitor: &mut F,
+) {
+    match statement {
+        Statement::Query(query) => collect_table_alias_idents_in_query(query, visitor),
+        Statement::Insert(insert) => {
+            if let Some(source) = &insert.source {
+                collect_table_alias_idents_in_query(source, visitor);
+            }
+        }
+        Statement::CreateView { query, .. } => collect_table_alias_idents_in_query(query, visitor),
+        Statement::CreateTable(create) => {
+            if let Some(query) = &create.query {
+                collect_table_alias_idents_in_query(query, visitor);
+            }
+        }
+        Statement::Merge { table, source, .. } => {
+            collect_table_alias_idents_in_table_factor(table, visitor);
+            collect_table_alias_idents_in_table_factor(source, visitor);
+        }
+        _ => {}
+    }
+}
+
+fn collect_table_alias_idents_in_query<F: FnMut(&Ident)>(query: &Query, visitor: &mut F) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_table_alias_idents_in_query(&cte.query, visitor);
+        }
+    }
+
+    collect_table_alias_idents_in_set_expr(&query.body, visitor);
+}
+
+fn collect_table_alias_idents_in_set_expr<F: FnMut(&Ident)>(set_expr: &SetExpr, visitor: &mut F) {
+    match set_expr {
+        SetExpr::Select(select) => {
+            for table in &select.from {
+                collect_table_alias_idents_in_table_with_joins(table, visitor);
+            }
+        }
+        SetExpr::Query(query) => collect_table_alias_idents_in_query(query, visitor),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_table_alias_idents_in_set_expr(left, visitor);
+            collect_table_alias_idents_in_set_expr(right, visitor);
+        }
+        SetExpr::Insert(statement)
+        | SetExpr::Update(statement)
+        | SetExpr::Delete(statement)
+        | SetExpr::Merge(statement) => collect_table_alias_idents_in_statement(statement, visitor),
+        _ => {}
+    }
+}
+
+fn collect_table_alias_idents_in_table_with_joins<F: FnMut(&Ident)>(
+    table_with_joins: &TableWithJoins,
+    visitor: &mut F,
+) {
+    collect_table_alias_idents_in_table_factor(&table_with_joins.relation, visitor);
+    for join in &table_with_joins.joins {
+        collect_table_alias_idents_in_table_factor(&join.relation, visitor);
+    }
+}
+
+fn collect_table_alias_idents_in_table_factor<F: FnMut(&Ident)>(
+    table_factor: &TableFactor,
+    visitor: &mut F,
+) {
+    if let Some(alias) = table_factor_alias_ident(table_factor) {
+        visitor(alias);
+    }
+
+    match table_factor {
+        TableFactor::Derived { subquery, .. } => {
+            collect_table_alias_idents_in_query(subquery, visitor)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_table_alias_idents_in_table_with_joins(table_with_joins, visitor),
+        TableFactor::Pivot { table, .. }
+        | TableFactor::Unpivot { table, .. }
+        | TableFactor::MatchRecognize { table, .. } => {
+            collect_table_alias_idents_in_table_factor(table, visitor)
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1764,176 +1881,6 @@ fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_idx: usize) ->
     }
 
     None
-}
-
-struct LocatedToken {
-    token: Token,
-    start: usize,
-    end: usize,
-}
-
-fn tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LocatedToken>> {
-    let dialect = dialect.to_sqlparser_dialect();
-    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
-    let tokens = tokenizer.tokenize_with_location().ok()?;
-
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let Some((start, end)) = token_with_span_offsets(sql, &token) else {
-            continue;
-        };
-        out.push(LocatedToken {
-            token: token.token,
-            start,
-            end,
-        });
-    }
-
-    Some(out)
-}
-
-fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
-    let start = line_col_to_offset(
-        sql,
-        token.span.start.line as usize,
-        token.span.start.column as usize,
-    )?;
-    let end = line_col_to_offset(
-        sql,
-        token.span.end.line as usize,
-        token.span.end.column as usize,
-    )?;
-    Some((start, end))
-}
-
-fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
-    if line == 0 || column == 0 {
-        return None;
-    }
-
-    let mut current_line = 1usize;
-    let mut current_col = 1usize;
-
-    for (offset, ch) in sql.char_indices() {
-        if current_line == line && current_col == column {
-            return Some(offset);
-        }
-
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 1;
-        } else {
-            current_col += 1;
-        }
-    }
-
-    if current_line == line && current_col == column {
-        return Some(sql.len());
-    }
-
-    None
-}
-
-fn is_trivia_token(token: &Token) -> bool {
-    matches!(
-        token,
-        Token::Whitespace(
-            Whitespace::Space
-                | Whitespace::Newline
-                | Whitespace::Tab
-                | Whitespace::SingleLineComment { .. }
-                | Whitespace::MultiLineComment(_)
-        )
-    )
-}
-
-fn collect_table_alias_idents_in_statement<F: FnMut(&Ident)>(
-    statement: &Statement,
-    visitor: &mut F,
-) {
-    match statement {
-        Statement::Query(query) => collect_table_alias_idents_in_query(query, visitor),
-        Statement::Insert(insert) => {
-            if let Some(source) = &insert.source {
-                collect_table_alias_idents_in_query(source, visitor);
-            }
-        }
-        Statement::CreateView { query, .. } => collect_table_alias_idents_in_query(query, visitor),
-        Statement::CreateTable(create) => {
-            if let Some(query) = &create.query {
-                collect_table_alias_idents_in_query(query, visitor);
-            }
-        }
-        Statement::Merge { table, source, .. } => {
-            collect_table_alias_idents_in_table_factor(table, visitor);
-            collect_table_alias_idents_in_table_factor(source, visitor);
-        }
-        _ => {}
-    }
-}
-
-fn collect_table_alias_idents_in_query<F: FnMut(&Ident)>(query: &Query, visitor: &mut F) {
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            collect_table_alias_idents_in_query(&cte.query, visitor);
-        }
-    }
-
-    collect_table_alias_idents_in_set_expr(&query.body, visitor);
-}
-
-fn collect_table_alias_idents_in_set_expr<F: FnMut(&Ident)>(set_expr: &SetExpr, visitor: &mut F) {
-    match set_expr {
-        SetExpr::Select(select) => {
-            for table in &select.from {
-                collect_table_alias_idents_in_table_with_joins(table, visitor);
-            }
-        }
-        SetExpr::Query(query) => collect_table_alias_idents_in_query(query, visitor),
-        SetExpr::SetOperation { left, right, .. } => {
-            collect_table_alias_idents_in_set_expr(left, visitor);
-            collect_table_alias_idents_in_set_expr(right, visitor);
-        }
-        SetExpr::Insert(statement)
-        | SetExpr::Update(statement)
-        | SetExpr::Delete(statement)
-        | SetExpr::Merge(statement) => collect_table_alias_idents_in_statement(statement, visitor),
-        _ => {}
-    }
-}
-
-fn collect_table_alias_idents_in_table_with_joins<F: FnMut(&Ident)>(
-    table_with_joins: &TableWithJoins,
-    visitor: &mut F,
-) {
-    collect_table_alias_idents_in_table_factor(&table_with_joins.relation, visitor);
-    for join in &table_with_joins.joins {
-        collect_table_alias_idents_in_table_factor(&join.relation, visitor);
-    }
-}
-
-fn collect_table_alias_idents_in_table_factor<F: FnMut(&Ident)>(
-    table_factor: &TableFactor,
-    visitor: &mut F,
-) {
-    if let Some(alias) = table_factor_alias_ident(table_factor) {
-        visitor(alias);
-    }
-
-    match table_factor {
-        TableFactor::Derived { subquery, .. } => {
-            collect_table_alias_idents_in_query(subquery, visitor);
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            collect_table_alias_idents_in_table_with_joins(table_with_joins, visitor);
-        }
-        TableFactor::Pivot { table, .. } | TableFactor::Unpivot { table, .. } => {
-            collect_table_alias_idents_in_table_factor(table, visitor);
-        }
-        _ => {}
-    }
 }
 
 fn fix_statement(stmt: &mut Statement, rule_filter: &RuleFilter) {

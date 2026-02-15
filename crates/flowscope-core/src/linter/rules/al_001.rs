@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{Ident, Query, SetExpr, Statement, TableFactor, TableWithJoins};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -90,11 +90,14 @@ impl LintRule for AliasingTableStyle {
                 return;
             }
 
-            issues.push(
-                Issue::warning(issue_codes::LINT_AL_001, self.aliasing.message())
-                    .with_statement(ctx.statement_index)
-                    .with_span(ctx.span_from_statement_offset(occurrence.start, occurrence.end)),
-            );
+            let mut issue = Issue::warning(issue_codes::LINT_AL_001, self.aliasing.message())
+                .with_statement(ctx.statement_index)
+                .with_span(ctx.span_from_statement_offset(occurrence.start, occurrence.end));
+            if let Some(edits) = autofix_edits_for_occurrence(occurrence, self.aliasing) {
+                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            }
+
+            issues.push(issue);
         });
 
         issues
@@ -106,6 +109,23 @@ struct AliasOccurrence {
     start: usize,
     end: usize,
     explicit_as: bool,
+    as_span: Option<Span>,
+}
+
+fn autofix_edits_for_occurrence(
+    occurrence: AliasOccurrence,
+    aliasing: AliasingPreference,
+) -> Option<Vec<IssuePatchEdit>> {
+    match aliasing {
+        AliasingPreference::Explicit if !occurrence.explicit_as => {
+            let insert = Span::new(occurrence.start, occurrence.start);
+            Some(vec![IssuePatchEdit::new(insert, "AS ")])
+        }
+        AliasingPreference::Implicit if occurrence.explicit_as => {
+            Some(vec![IssuePatchEdit::new(occurrence.as_span?, "")])
+        }
+        _ => None,
+    }
 }
 
 fn alias_occurrence_in_statement(
@@ -132,11 +152,12 @@ fn alias_occurrence_in_statement(
 
     let rel_start = abs_start - ctx.statement_range.start;
     let rel_end = abs_end - ctx.statement_range.start;
-    let explicit_as = explicit_as_before_alias_tokens(tokens, rel_start)?;
+    let (explicit_as, as_span) = explicit_as_before_alias_tokens(tokens, rel_start)?;
     Some(AliasOccurrence {
         start: rel_start,
         end: rel_end,
         explicit_as,
+        as_span,
     })
 }
 
@@ -244,12 +265,19 @@ fn table_factor_alias_ident(table_factor: &TableFactor) -> Option<&Ident> {
     Some(&alias.name)
 }
 
-fn explicit_as_before_alias_tokens(tokens: &[LocatedToken], alias_start: usize) -> Option<bool> {
+fn explicit_as_before_alias_tokens(
+    tokens: &[LocatedToken],
+    alias_start: usize,
+) -> Option<(bool, Option<Span>)> {
     let token = tokens
         .iter()
         .rev()
         .find(|token| token.end <= alias_start && !is_trivia_token(&token.token))?;
-    Some(is_as_token(&token.token))
+    if is_as_token(&token.token) {
+        Some((true, Some(Span::new(token.start, token.end))))
+    } else {
+        Some((false, None))
+    }
 }
 
 fn is_as_token(token: &Token) -> bool {
@@ -262,6 +290,7 @@ fn is_as_token(token: &Token) -> bool {
 #[derive(Clone)]
 struct LocatedToken {
     token: Token,
+    start: usize,
     end: usize,
 }
 
@@ -272,9 +301,10 @@ fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<LocatedToken>> {
 
     let mut out = Vec::with_capacity(tokens.len());
     for token in tokens {
-        let (_start, end) = token_with_span_offsets(sql, &token)?;
+        let (start, end) = token_with_span_offsets(sql, &token)?;
         out.push(LocatedToken {
             token: token.token,
+            start,
             end,
         });
     }
@@ -292,12 +322,13 @@ fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<LocatedToken>> {
             tokens
                 .iter()
                 .filter_map(|token| {
-                    let (_start, end) = token_with_span_offsets(ctx.sql, token)?;
-                    if end <= ctx.statement_range.start || end > ctx.statement_range.end {
+                    let (start, end) = token_with_span_offsets(ctx.sql, token)?;
+                    if start < ctx.statement_range.start || end > ctx.statement_range.end {
                         return None;
                     }
                     Some(LocatedToken {
                         token: token.token.clone(),
+                        start: start - statement_start,
                         end: end - statement_start,
                     })
                 })
@@ -362,6 +393,7 @@ mod tests {
     use super::*;
     use crate::{
         parser::{parse_sql, parse_sql_with_dialect},
+        types::IssueAutofixApplicability,
         Dialect,
     };
 
@@ -444,5 +476,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(issues.len(), 2);
         assert!(issues.iter().all(|i| i.code == issue_codes::LINT_AL_001));
+    }
+
+    #[test]
+    fn explicit_mode_emits_safe_insert_as_autofix_patch() {
+        let sql = "select * from users u";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AL001 core autofix metadata in explicit mode");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "AS ");
+        assert_eq!(autofix.edits[0].span.start, autofix.edits[0].span.end);
+    }
+
+    #[test]
+    fn implicit_mode_emits_safe_remove_as_autofix_patch() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "LINT_AL_001".to_string(),
+                serde_json::json!({"aliasing": "implicit"}),
+            )]),
+        };
+        let rule = AliasingTableStyle::from_config(&config);
+        let sql = "select * from users as u";
+        let issues = run_with_rule(sql, rule);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AL001 core autofix metadata in implicit mode");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "");
+        assert_eq!(
+            &sql[autofix.edits[0].span.start..autofix.edits[0].span.end].to_ascii_uppercase(),
+            "AS"
+        );
     }
 }
