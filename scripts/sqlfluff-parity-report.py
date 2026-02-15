@@ -148,6 +148,15 @@ def extract_rule_configs(configs: dict | None) -> dict | None:
         lt05_cfg = result.setdefault("layout.long_lines", {})
         lt05_cfg.setdefault("max_line_length", core["max_line_length"])
 
+    # Map layout.type.* → layout.keyword_newline.* for LT14.
+    layout = configs.get("layout", {})
+    layout_type = layout.get("type", {})
+    if layout_type and isinstance(layout_type, dict):
+        lt14_cfg = result.setdefault("layout.keyword_newline", {})
+        for clause_type, clause_obj in layout_type.items():
+            if isinstance(clause_obj, dict):
+                lt14_cfg[clause_type] = clause_obj
+
     return result if result else None
 
 

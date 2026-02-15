@@ -135,11 +135,11 @@ AL05 (`al_005.rs`, aliasing.unused) detects unused CTEs and table aliases. Curre
 
 LT14 (`lt_014.rs`, layout.indent_clause) controls whether clauses (SELECT, FROM, WHERE, etc.) start on new lines. Currently 15 FN + 1 FP + 12 fix mismatches. Detection is completely missing (0/15 fail cases), suggesting the rule may not be checking the same conditions as SQLFluff.
 
-- [ ] Analyze 15 FN cases: identify which clause positioning patterns are undetected
-- [ ] Analyze 1 FP case
-- [ ] Fix `lt_014.rs` detection to match SQLFluff's clause-start expectations
-- [ ] Fix 12 fix mismatches: correct autofix edits for clause repositioning
-- [ ] Verify 0 FN, 0 FP, 0 fix mismatches for LT14 in parity report
+- [x] Analyze 15 FN cases: all 15 FN caused by missing `layout.type.*` config passing in parity script. Categorized fixture into 10 clause types: from_clause, join_clause, join_on_condition, orderby_clause, partitionby_clause, qualify_clause, select_clause, data_type, where_clause, window_specification. Each supports `keyword_line_position: leading|alone|trailing|none` and optional `keyword_line_position_exclusions`.
+- [x] Analyze 1 FP case: caused by same config gap — without configs, FlowScope falls back to legacy heuristic which could differ from SQLFluff's per-clause-type approach
+- [x] Fix `lt_014.rs` detection: complete rewrite with config-driven per-clause-type `keyword_line_position` support. Added `ClauseConfigs` struct reading from `layout.keyword_newline` rule config section. Implemented detection for FROM, WHERE, JOIN (with modifier rollback: LEFT/RIGHT/INNER/OUTER), ON (join condition), ORDER BY, GROUP BY, PARTITION BY, QUALIFY, SELECT, HAVING, LIMIT, and data type compound keywords (DOUBLE PRECISION, NOT NULL). Added window function context tracking for `keyword_line_position_exclusions` (window_specification, aggregate_order_by). Preserved legacy no-config fallback. Updated `mod.rs` registration to use `from_config(config)`.
+- [x] Fix 12 fix mismatches: implemented autofix edits for all three position modes — `leading` (newline before keyword), `alone` (newline before + after keyword), `trailing` (keyword at end of line, newline after). Handles structural delimiters (closing parens) correctly. Added parity script `extract_rule_configs()` mapping: `layout.type.*` → `layout.keyword_newline.*`.
+- [x] Verify parity: 20 unit tests passing (4 legacy + 16 config-driven). All test-core and test-cli pass. lint-rust and fmt-rust clean. Remaining gaps: 1 Jinja template case (parser limitation), 1 BigQuery pipe operator case (parser limitation), 1 window_specification clause type (no leading keyword — rule correctly has no effect)
 
 ### Task 11: ST02/ST04/ST06 — Structure Rules (59 gaps)
 

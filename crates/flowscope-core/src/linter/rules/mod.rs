@@ -134,7 +134,7 @@ pub fn all_rules(config: &LintConfig) -> Vec<Box<dyn LintRule>> {
         Box::new(lt_011::LayoutSetOperators::from_config(config)),
         Box::new(lt_012::LayoutEndOfFile),
         Box::new(lt_013::LayoutStartOfFile),
-        Box::new(lt_014::LayoutKeywordNewline),
+        Box::new(lt_014::LayoutKeywordNewline::from_config(config)),
         Box::new(lt_015::LayoutNewlines::from_config(config)),
         Box::new(rf_001::ReferencesFrom::from_config(config)),
         Box::new(rf_002::ReferencesQualification::from_config(config)),
