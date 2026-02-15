@@ -41,63 +41,172 @@ impl LintRule for UnusedCte {
                     return Vec::new();
                 }
             }
+            Statement::Delete(delete) => {
+                let mut issues = Vec::new();
+                check_delete_for_nested_ctes(delete, ctx, &mut issues);
+                return issues;
+            }
             _ => return Vec::new(),
         };
 
-        let with = match &query.with {
-            Some(w) => w,
-            None => return Vec::new(),
-        };
-
-        // Collect all table references from the query body and other CTEs
-        let mut referenced = HashSet::new();
-        collect_query_refs(query, &mut referenced);
-
-        // Each CTE can reference earlier CTEs
-        for (i, cte) in with.cte_tables.iter().enumerate() {
-            let mut cte_refs = HashSet::new();
-            collect_query_refs(&cte.query, &mut cte_refs);
-            // CTEs defined after this one can reference it
-            for later_cte in &with.cte_tables[i + 1..] {
-                collect_query_refs(&later_cte.query, &mut cte_refs);
-            }
-            referenced.extend(cte_refs);
-        }
-
         let mut issues = Vec::new();
-        for (i, cte) in with.cte_tables.iter().enumerate() {
-            let name_upper = cte.alias.name.value.to_uppercase();
-            if !referenced.contains(&name_upper) {
-                // Check if any later CTE references this one
-                let referenced_by_later = with.cte_tables[i + 1..].iter().any(|later| {
-                    let mut refs = HashSet::new();
-                    collect_query_refs(&later.query, &mut refs);
-                    refs.contains(&name_upper)
-                });
-                if referenced_by_later {
-                    continue;
-                }
-
-                let span = find_cte_name_span(&cte.alias.name, ctx);
-                let mut issue = Issue::warning(
-                    issue_codes::LINT_ST_003,
-                    format!(
-                        "CTE '{}' is defined but never referenced.",
-                        cte.alias.name.value
-                    ),
-                )
-                .with_statement(ctx.statement_index);
-                if let Some(s) = span {
-                    issue = issue.with_span(s);
-                }
-                issues.push(issue);
-            }
-        }
+        check_query_unused_ctes(query, ctx, &mut issues);
         issues
     }
 }
 
+/// Checks a query for unused CTEs, including nested WITH clauses inside CTE
+/// bodies.
+fn check_query_unused_ctes(query: &Query, ctx: &LintContext, issues: &mut Vec<Issue>) {
+    let with = match &query.with {
+        Some(w) => w,
+        None => {
+            // Even without a top-level WITH, the body may contain nested CTEs.
+            check_set_expr_for_nested_ctes(&query.body, ctx, issues);
+            return;
+        }
+    };
+
+    // Collect table references from the query body only (the body's own
+    // references, not inner CTE definitions which are a separate scope).
+    let mut referenced = HashSet::new();
+    collect_table_refs(&query.body, &mut referenced);
+    if let Some(order_by) = &query.order_by {
+        collect_order_by_refs(order_by, &mut referenced);
+    }
+
+    // Each CTE can reference earlier CTEs; collect those refs too.
+    for (i, cte) in with.cte_tables.iter().enumerate() {
+        let mut cte_refs = HashSet::new();
+        collect_query_refs(&cte.query, &mut cte_refs);
+        for later_cte in &with.cte_tables[i + 1..] {
+            collect_query_refs(&later_cte.query, &mut cte_refs);
+        }
+        referenced.extend(cte_refs);
+    }
+
+    for (i, cte) in with.cte_tables.iter().enumerate() {
+        let name_upper = cte.alias.name.value.to_uppercase();
+        if !referenced.contains(&name_upper) {
+            let referenced_by_later = with.cte_tables[i + 1..].iter().any(|later| {
+                let mut refs = HashSet::new();
+                collect_query_refs(&later.query, &mut refs);
+                refs.contains(&name_upper)
+            });
+            if referenced_by_later {
+                continue;
+            }
+
+            let span = find_cte_name_span(&cte.alias.name, ctx);
+            let mut issue = Issue::warning(
+                issue_codes::LINT_ST_003,
+                format!(
+                    "CTE '{}' is defined but never referenced.",
+                    cte.alias.name.value
+                ),
+            )
+            .with_statement(ctx.statement_index);
+            if let Some(s) = span {
+                issue = issue.with_span(s);
+            }
+            issues.push(issue);
+        }
+
+        // Recursively check nested CTEs inside this CTE's body.
+        check_query_unused_ctes(&cte.query, ctx, issues);
+    }
+
+    // Also check nested CTEs in the main body (e.g. subqueries with WITH).
+    check_set_expr_for_nested_ctes(&query.body, ctx, issues);
+}
+
+/// Walks a set expression looking for nested queries that might contain WITH
+/// clauses to check.
+fn check_set_expr_for_nested_ctes(expr: &SetExpr, ctx: &LintContext, issues: &mut Vec<Issue>) {
+    match expr {
+        SetExpr::Select(select) => {
+            for item in &select.from {
+                check_relation_for_nested_ctes(&item.relation, ctx, issues);
+                for join in &item.joins {
+                    check_relation_for_nested_ctes(&join.relation, ctx, issues);
+                }
+            }
+            // Check subqueries in projections and predicates.
+            for item in &select.projection {
+                if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item
+                {
+                    check_expr_for_nested_ctes(e, ctx, issues);
+                }
+            }
+            if let Some(sel) = &select.selection {
+                check_expr_for_nested_ctes(sel, ctx, issues);
+            }
+        }
+        SetExpr::Query(q) => check_query_unused_ctes(q, ctx, issues),
+        SetExpr::SetOperation { left, right, .. } => {
+            check_set_expr_for_nested_ctes(left, ctx, issues);
+            check_set_expr_for_nested_ctes(right, ctx, issues);
+        }
+        _ => {}
+    }
+}
+
+/// Checks a DELETE statement for CTEs inside USING and FROM subqueries.
+fn check_delete_for_nested_ctes(delete: &Delete, ctx: &LintContext, issues: &mut Vec<Issue>) {
+    if let Some(using) = &delete.using {
+        for twj in using {
+            check_relation_for_nested_ctes(&twj.relation, ctx, issues);
+            for join in &twj.joins {
+                check_relation_for_nested_ctes(&join.relation, ctx, issues);
+            }
+        }
+    }
+    let from_tables = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+    };
+    for twj in from_tables {
+        check_relation_for_nested_ctes(&twj.relation, ctx, issues);
+        for join in &twj.joins {
+            check_relation_for_nested_ctes(&join.relation, ctx, issues);
+        }
+    }
+}
+
+fn check_relation_for_nested_ctes(
+    relation: &TableFactor,
+    ctx: &LintContext,
+    issues: &mut Vec<Issue>,
+) {
+    if let TableFactor::Derived { subquery, .. } = relation {
+        check_query_unused_ctes(subquery, ctx, issues);
+    }
+}
+
+fn check_expr_for_nested_ctes(expr: &Expr, ctx: &LintContext, issues: &mut Vec<Issue>) {
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            check_query_unused_ctes(q, ctx, issues);
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            check_query_unused_ctes(subquery, ctx, issues);
+            check_expr_for_nested_ctes(expr, ctx, issues);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            check_expr_for_nested_ctes(left, ctx, issues);
+            check_expr_for_nested_ctes(right, ctx, issues);
+        }
+        Expr::Nested(inner) => check_expr_for_nested_ctes(inner, ctx, issues),
+        _ => {}
+    }
+}
+
+/// Collects all table references from a query, including nested CTE bodies.
 fn collect_query_refs(query: &Query, refs: &mut HashSet<String>) {
+    if let Some(w) = &query.with {
+        for cte in &w.cte_tables {
+            collect_query_refs(&cte.query, refs);
+        }
+    }
     collect_table_refs(&query.body, refs);
     if let Some(order_by) = &query.order_by {
         collect_order_by_refs(order_by, refs);
@@ -116,6 +225,47 @@ fn collect_statement_refs(stmt: &Statement, refs: &mut HashSet<String>) {
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 collect_query_refs(query, refs);
+            }
+        }
+        Statement::Update {
+            table,
+            from,
+            selection,
+            ..
+        } => {
+            collect_relation_refs(&table.relation, refs);
+            for join in &table.joins {
+                collect_relation_refs(&join.relation, refs);
+                collect_join_constraint_refs(&join.join_operator, refs);
+            }
+            if let Some(from_kind) = from {
+                let tables = match from_kind {
+                    UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
+                };
+                for twj in tables {
+                    collect_relation_refs(&twj.relation, refs);
+                    for join in &twj.joins {
+                        collect_relation_refs(&join.relation, refs);
+                        collect_join_constraint_refs(&join.join_operator, refs);
+                    }
+                }
+            }
+            if let Some(sel) = selection {
+                collect_expr_table_refs(sel, refs);
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(using) = &delete.using {
+                for twj in using {
+                    collect_relation_refs(&twj.relation, refs);
+                    for join in &twj.joins {
+                        collect_relation_refs(&join.relation, refs);
+                        collect_join_constraint_refs(&join.join_operator, refs);
+                    }
+                }
+            }
+            if let Some(sel) = &delete.selection {
+                collect_expr_table_refs(sel, refs);
             }
         }
         _ => {}
@@ -497,5 +647,52 @@ mod tests {
     fn test_all_ctes_unused() {
         let issues = check_sql("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT 3");
         assert_eq!(issues.len(), 2);
+    }
+
+    #[test]
+    fn test_update_cte_used_in_from() {
+        // SQLFluff: test_pass_update_cte
+        let sql = "\
+            WITH cte AS (SELECT id, name, description FROM table1) \
+            UPDATE table2 SET name = cte.name, description = cte.description \
+            FROM cte WHERE table2.id = cte.id";
+        assert!(check_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn test_nested_cte_unused() {
+        // SQLFluff: test_fail_nested_cte
+        let sql = "WITH a AS (WITH b AS (SELECT 1 FROM foo) SELECT 1) SELECT * FROM a";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("b"));
+    }
+
+    #[test]
+    fn test_nested_with_cte_used() {
+        // SQLFluff: test_pass_nested_with_cte
+        let sql = "\
+            WITH example_cte AS (SELECT 1), \
+            container_cte AS (\
+                WITH nested_cte AS (SELECT * FROM example_cte) \
+                SELECT * FROM nested_cte\
+            ) SELECT * FROM container_cte";
+        assert!(check_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn test_snowflake_delete_cte() {
+        // SQLFluff: test_snowflake_delete_cte
+        // CTE inside a derived table (USING subquery) is unused.
+        let sql = "\
+            DELETE FROM MYTABLE1 \
+            USING (\
+                WITH MYCTE AS (SELECT COLUMN2 FROM MYTABLE3) \
+                SELECT COLUMN3 FROM MYTABLE3\
+            ) X \
+            WHERE COLUMN1 = X.COLUMN3";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.to_uppercase().contains("MYCTE"));
     }
 }

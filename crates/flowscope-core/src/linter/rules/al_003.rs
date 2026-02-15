@@ -56,29 +56,39 @@ fn check_statement(
     issues: &mut Vec<Issue>,
 ) {
     match stmt {
-        Statement::Query(q) => check_query(q, ctx, allow_scalar, issues),
+        Statement::Query(q) => check_query(q, ctx, allow_scalar, issues, false),
         Statement::Insert(ins) => {
             if let Some(ref source) = ins.source {
-                check_query(source, ctx, allow_scalar, issues);
+                check_query(source, ctx, allow_scalar, issues, false);
             }
         }
-        Statement::CreateView { query, .. } => check_query(query, ctx, allow_scalar, issues),
+        Statement::CreateView { query, .. } => check_query(query, ctx, allow_scalar, issues, false),
         Statement::CreateTable(create) => {
             if let Some(ref q) = create.query {
-                check_query(q, ctx, allow_scalar, issues);
+                check_query(q, ctx, allow_scalar, issues, false);
             }
         }
         _ => {}
     }
 }
 
-fn check_query(query: &Query, ctx: &LintContext, allow_scalar: bool, issues: &mut Vec<Issue>) {
+fn check_query(
+    query: &Query,
+    ctx: &LintContext,
+    allow_scalar: bool,
+    issues: &mut Vec<Issue>,
+    has_cte_column_list: bool,
+) {
     if let Some(ref with) = query.with {
         for cte in &with.cte_tables {
-            check_query(&cte.query, ctx, allow_scalar, issues);
+            // When a CTE has an explicit column list like `cte(a, b)`, the inner
+            // SELECT's column names are bound to those names automatically, so
+            // requiring aliases would be noise.
+            let cte_has_columns = !cte.alias.columns.is_empty();
+            check_query(&cte.query, ctx, allow_scalar, issues, cte_has_columns);
         }
     }
-    check_set_expr(&query.body, ctx, allow_scalar, issues, false);
+    check_set_expr(&query.body, ctx, allow_scalar, issues, false, has_cte_column_list);
 }
 
 fn check_set_expr(
@@ -87,12 +97,18 @@ fn check_set_expr(
     allow_scalar: bool,
     issues: &mut Vec<Issue>,
     in_set_rhs: bool,
+    has_cte_column_list: bool,
 ) {
     match body {
         SetExpr::Select(select) => {
             // In set-operation RHS branches, output column names come from the left side.
             // Requiring aliases here creates noisy false positives on common UNION patterns.
             if in_set_rhs {
+                return;
+            }
+            // When a CTE has an explicit column list, the inner SELECT's column
+            // names are automatically overridden, so aliases are not required.
+            if has_cte_column_list {
                 return;
             }
 
@@ -114,10 +130,10 @@ fn check_set_expr(
                 }
             }
         }
-        SetExpr::Query(q) => check_query(q, ctx, allow_scalar, issues),
+        SetExpr::Query(q) => check_query(q, ctx, allow_scalar, issues, has_cte_column_list),
         SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr(left, ctx, allow_scalar, issues, false);
-            check_set_expr(right, ctx, allow_scalar, issues, true);
+            check_set_expr(left, ctx, allow_scalar, issues, false, has_cte_column_list);
+            check_set_expr(right, ctx, allow_scalar, issues, true, has_cte_column_list);
         }
         SetExpr::Insert(stmt)
         | SetExpr::Update(stmt)
@@ -128,11 +144,57 @@ fn check_set_expr(
 }
 
 /// Returns true if the expression is "computed" (not a simple column reference or literal).
+///
+/// Postgres-style `::` casts (`col::TYPE`) preserve the output column name,
+/// so they are treated as non-computed when the inner expression is a simple
+/// reference. Function-style `CAST()` produces implementation-dependent names
+/// and is still treated as computed.
 fn is_computed(expr: &Expr) -> bool {
-    !matches!(
-        expr,
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_)
-    )
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => false,
+        // `col::TYPE` preserves the column name — recurse into the inner expression.
+        Expr::Cast {
+            kind: CastKind::DoubleColon,
+            expr: inner,
+            ..
+        } => is_computed(inner),
+        // Parenthesized expression — check inner.
+        Expr::Nested(inner) => is_computed(inner),
+        // DuckDB `COLUMNS(...)` is a macro that expands to matching column
+        // references at query time. Wrapping it in another function
+        // (e.g. `MIN(COLUMNS(...))`) also expands dynamically, so there is
+        // no single computed column that needs an alias.
+        _ if contains_columns_macro(expr) => false,
+        _ => true,
+    }
+}
+
+/// Returns true when the expression tree contains a DuckDB `COLUMNS()`
+/// macro call at any depth.
+fn contains_columns_macro(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(func) => {
+            let is_columns = func.name.0.len() == 1
+                && func.name.0[0]
+                    .as_ident()
+                    .is_some_and(|id| id.value.eq_ignore_ascii_case("columns"));
+            if is_columns {
+                return true;
+            }
+            if let FunctionArguments::List(ref arg_list) = func.args {
+                arg_list.args.iter().any(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                        contains_columns_macro(e)
+                    }
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        Expr::Nested(inner) => contains_columns_macro(inner),
+        _ => false,
+    }
 }
 
 fn is_scalar_literal(expr: &Expr) -> bool {
@@ -322,5 +384,51 @@ mod tests {
         };
         let issues = check_sql_with_rule("SELECT 1 FROM t", ImplicitAlias::from_config(&config));
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn cast_only_column_is_not_computed() {
+        // SQLFluff: test_pass_column_exp_without_alias_if_only_cast
+        assert!(check_sql("SELECT foo_col::VARCHAR(28) , bar FROM blah").is_empty());
+    }
+
+    #[test]
+    fn double_cast_column_is_not_computed() {
+        // SQLFluff: test_pass_column_exp_without_alias_if_only_cast_inc_double_cast
+        assert!(check_sql("SELECT foo_col::INT::VARCHAR , bar FROM blah").is_empty());
+    }
+
+    #[test]
+    fn bracketed_cast_column_is_not_computed() {
+        // SQLFluff: test_pass_column_exp_without_alias_if_bracketed
+        assert!(check_sql("SELECT (foo_col::INT)::VARCHAR , bar FROM blah").is_empty());
+    }
+
+    #[test]
+    fn cte_with_column_list_skips_alias_check() {
+        // SQLFluff: test_pass_cte_column_list
+        let sql = "WITH cte(a, b) AS (SELECT col_a, min(col_b) FROM my_table GROUP BY 1) SELECT a, b FROM cte";
+        assert!(check_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn cast_wrapping_function_is_computed() {
+        // CAST(func()) still needs an alias since func() is computed.
+        assert_eq!(check_sql("SELECT CAST(COUNT(*) AS INT) FROM t").len(), 1);
+    }
+
+    #[test]
+    fn duckdb_columns_macro_ok() {
+        // SQLFluff: test_pass_duckdb_columns_expression
+        assert!(check_sql("SELECT COLUMNS(c -> c LIKE '%num%'), 1 AS x FROM numbers").is_empty());
+    }
+
+    #[test]
+    fn duckdb_nested_columns_macro_ok() {
+        // SQLFluff: test_pass_duckdb_nested_columns_expression
+        // MIN(COLUMNS(...)) expands dynamically — no single computed column.
+        assert!(
+            check_sql("SELECT MIN(COLUMNS(c -> c LIKE '%num%')), 1 AS x FROM numbers").is_empty()
+        );
     }
 }

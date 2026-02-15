@@ -201,8 +201,8 @@ Covers all remaining rules with smaller individual gaps. AM05 (20 gaps: 1 FP + 8
 - [ ] Fix CV12: 2 FN in `cv_012.rs`, fix 6 fix mismatches
 - [ ] Fix ST07: fix 6 fix mismatches in `st_007.rs`
 - [x] Fix ST08: 4 FN in `st_008.rs`, fix 4 fix mismatches — detection 7/7, fix 6/7, token-only detection
-- [ ] Fix ST03: 2 FP + 2 FN in `st_003.rs`
-- [ ] Fix AL03: 6 FP + 1 FN in `al_003.rs`
+- [x] Fix ST03: 2 FP + 2 FN in `st_003.rs` — detection 19/19 pass + 11/11 fail, UPDATE/DELETE/nested CTE support
+- [x] Fix AL03: 6 FP + 1 FN in `al_003.rs` — detection 16/16, DuckDB COLUMNS macro + DoubleColon cast + CTE column list
 - [ ] Fix AL09: 2 FP + 1 FN in `al_009.rs`, fix 5 fix mismatches
 - [ ] Fix remaining small-gap rules: CP04, CV02, CV03, CV05, CV07, RF01, RF02, AM04, AM07, AM08, LT07, LT08, LT10, LT11, LT13, LT15, AM02
 - [ ] Verify all remaining rules show 0 gaps in parity report

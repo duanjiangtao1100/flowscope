@@ -142,6 +142,11 @@ def extract_rule_configs(configs: dict | None) -> dict | None:
     if rules and isinstance(rules, dict):
         result = {k: v for k, v in rules.items() if isinstance(v, dict)}
 
+        # Map rules.allow_scalar → aliasing.expression.allow_scalar (AL03).
+        if "allow_scalar" in rules and not isinstance(rules["allow_scalar"], dict):
+            al03_cfg = result.setdefault("aliasing.expression", {})
+            al03_cfg.setdefault("allow_scalar", rules["allow_scalar"])
+
     # Map core.max_line_length → layout.long_lines.max_line_length.
     core = configs.get("core", {})
     if "max_line_length" in core:
