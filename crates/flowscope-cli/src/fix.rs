@@ -754,9 +754,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     {
         out = fix_case_style_consistency(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_CP_002) {
-        out = fix_identifier_capitalisation(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_TQ_002) {
         out = fix_tsql_procedure_begin_end(&out);
     }
@@ -931,6 +928,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CP_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
@@ -2498,78 +2496,6 @@ fn fix_case_style_consistency(sql: &str) -> String {
                 out.push_str(&token.to_ascii_lowercase());
             } else {
                 out.push_str(&token);
-            }
-            continue;
-        }
-
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-/// CP_002: lowercase unquoted identifiers (non-keyword tokens).
-fn fix_identifier_capitalisation(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if in_single {
-            out.push(chars[i]);
-            if chars[i] == '\'' {
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    out.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_double {
-            out.push(chars[i]);
-            if chars[i] == '"' {
-                if i + 1 < chars.len() && chars[i + 1] == '"' {
-                    out.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '\'' {
-            in_single = true;
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '"' {
-            in_double = true;
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        // Collect word tokens and lowercase only non-keyword identifiers
-        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
-            let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let token: String = chars[start..i].iter().collect();
-            if is_sql_keyword(&token) {
-                out.push_str(&token);
-            } else {
-                out.push_str(&token.to_ascii_lowercase());
             }
             continue;
         }
@@ -7055,65 +6981,6 @@ mod tests {
                 out.sql
             );
         }
-    }
-
-    // --- CP_002: identifier capitalisation ---
-
-    #[test]
-    fn cp002_lowercases_mixed_case_identifiers() {
-        let fixed = fix_identifier_capitalisation("SELECT MyCol, Another_COL FROM my_table");
-        assert_eq!(fixed, "SELECT mycol, another_col FROM my_table");
-    }
-
-    #[test]
-    fn cp002_preserves_sql_keywords() {
-        let fixed = fix_identifier_capitalisation("SELECT col FROM t WHERE col IS NOT NULL");
-        assert!(
-            fixed.contains("WHERE"),
-            "keyword WHERE should be preserved: {fixed}"
-        );
-        assert!(
-            fixed.contains("IS"),
-            "keyword IS should be preserved: {fixed}"
-        );
-        assert!(
-            fixed.contains("NOT"),
-            "keyword NOT should be preserved: {fixed}"
-        );
-        assert!(
-            fixed.contains("NULL"),
-            "keyword NULL should be preserved: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp002_preserves_double_quoted_identifiers() {
-        let fixed = fix_identifier_capitalisation("SELECT \"CamelCase\", \"FROM\" FROM t");
-        assert!(
-            fixed.contains("\"CamelCase\""),
-            "quoted identifier should be unchanged: {fixed}"
-        );
-        assert!(
-            fixed.contains("\"FROM\""),
-            "quoted keyword identifier should be unchanged: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp002_preserves_single_quoted_strings() {
-        let fixed = fix_identifier_capitalisation("SELECT 'HelloWorld' FROM t");
-        assert!(
-            fixed.contains("'HelloWorld'"),
-            "string literal should be unchanged: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp002_is_idempotent() {
-        let sql = "SELECT mycol, another_col FROM t WHERE col IS NOT NULL";
-        let first = fix_identifier_capitalisation(sql);
-        let second = fix_identifier_capitalisation(&first);
-        assert_eq!(first, second, "second pass should produce identical output");
     }
 
     // --- CV_012: implicit WHERE join → explicit ON ---
