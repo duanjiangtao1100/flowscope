@@ -730,9 +730,6 @@ fn try_core_only_fix_plan(
 fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> String {
     let mut out = sql.to_string();
 
-    if rule_filter.allows(issue_codes::LINT_LT_002) {
-        out = fix_indentation(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
     }
@@ -943,10 +940,19 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_001)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_003)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_004)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_006)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_007)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_008)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_009)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_010)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_011)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_013)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
@@ -1642,120 +1648,6 @@ where
     }
 
     out
-}
-
-/// Normalize leading indentation: strip first-line indent, round indent widths
-/// to multiples of `indent_unit` (default 4 spaces), and normalize mixed
-/// tabs/spaces to consistent spaces.
-fn fix_indentation(sql: &str) -> String {
-    const INDENT_UNIT: usize = 4;
-    const TAB_SPACE_SIZE: usize = 4;
-
-    let mut out = String::with_capacity(sql.len());
-    let mut line_idx = 0usize;
-
-    // Track string-literal state so we don't modify content inside quotes.
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut at_line_start = true;
-    let mut line_buf = String::new();
-
-    for ch in sql.chars() {
-        if ch == '\n' {
-            if at_line_start {
-                // Line is all whitespace — preserve as-is.
-                out.push_str(&line_buf);
-            } else {
-                // Non-blank line: normalize leading whitespace.
-                let normalized =
-                    normalize_line_indent(&line_buf, line_idx, INDENT_UNIT, TAB_SPACE_SIZE);
-                out.push_str(&normalized);
-            }
-            out.push('\n');
-            line_idx += 1;
-            line_buf.clear();
-            at_line_start = true;
-            in_single = false;
-            in_double = false;
-            continue;
-        }
-
-        line_buf.push(ch);
-
-        if at_line_start && !ch.is_whitespace() {
-            at_line_start = false;
-        }
-
-        // Track quote state to skip content inside string literals.
-        if !in_double && ch == '\'' {
-            in_single = !in_single;
-        } else if !in_single && ch == '"' {
-            in_double = !in_double;
-        }
-    }
-
-    // Handle last line (no trailing newline).
-    if !line_buf.is_empty() {
-        if at_line_start {
-            out.push_str(&line_buf);
-        } else {
-            let normalized =
-                normalize_line_indent(&line_buf, line_idx, INDENT_UNIT, TAB_SPACE_SIZE);
-            out.push_str(&normalized);
-        }
-    }
-
-    out
-}
-
-fn normalize_line_indent(
-    line: &str,
-    line_idx: usize,
-    indent_unit: usize,
-    tab_space_size: usize,
-) -> String {
-    let mut width = 0usize;
-    let mut end_of_ws = 0usize;
-    for (i, ch) in line.char_indices() {
-        match ch {
-            ' ' => width += 1,
-            '\t' => width += tab_space_size,
-            _ => {
-                end_of_ws = i;
-                break;
-            }
-        }
-        end_of_ws = i + ch.len_utf8();
-    }
-
-    // First line: strip all leading whitespace.
-    if line_idx == 0 {
-        return line[end_of_ws..].to_string();
-    }
-
-    // No indent — nothing to normalize.
-    if width == 0 {
-        return line.to_string();
-    }
-
-    // Round to nearest multiple of indent_unit.
-    let rounded = if width.is_multiple_of(indent_unit) {
-        width
-    } else {
-        let down = (width / indent_unit) * indent_unit;
-        let up = down + indent_unit;
-        // Round to nearest; prefer up when equidistant and down would be 0.
-        if down == 0 {
-            up
-        } else if width - down <= up - width {
-            down
-        } else {
-            up
-        }
-    };
-
-    let spaces: String = " ".repeat(rounded);
-    format!("{}{}", spaces, &line[end_of_ws..])
 }
 
 /// Maximum line length before `fix_long_lines` will attempt to split.
@@ -7492,61 +7384,5 @@ mod tests {
             out2.sql.trim_end_matches('\n'),
             "second pass should be idempotent aside from LT012 trailing-newline normalization"
         );
-    }
-
-    // --- LT_002: indentation normalization ---
-
-    #[test]
-    fn lt002_rounds_odd_indent_to_4() {
-        let fixed = fix_indentation("SELECT a\n   , b\nFROM t");
-        assert_eq!(fixed, "SELECT a\n    , b\nFROM t");
-    }
-
-    #[test]
-    fn lt002_strips_first_line_indent() {
-        let fixed = fix_indentation("   SELECT 1");
-        assert_eq!(fixed, "SELECT 1");
-    }
-
-    #[test]
-    fn lt002_normalizes_tabs_to_spaces() {
-        let fixed = fix_indentation("SELECT a\n\t, b\nFROM t");
-        assert_eq!(fixed, "SELECT a\n    , b\nFROM t");
-    }
-
-    #[test]
-    fn lt002_preserves_blank_lines() {
-        let fixed = fix_indentation("SELECT a\n\n    , b\nFROM t");
-        assert_eq!(fixed, "SELECT a\n\n    , b\nFROM t");
-    }
-
-    #[test]
-    fn lt002_preserves_string_literal_content() {
-        let sql = "SELECT 'hello\n   world' FROM t";
-        let fixed = fix_indentation(sql);
-        // The fix only changes leading whitespace per line; the 3-space indent
-        // on the continuation line inside a string literal is rounded to 4.
-        // However string content spanning lines is tricky — the fixer operates
-        // line-by-line so the inner line may be adjusted.  This test ensures
-        // no crash and the overall structure is preserved.
-        assert!(
-            fixed.contains("hello"),
-            "content should be preserved: {fixed}"
-        );
-    }
-
-    #[test]
-    fn lt002_idempotent() {
-        let sql = "SELECT a\n   , b\nFROM t";
-        let first = fix_indentation(sql);
-        let second = fix_indentation(&first);
-        assert_eq!(first, second, "second pass should produce identical output");
-    }
-
-    #[test]
-    fn lt002_no_change_on_correct_indent() {
-        let sql = "SELECT a\n    , b\nFROM t";
-        let fixed = fix_indentation(sql);
-        assert_eq!(fixed, sql, "correctly indented SQL should be unchanged");
     }
 }
