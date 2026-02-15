@@ -511,6 +511,29 @@ async fn lint_fix_applies_al009_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_st001_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT CASE WHEN x > 1 THEN 'a' ELSE NULL END FROM t\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT CASE WHEN x > 1 THEN 'a' END FROM t\n",
+        "expected ST001 core autofix to remove redundant ELSE NULL branch"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_am001_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

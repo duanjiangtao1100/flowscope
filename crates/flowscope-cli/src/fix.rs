@@ -12,8 +12,8 @@ use crate::fix_engine::{
 };
 use flowscope_core::linter::config::canonicalize_rule_code;
 use flowscope_core::{
-    analyze, issue_codes, linter::helpers as lint_helpers, parse_sql_with_dialect, AnalysisOptions,
-    AnalyzeRequest, Dialect, Issue, IssueAutofixApplicability, LintConfig, ParseError,
+    analyze, issue_codes, parse_sql_with_dialect, AnalysisOptions, AnalyzeRequest, Dialect, Issue,
+    IssueAutofixApplicability, LintConfig, ParseError,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
@@ -828,6 +828,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_013)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_008)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
@@ -3594,18 +3595,6 @@ fn fix_expr(expr: &mut Expr, rule_filter: &RuleFilter) {
     if rule_filter.allows(issue_codes::LINT_ST_002) {
         if let Some(rewritten) = simple_case_rewrite(expr) {
             *expr = rewritten;
-        }
-    }
-
-    if let Expr::Case {
-        else_result: Some(else_result),
-        ..
-    } = expr
-    {
-        if rule_filter.allows(issue_codes::LINT_ST_001) && lint_helpers::is_null_expr(else_result) {
-            if let Expr::Case { else_result, .. } = expr {
-                *else_result = None;
-            }
         }
     }
 }
