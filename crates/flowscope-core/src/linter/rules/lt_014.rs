@@ -33,7 +33,10 @@ impl LintRule for LayoutKeywordNewline {
         };
 
         let keyword_span = ctx.span_from_statement_offset(keyword_start, keyword_end);
-        let insert_span = ctx.span_from_statement_offset(keyword_start, keyword_start);
+
+        // Replace preceding whitespace with newline to avoid trailing whitespace.
+        let ws_start = ctx.statement_sql()[..keyword_start].trim_end().len();
+        let replace_span = ctx.span_from_statement_offset(ws_start, keyword_start);
         vec![Issue::info(
             issue_codes::LINT_LT_014,
             "Major clauses should be consistently line-broken.",
@@ -42,7 +45,7 @@ impl LintRule for LayoutKeywordNewline {
         .with_span(keyword_span)
         .with_autofix_edits(
             IssueAutofixApplicability::Safe,
-            vec![IssuePatchEdit::new(insert_span, "\n")],
+            vec![IssuePatchEdit::new(replace_span, "\n")],
         )]
     }
 }

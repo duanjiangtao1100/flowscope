@@ -159,6 +159,21 @@ impl Linter {
                                     }
                                     _ => (document.sql, statement.statement_range.clone()),
                                 }
+                            } else if rule.code() == crate::types::issue_codes::LINT_LT_001 {
+                                // LT01 needs trailing whitespace visible so it can
+                                // detect and fix trailing spaces/tabs on lines.
+                                // The normal statement range trims whitespace, so
+                                // extend it to include trailing whitespace up to
+                                // the next newline (inclusive).
+                                let range = extend_range_with_trailing_whitespace(
+                                    document.sql,
+                                    &statement.statement_range,
+                                    next_statement_start(
+                                        &document.statements,
+                                        statement.statement_index,
+                                    ),
+                                );
+                                (document.sql, range)
                             } else {
                                 (document.sql, statement.statement_range.clone())
                             };
@@ -212,6 +227,45 @@ impl Linter {
         );
         self.check_document(&document)
     }
+}
+
+/// Extends a statement range to include trailing whitespace (spaces, tabs) and
+/// the terminating newline. This is used by LT01 so it can detect and fix
+/// trailing whitespace that `trim_statement_range` normally strips.
+fn extend_range_with_trailing_whitespace(
+    sql: &str,
+    range: &std::ops::Range<usize>,
+    next_start: Option<usize>,
+) -> std::ops::Range<usize> {
+    let bytes = sql.as_bytes();
+    let limit = next_start.unwrap_or(sql.len());
+    let mut end = range.end;
+    while end < limit {
+        match bytes[end] {
+            b' ' | b'\t' => end += 1,
+            b'\n' => {
+                end += 1;
+                break;
+            }
+            b'\r' => {
+                end += 1;
+                if end < limit && bytes[end] == b'\n' {
+                    end += 1;
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    range.start..end
+}
+
+/// Returns the start byte of the next statement's range, if any.
+fn next_statement_start(statements: &[LintStatement], current_index: usize) -> Option<usize> {
+    statements
+        .iter()
+        .find(|s| s.statement_index == current_index + 1)
+        .map(|s| s.statement_range.start)
 }
 
 fn normalize_issues(mut issues: Vec<Issue>) -> Vec<Issue> {
