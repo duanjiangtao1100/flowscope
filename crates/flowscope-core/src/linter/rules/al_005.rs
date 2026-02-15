@@ -106,13 +106,14 @@ impl LintRule for UnusedTableAlias {
         }
 
         if let Some(first_issue) = issues.first_mut() {
-            let autofix_edits: Vec<IssuePatchEdit> =
-                al005_legacy_autofix_edits(ctx.statement_sql())
-                    .into_iter()
-                    .map(|(start, end)| {
-                        IssuePatchEdit::new(ctx.span_from_statement_offset(start, end), "")
-                    })
-                    .collect();
+            let autofix_edits: Vec<IssuePatchEdit> = al005_legacy_autofix_edits(
+                ctx.statement_sql(),
+                ctx.dialect(),
+                self.alias_case_check,
+            )
+            .into_iter()
+            .map(|(start, end)| IssuePatchEdit::new(ctx.span_from_statement_offset(start, end), ""))
+            .collect();
             if !autofix_edits.is_empty() {
                 *first_issue = first_issue
                     .clone()
@@ -642,7 +643,10 @@ fn collect_identifier_prefixes(
                 }
             }
         }
-        Expr::IsNull(inner) | Expr::IsNotNull(inner) | Expr::Cast { expr: inner, .. } => {
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::JsonAccess { value: inner, .. } => {
             collect_identifier_prefixes(inner, dialect, prefixes);
         }
         Expr::Case {
@@ -999,7 +1003,10 @@ fn normalize_naked_identifier_for_dialect(identifier: &str, dialect: Dialect) ->
 }
 
 fn quoted_identifiers_case_insensitive_for_dialect(dialect: Dialect) -> bool {
-    matches!(dialect, Dialect::Duckdb | Dialect::Hive | Dialect::Sqlite)
+    matches!(
+        dialect,
+        Dialect::Duckdb | Dialect::Hive | Dialect::Sqlite | Dialect::Databricks
+    )
 }
 
 fn normalize_case_for_mode(reference: &QualifierRef, mode: AliasCaseCheck) -> String {
@@ -1100,6 +1107,7 @@ struct LegacySimpleTableAliasDecl {
     table_end: usize,
     alias_end: usize,
     alias: String,
+    quoted: bool,
 }
 
 #[derive(Clone)]
@@ -1108,8 +1116,12 @@ struct LegacyLocatedToken {
     end: usize,
 }
 
-fn al005_legacy_autofix_edits(sql: &str) -> Vec<(usize, usize)> {
-    let Some(decls) = legacy_collect_simple_table_alias_declarations(sql, Dialect::Generic) else {
+fn al005_legacy_autofix_edits(
+    sql: &str,
+    dialect: Dialect,
+    alias_case_check: AliasCaseCheck,
+) -> Vec<(usize, usize)> {
+    let Some(decls) = legacy_collect_simple_table_alias_declarations(sql, dialect) else {
         return Vec::new();
     };
     if decls.is_empty() {
@@ -1126,7 +1138,13 @@ fn al005_legacy_autofix_edits(sql: &str) -> Vec<(usize, usize)> {
         if legacy_is_sql_keyword(&decl.alias) || legacy_is_generated_alias_identifier(&decl.alias) {
             continue;
         }
-        if legacy_contains_alias_qualifier(sql, &decl.alias) {
+        if legacy_contains_alias_qualifier_dialect(
+            sql,
+            &decl.alias,
+            decl.quoted,
+            dialect,
+            alias_case_check,
+        ) {
             continue;
         }
 
@@ -1160,61 +1178,118 @@ fn legacy_collect_simple_table_alias_declarations(
             continue;
         }
 
-        let Some(mut cursor) = legacy_next_non_trivia_token(&tokens, index + 1) else {
+        // Parse first table item after FROM/JOIN.
+        let Some(next) = legacy_next_non_trivia_token(&tokens, index + 1) else {
             index += 1;
             continue;
         };
-        if legacy_token_simple_identifier(&tokens[cursor].token).is_none() {
-            index += 1;
-            continue;
-        }
+        index = legacy_try_parse_table_item(&tokens, next, &mut out);
 
-        let mut table_end = tokens[cursor].end;
-        cursor += 1;
-
+        // Handle comma-separated table items (FROM t1, t2, LATERAL f(...) AS x).
         loop {
-            let Some(dot_index) = legacy_next_non_trivia_token(&tokens, cursor) else {
+            let Some(comma_index) = legacy_next_non_trivia_token(&tokens, index) else {
                 break;
             };
-            if !matches!(tokens[dot_index].token, Token::Period) {
+            if !matches!(tokens[comma_index].token, Token::Comma) {
                 break;
             }
-            let Some(next_index) = legacy_next_non_trivia_token(&tokens, dot_index + 1) else {
+            let Some(next_item) = legacy_next_non_trivia_token(&tokens, comma_index + 1) else {
+                index = comma_index + 1;
                 break;
             };
-            if legacy_token_simple_identifier(&tokens[next_index].token).is_none() {
-                break;
-            }
-            table_end = tokens[next_index].end;
-            cursor = next_index + 1;
+            index = legacy_try_parse_table_item(&tokens, next_item, &mut out);
         }
-
-        let Some(mut alias_index) = legacy_next_non_trivia_token(&tokens, cursor) else {
-            index += 1;
-            continue;
-        };
-        if legacy_token_matches_keyword(&tokens[alias_index].token, "AS") {
-            let Some(next_index) = legacy_next_non_trivia_token(&tokens, alias_index + 1) else {
-                index += 1;
-                continue;
-            };
-            alias_index = next_index;
-        }
-
-        let Some(alias_value) = legacy_token_simple_identifier(&tokens[alias_index].token) else {
-            index += 1;
-            continue;
-        };
-
-        out.push(LegacySimpleTableAliasDecl {
-            table_end,
-            alias_end: tokens[alias_index].end,
-            alias: alias_value.to_string(),
-        });
-        index = alias_index + 1;
     }
 
     Some(out)
+}
+
+/// Try to parse a single table item (table reference or LATERAL function call) starting
+/// at token `start`. Returns the next token index to continue scanning from.
+fn legacy_try_parse_table_item(
+    tokens: &[LegacyLocatedToken],
+    start: usize,
+    out: &mut Vec<LegacySimpleTableAliasDecl>,
+) -> usize {
+    if start >= tokens.len() {
+        return start;
+    }
+
+    // Handle LATERAL function(...) AS alias pattern.
+    if legacy_token_matches_keyword(&tokens[start].token, "LATERAL") {
+        if let Some(func_end) = legacy_skip_lateral_function_call(tokens, start + 1) {
+            let Some(mut alias_index) = legacy_next_non_trivia_token(tokens, func_end) else {
+                return func_end;
+            };
+            if legacy_token_matches_keyword(&tokens[alias_index].token, "AS") {
+                let Some(next_index) = legacy_next_non_trivia_token(tokens, alias_index + 1) else {
+                    return alias_index + 1;
+                };
+                alias_index = next_index;
+            }
+            if let Some((alias_value, alias_quoted)) =
+                legacy_token_any_identifier(&tokens[alias_index].token)
+            {
+                out.push(LegacySimpleTableAliasDecl {
+                    table_end: tokens[func_end - 1].end,
+                    alias_end: tokens[alias_index].end,
+                    alias: alias_value.to_string(),
+                    quoted: alias_quoted,
+                });
+                return alias_index + 1;
+            }
+            return func_end;
+        }
+        return start + 1;
+    }
+
+    // Table name: identifier(.identifier)*
+    if legacy_token_any_identifier(&tokens[start].token).is_none() {
+        return start + 1;
+    }
+
+    let mut table_end = tokens[start].end;
+    let mut cursor = start + 1;
+
+    loop {
+        let Some(dot_index) = legacy_next_non_trivia_token(tokens, cursor) else {
+            break;
+        };
+        if !matches!(tokens[dot_index].token, Token::Period) {
+            break;
+        }
+        let Some(next_index) = legacy_next_non_trivia_token(tokens, dot_index + 1) else {
+            break;
+        };
+        if legacy_token_any_identifier(&tokens[next_index].token).is_none() {
+            break;
+        }
+        table_end = tokens[next_index].end;
+        cursor = next_index + 1;
+    }
+
+    let Some(mut alias_index) = legacy_next_non_trivia_token(tokens, cursor) else {
+        return cursor;
+    };
+    if legacy_token_matches_keyword(&tokens[alias_index].token, "AS") {
+        let Some(next_index) = legacy_next_non_trivia_token(tokens, alias_index + 1) else {
+            return alias_index + 1;
+        };
+        alias_index = next_index;
+    }
+
+    let Some((alias_value, alias_quoted)) = legacy_token_any_identifier(&tokens[alias_index].token)
+    else {
+        return cursor;
+    };
+
+    out.push(LegacySimpleTableAliasDecl {
+        table_end,
+        alias_end: tokens[alias_index].end,
+        alias: alias_value.to_string(),
+        quoted: alias_quoted,
+    });
+    alias_index + 1
 }
 
 fn legacy_tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LegacyLocatedToken>> {
@@ -1285,6 +1360,34 @@ fn legacy_next_non_trivia_token(tokens: &[LegacyLocatedToken], mut start: usize)
     None
 }
 
+/// Skip past `FUNCTION_NAME(...)` after LATERAL keyword.
+/// Returns the token index right after the closing `)`, or None if not found.
+fn legacy_skip_lateral_function_call(tokens: &[LegacyLocatedToken], start: usize) -> Option<usize> {
+    // Expect: function_name ( ... )
+    let func_index = legacy_next_non_trivia_token(tokens, start)?;
+    legacy_token_any_identifier(&tokens[func_index].token)?;
+    let lparen_index = legacy_next_non_trivia_token(tokens, func_index + 1)?;
+    if !matches!(tokens[lparen_index].token, Token::LParen) {
+        return None;
+    }
+    // Find matching closing paren, handling nesting.
+    let mut depth = 1u32;
+    let mut cursor = lparen_index + 1;
+    while cursor < tokens.len() && depth > 0 {
+        match &tokens[cursor].token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if depth == 0 {
+        Some(cursor)
+    } else {
+        None
+    }
+}
+
 fn legacy_is_trivia_token(token: &Token) -> bool {
     matches!(
         token,
@@ -1302,46 +1405,125 @@ fn legacy_token_matches_keyword(token: &Token, keyword: &str) -> bool {
     matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(keyword))
 }
 
-fn legacy_token_simple_identifier(token: &Token) -> Option<&str> {
+/// Extract identifier value from any token type (unquoted, single-quoted,
+/// double-quoted, backtick-quoted). Returns (value, is_quoted).
+fn legacy_token_any_identifier(token: &Token) -> Option<(&str, bool)> {
     match token {
-        Token::Word(word) if legacy_is_simple_identifier(&word.value) => Some(&word.value),
+        Token::Word(word) if legacy_is_simple_identifier(&word.value) => {
+            if word.quote_style.is_some() {
+                Some((&word.value, true))
+            } else {
+                Some((&word.value, false))
+            }
+        }
+        Token::SingleQuotedString(s) => Some((s.as_str(), true)),
         _ => None,
     }
 }
 
-fn legacy_contains_alias_qualifier(sql: &str, alias: &str) -> bool {
+fn legacy_contains_alias_qualifier_dialect(
+    sql: &str,
+    alias: &str,
+    alias_quoted: bool,
+    dialect: Dialect,
+    alias_case_check: AliasCaseCheck,
+) -> bool {
     let alias_bytes = alias.as_bytes();
     if alias_bytes.is_empty() {
         return false;
     }
 
+    // Build the normalized alias for comparison, respecting the dialect/config.
+    let normalized_alias = match alias_case_check {
+        AliasCaseCheck::Dialect => normalize_identifier_for_dialect(alias, alias_quoted, dialect),
+        AliasCaseCheck::CaseInsensitive => alias.to_ascii_lowercase(),
+        AliasCaseCheck::CaseSensitive => alias.to_string(),
+        AliasCaseCheck::QuotedCsNakedUpper => {
+            if alias_quoted {
+                alias.to_string()
+            } else {
+                alias.to_ascii_uppercase()
+            }
+        }
+        AliasCaseCheck::QuotedCsNakedLower => {
+            if alias_quoted {
+                alias.to_string()
+            } else {
+                alias.to_ascii_lowercase()
+            }
+        }
+    };
+
     let bytes = sql.as_bytes();
     let mut index = 0usize;
-    while index + alias_bytes.len() < bytes.len() {
-        if !legacy_is_word_boundary_for_keyword(bytes, index.saturating_sub(1)) {
+    while index < bytes.len() {
+        // Skip past quote characters to handle quoted qualifiers like "A".col
+        let (ref_name, ref_quoted, ref_end) = if index < bytes.len()
+            && (bytes[index] == b'"' || bytes[index] == b'`' || bytes[index] == b'[')
+        {
+            let close_char = match bytes[index] {
+                b'"' => b'"',
+                b'`' => b'`',
+                b'[' => b']',
+                _ => unreachable!(),
+            };
+            let start = index + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != close_char {
+                end += 1;
+            }
+            if end >= bytes.len() {
+                index += 1;
+                continue;
+            }
+            let name = &sql[start..end];
+            // end points to the closing quote; advance past it
+            (name.to_string(), true, end + 1)
+        } else if index < bytes.len() && legacy_is_ascii_ident_start(bytes[index]) {
+            let start = index;
+            let mut end = start;
+            while end < bytes.len() && legacy_is_ascii_ident_continue(bytes[end]) {
+                end += 1;
+            }
+            let name = &sql[start..end];
+            (name.to_string(), false, end)
+        } else {
             index += 1;
             continue;
+        };
+
+        // Check if followed by '.'
+        if ref_end < bytes.len() && bytes[ref_end] == b'.' {
+            let normalized_ref = match alias_case_check {
+                AliasCaseCheck::Dialect => {
+                    normalize_identifier_for_dialect(&ref_name, ref_quoted, dialect)
+                }
+                AliasCaseCheck::CaseInsensitive => ref_name.to_ascii_lowercase(),
+                AliasCaseCheck::CaseSensitive => ref_name.clone(),
+                AliasCaseCheck::QuotedCsNakedUpper => {
+                    if ref_quoted {
+                        ref_name.clone()
+                    } else {
+                        ref_name.to_ascii_uppercase()
+                    }
+                }
+                AliasCaseCheck::QuotedCsNakedLower => {
+                    if ref_quoted {
+                        ref_name.clone()
+                    } else {
+                        ref_name.to_ascii_lowercase()
+                    }
+                }
+            };
+            if normalized_ref == normalized_alias {
+                return true;
+            }
         }
 
-        let end = index + alias_bytes.len();
-        if end < bytes.len()
-            && bytes[end] == b'.'
-            && bytes[index..end]
-                .iter()
-                .zip(alias_bytes.iter())
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        {
-            return true;
-        }
-
-        index += 1;
+        index = if ref_end > index { ref_end } else { index + 1 };
     }
 
     false
-}
-
-fn legacy_is_word_boundary_for_keyword(bytes: &[u8], index: usize) -> bool {
-    index == 0 || index >= bytes.len() || !legacy_is_ascii_ident_continue(bytes[index])
 }
 
 fn legacy_is_generated_alias_identifier(alias: &str) -> bool {
@@ -2050,5 +2232,60 @@ mod tests {
              CROSS JOIN sys.objects c",
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn dialect_mode_databricks_allows_backtick_case_insensitive_reference() {
+        let issues =
+            check_sql_in_dialect("SELECT `a`.col_1 FROM table_a AS A", Dialect::Databricks);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn snowflake_json_access_counts_as_alias_usage() {
+        let issues = check_sql_in_dialect(
+            "SELECT r.rec:foo::string FROM foo.bar AS r",
+            Dialect::Snowflake,
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn snowflake_lateral_flatten_unused_alias_detected_and_fixable() {
+        let sql = "SELECT r.rec:foo::string, value:bar::string \
+                   FROM foo.bar AS r, LATERAL FLATTEN(input => rec:result) AS x";
+        let issues = check_sql_in_dialect(sql, Dialect::Snowflake);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("x"));
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert!(
+            !fixed.contains("AS x"),
+            "autofix should remove the unused LATERAL alias"
+        );
+    }
+
+    #[test]
+    fn autofix_removes_double_quoted_alias_in_dialect_mode() {
+        let sql = "SELECT a.col_1\nFROM table_a AS \"A\"\n";
+        let issues = check_sql_in_dialect(sql, Dialect::Postgres);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].message.contains("A"));
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a.col_1\nFROM table_a\n");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+    }
+
+    #[test]
+    fn autofix_removes_single_quoted_alias() {
+        let sql = "SELECT a.col1\nFROM tab1 as 'a'\n";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a.col1\nFROM tab1\n");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
     }
 }
