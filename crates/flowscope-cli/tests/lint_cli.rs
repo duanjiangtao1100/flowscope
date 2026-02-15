@@ -1374,8 +1374,10 @@ fn test_lint_fix_applies_cp002_core_autofix_in_patch_mode() {
     );
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    // Col refutes lower/upper, leaving capitalise. col then violates capitalise.
+    // Consistent policy resolves to capitalise, fixing all identifiers.
     assert_eq!(
-        after, "SELECT col, col FROM t\n",
+        after, "SELECT Col, Col FROM T\n",
         "Expected CP002 core autofix to normalize identifier capitalisation: {after:?}"
     );
 }

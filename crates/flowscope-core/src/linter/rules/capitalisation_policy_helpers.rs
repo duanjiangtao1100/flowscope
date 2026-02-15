@@ -139,30 +139,79 @@ fn token_matches_policy(token: &str, policy: CapitalisationPolicy) -> bool {
             }
             seen_alpha
         }
-        CapitalisationPolicy::Pascal => {
-            if token.contains('_') {
-                return false;
-            }
-            let mut chars = token.chars();
-            let Some(first) = chars.next() else {
-                return false;
-            };
-            first.is_ascii_uppercase()
-        }
-        CapitalisationPolicy::Camel => {
-            if token.contains('_') {
-                return false;
-            }
-            let mut chars = token.chars();
-            let Some(first) = chars.next() else {
-                return false;
-            };
-            first.is_ascii_lowercase() && token.chars().any(|ch| ch.is_ascii_uppercase())
-        }
-        CapitalisationPolicy::Snake => token
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+        // For pascal, camel, and snake we match SQLFluff's "fix-based detection":
+        // a token matches if applying the fix transformation would be a no-op.
+        CapitalisationPolicy::Pascal => token == apply_pascal_transform(token),
+        CapitalisationPolicy::Camel => token == apply_camel_transform(token),
+        CapitalisationPolicy::Snake => token == apply_snake_transform(token),
     }
+}
+
+/// Pascal-case transform: uppercase the first letter of each word at non-alphanumeric boundaries.
+fn apply_pascal_transform(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut at_word_start = true;
+    for ch in value.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            at_word_start = true;
+        } else if at_word_start {
+            out.push(ch.to_ascii_uppercase());
+            at_word_start = false;
+        } else {
+            out.push(ch);
+            at_word_start = false;
+        }
+    }
+    out
+}
+
+/// Camel-case transform: lowercase the first letter of each word at non-alphanumeric boundaries.
+fn apply_camel_transform(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut at_word_start = true;
+    for ch in value.chars() {
+        if !ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            at_word_start = true;
+        } else if at_word_start {
+            out.push(ch.to_ascii_lowercase());
+            at_word_start = false;
+        } else {
+            out.push(ch);
+            at_word_start = false;
+        }
+    }
+    out
+}
+
+/// Snake-case transform: insert underscores at camelCase and letter/digit boundaries, lowercase.
+fn apply_snake_transform(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 4);
+    let chars: Vec<char> = value.chars().collect();
+    let all_upper = chars
+        .iter()
+        .filter(|c| c.is_ascii_alphabetic())
+        .all(|c| c.is_ascii_uppercase());
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 {
+            let prev = chars[i - 1];
+            if !all_upper
+                && ch.is_ascii_uppercase()
+                && (prev.is_ascii_lowercase() || prev.is_ascii_digit())
+            {
+                out.push('_');
+            }
+            if ch.is_ascii_digit() && prev.is_ascii_alphabetic() {
+                out.push('_');
+            }
+            if ch.is_ascii_alphabetic() && prev.is_ascii_digit() {
+                out.push('_');
+            }
+        }
+        out.push(ch);
+    }
+    out.to_ascii_lowercase()
 }
 
 fn tokens_match_consistent_policy(tokens: &[String]) -> bool {

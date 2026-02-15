@@ -999,9 +999,11 @@ async fn lint_fix_applies_cp002_core_autofix_in_patch_mode() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["changed"], true);
+    // Col refutes lower/upper, leaving capitalise. col then violates capitalise.
+    // Consistent policy resolves to capitalise, fixing all identifiers.
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT col, col FROM t\n",
+        "SELECT Col, Col FROM T\n",
         "expected CP002 core autofix to normalize identifier capitalisation"
     );
 }
