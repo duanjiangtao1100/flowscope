@@ -955,7 +955,7 @@ async fn lint_fix_applies_cp001_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "select a from t\n",
+        "SELECT a FROM t\n",
         "expected CP001 core autofix to normalize keyword capitalisation"
     );
 }
@@ -978,7 +978,7 @@ async fn lint_fix_applies_cp003_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT count(*), sum(a) FROM t\n",
+        "SELECT COUNT(*), SUM(a) FROM t\n",
         "expected CP003 core autofix to normalize function capitalisation"
     );
 }
@@ -1049,7 +1049,7 @@ async fn lint_fix_applies_cp005_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "CREATE TABLE t (a int, b varchar(10))\n",
+        "CREATE TABLE t (a INT, b VARCHAR(10))\n",
         "expected CP005 core autofix to normalize type capitalisation"
     );
 }

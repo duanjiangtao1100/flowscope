@@ -1325,7 +1325,7 @@ fn test_lint_fix_applies_cp001_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "select a from t\n",
+        after, "SELECT a FROM t\n",
         "Expected CP001 core autofix to normalize keyword capitalisation: {after:?}"
     );
 }
@@ -1350,7 +1350,7 @@ fn test_lint_fix_applies_cp003_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT count(*), sum(a) FROM t\n",
+        after, "SELECT COUNT(*), SUM(a) FROM t\n",
         "Expected CP003 core autofix to normalize function capitalisation: {after:?}"
     );
 }
@@ -1427,7 +1427,7 @@ fn test_lint_fix_applies_cp005_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "CREATE TABLE t (a int, b varchar(10))\n",
+        after, "CREATE TABLE t (a INT, b VARCHAR(10))\n",
         "Expected CP005 core autofix to normalize type capitalisation: {after:?}"
     );
 }

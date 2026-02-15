@@ -198,10 +198,18 @@ fn type_autofix_edits(
     types: &[TypeCandidate],
     policy: CapitalisationPolicy,
 ) -> Vec<IssuePatchEdit> {
+    // For consistent mode, resolve to the first-seen concrete style.
+    let resolved_policy = if policy == CapitalisationPolicy::Consistent {
+        resolve_consistent_policy(types)
+    } else {
+        policy
+    };
+
     let mut edits = Vec::new();
 
     for candidate in types {
-        let Some(replacement) = type_case_replacement(candidate.value.as_str(), policy) else {
+        let Some(replacement) = type_case_replacement(candidate.value.as_str(), resolved_policy)
+        else {
             continue;
         };
         if replacement == candidate.value {
@@ -225,9 +233,11 @@ fn type_autofix_edits(
 
 fn type_case_replacement(value: &str, policy: CapitalisationPolicy) -> Option<String> {
     match policy {
-        CapitalisationPolicy::Consistent | CapitalisationPolicy::Lower => {
+        CapitalisationPolicy::Consistent => {
+            // Consistent mode is resolved before calling this function.
             Some(value.to_ascii_lowercase())
         }
+        CapitalisationPolicy::Lower => Some(value.to_ascii_lowercase()),
         CapitalisationPolicy::Upper => Some(value.to_ascii_uppercase()),
         CapitalisationPolicy::Capitalise => Some(capitalise_ascii_token(value)),
         // These policies are currently report-only in CP05 autofix scope.
@@ -235,6 +245,57 @@ fn type_case_replacement(value: &str, policy: CapitalisationPolicy) -> Option<St
         | CapitalisationPolicy::Camel
         | CapitalisationPolicy::Snake => None,
     }
+}
+
+/// Determine the concrete capitalisation style using SQLFluff's cumulative
+/// refutation algorithm (same as CP01). Refuted cases accumulate across
+/// type names: the first type that fully determines a style wins.
+fn resolve_consistent_policy(types: &[TypeCandidate]) -> CapitalisationPolicy {
+    const UPPER: u8 = 0b001;
+    const LOWER: u8 = 0b010;
+    const CAPITALISE: u8 = 0b100;
+
+    let mut refuted: u8 = 0;
+    let mut latest_possible = CapitalisationPolicy::Upper; // default
+
+    for typ in types {
+        let v = typ.value.as_str();
+
+        let first_is_lower = v
+            .chars()
+            .find(|c| c.is_ascii_alphabetic())
+            .is_some_and(|c| c.is_ascii_lowercase());
+
+        if first_is_lower {
+            refuted |= UPPER | CAPITALISE;
+            if v != v.to_ascii_lowercase() {
+                refuted |= LOWER;
+            }
+        } else {
+            refuted |= LOWER;
+            if v != v.to_ascii_uppercase() {
+                refuted |= UPPER;
+            }
+            if v != capitalise_ascii_token(v) {
+                refuted |= CAPITALISE;
+            }
+        }
+
+        let possible = (UPPER | LOWER | CAPITALISE) & !refuted;
+        if possible == 0 {
+            return latest_possible;
+        }
+
+        if possible & UPPER != 0 {
+            latest_possible = CapitalisationPolicy::Upper;
+        } else if possible & LOWER != 0 {
+            latest_possible = CapitalisationPolicy::Lower;
+        } else {
+            latest_possible = CapitalisationPolicy::Capitalise;
+        }
+    }
+
+    latest_possible
 }
 
 fn capitalise_ascii_token(value: &str) -> String {
@@ -438,7 +499,7 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "CREATE TABLE t (a int, b varchar(10))");
+        assert_eq!(fixed, "CREATE TABLE t (a INT, b VARCHAR(10))");
     }
 
     #[test]

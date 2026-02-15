@@ -130,6 +130,19 @@ fn function_candidates(
             continue;
         }
 
+        // Skip qualified function names (e.g. project1.foo) — these are
+        // user-defined and case-sensitive. Check if a period precedes this word.
+        if index > 0 && matches!(tokens[index - 1].token, Token::Period) {
+            continue;
+        }
+
+        // Skip data type names — they have their own rule (CP05). Without AST
+        // context we cannot distinguish `VARCHAR(10)` the type from a function
+        // call, so exclude known type keywords by name.
+        if is_data_type_keyword(word.value.as_str()) {
+            continue;
+        }
+
         let next_index = next_non_trivia_index(tokens, index + 1);
         let is_regular_function_call = next_index
             .map(|idx| matches!(tokens[idx].token, Token::LParen))
@@ -158,10 +171,19 @@ fn function_autofix_edits(
     functions: &[FunctionCandidate],
     policy: CapitalisationPolicy,
 ) -> Vec<IssuePatchEdit> {
+    // For consistent mode, resolve to the first-seen concrete style.
+    let resolved_policy = if policy == CapitalisationPolicy::Consistent {
+        resolve_consistent_policy(functions)
+    } else {
+        policy
+    };
+
     let mut edits = Vec::new();
 
     for candidate in functions {
-        let Some(replacement) = function_case_replacement(candidate.value.as_str(), policy) else {
+        let Some(replacement) =
+            function_case_replacement(candidate.value.as_str(), resolved_policy)
+        else {
             continue;
         };
         if replacement == candidate.value {
@@ -185,9 +207,11 @@ fn function_autofix_edits(
 
 fn function_case_replacement(value: &str, policy: CapitalisationPolicy) -> Option<String> {
     match policy {
-        CapitalisationPolicy::Consistent | CapitalisationPolicy::Lower => {
+        CapitalisationPolicy::Consistent => {
+            // Consistent mode is resolved before calling this function.
             Some(value.to_ascii_lowercase())
         }
+        CapitalisationPolicy::Lower => Some(value.to_ascii_lowercase()),
         CapitalisationPolicy::Upper => Some(value.to_ascii_uppercase()),
         CapitalisationPolicy::Capitalise => Some(capitalise_ascii_token(value)),
         // These policies are currently report-only in CP03 autofix scope.
@@ -195,6 +219,57 @@ fn function_case_replacement(value: &str, policy: CapitalisationPolicy) -> Optio
         | CapitalisationPolicy::Camel
         | CapitalisationPolicy::Snake => None,
     }
+}
+
+/// Determine the concrete capitalisation style using SQLFluff's cumulative
+/// refutation algorithm (same as CP01). Refuted cases accumulate across
+/// function names: the first function that fully determines a style wins.
+fn resolve_consistent_policy(functions: &[FunctionCandidate]) -> CapitalisationPolicy {
+    const UPPER: u8 = 0b001;
+    const LOWER: u8 = 0b010;
+    const CAPITALISE: u8 = 0b100;
+
+    let mut refuted: u8 = 0;
+    let mut latest_possible = CapitalisationPolicy::Upper; // default
+
+    for func in functions {
+        let v = func.value.as_str();
+
+        let first_is_lower = v
+            .chars()
+            .find(|c| c.is_ascii_alphabetic())
+            .is_some_and(|c| c.is_ascii_lowercase());
+
+        if first_is_lower {
+            refuted |= UPPER | CAPITALISE;
+            if v != v.to_ascii_lowercase() {
+                refuted |= LOWER;
+            }
+        } else {
+            refuted |= LOWER;
+            if v != v.to_ascii_uppercase() {
+                refuted |= UPPER;
+            }
+            if v != capitalise_ascii_token(v) {
+                refuted |= CAPITALISE;
+            }
+        }
+
+        let possible = (UPPER | LOWER | CAPITALISE) & !refuted;
+        if possible == 0 {
+            return latest_possible;
+        }
+
+        if possible & UPPER != 0 {
+            latest_possible = CapitalisationPolicy::Upper;
+        } else if possible & LOWER != 0 {
+            latest_possible = CapitalisationPolicy::Lower;
+        } else {
+            latest_possible = CapitalisationPolicy::Capitalise;
+        }
+    }
+
+    latest_possible
 }
 
 fn capitalise_ascii_token(value: &str) -> String {
@@ -296,6 +371,40 @@ fn is_bare_function_keyword(value: &str) -> bool {
     )
 }
 
+/// Data type keywords that can look like function calls (e.g. `VARCHAR(10)`)
+/// but belong to CP05's scope, not CP03's.
+fn is_data_type_keyword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "SMALLINT"
+            | "TINYINT"
+            | "VARCHAR"
+            | "CHAR"
+            | "TEXT"
+            | "BOOLEAN"
+            | "BOOL"
+            | "STRING"
+            | "INT64"
+            | "FLOAT64"
+            | "BYTES"
+            | "DATE"
+            | "TIME"
+            | "TIMESTAMP"
+            | "INTERVAL"
+            | "NUMERIC"
+            | "DECIMAL"
+            | "FLOAT"
+            | "DOUBLE"
+            | "STRUCT"
+            | "ARRAY"
+            | "MAP"
+            | "ENUM"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,7 +457,7 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT count(*), count(x) FROM t");
+        assert_eq!(fixed, "SELECT COUNT(*), COUNT(x) FROM t");
     }
 
     #[test]
