@@ -7,12 +7,12 @@ use std::collections::HashSet;
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue};
+use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use regex::{Regex, RegexBuilder};
 use sqlparser::ast::Statement;
 
 use super::identifier_candidates_helpers::{
-    collect_identifier_candidates, IdentifierCandidate, IdentifierPolicy,
+    collect_identifier_candidates, IdentifierCandidate, IdentifierKind, IdentifierPolicy,
 };
 
 pub struct ReferencesQuoting {
@@ -98,17 +98,141 @@ impl LintRule for ReferencesQuoting {
             .into_iter()
             .any(|candidate| candidate_triggers_rule(&candidate, self));
 
-        if has_violation {
-            let message = if self.prefer_quoted_identifiers {
-                "Identifiers should be quoted."
-            } else {
-                "Identifier quoting appears unnecessary."
-            };
-            vec![Issue::info(issue_codes::LINT_RF_006, message).with_statement(ctx.statement_index)]
-        } else {
-            Vec::new()
+        if !has_violation {
+            return Vec::new();
         }
+
+        let message = if self.prefer_quoted_identifiers {
+            "Identifiers should be quoted."
+        } else {
+            "Identifier quoting appears unnecessary."
+        };
+        let mut issue =
+            Issue::info(issue_codes::LINT_RF_006, message).with_statement(ctx.statement_index);
+
+        let autofix_edits = unnecessary_quoted_identifier_edits(ctx.statement_sql(), self)
+            .into_iter()
+            .map(|edit| {
+                IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit.start, edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !autofix_edits.is_empty() {
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+        }
+
+        vec![issue]
     }
+}
+
+struct Rf006AutofixEdit {
+    start: usize,
+    end: usize,
+    replacement: String,
+}
+
+fn unnecessary_quoted_identifier_edits(
+    sql: &str,
+    rule: &ReferencesQuoting,
+) -> Vec<Rf006AutofixEdit> {
+    if rule.prefer_quoted_identifiers || !rule.quoted_policy.allows(IdentifierKind::Other) {
+        // This guard is kept conservative: quoting-preferred mode remains
+        // report-only in current migration scope.
+        return Vec::new();
+    }
+
+    let bytes = sql.as_bytes();
+    let mut edits = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+
+    while index < bytes.len() {
+        if bytes[index] == b'\'' {
+            if in_single && index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                index += 2;
+                continue;
+            }
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+
+        if in_single || bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        let ident_start = index;
+        let mut escaped_quote = false;
+        while index < bytes.len() {
+            if bytes[index] == b'"' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    escaped_quote = true;
+                    index += 2;
+                    continue;
+                }
+                break;
+            }
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+
+        let ident_end = index;
+        let end = index + 1;
+        let Some(ident) = sql.get(ident_start..ident_end) else {
+            index += 1;
+            continue;
+        };
+
+        if !escaped_quote
+            && quoted_identifier_allows_safe_unquote(ident, rule)
+            && can_unquote_identifier_safely(ident)
+        {
+            edits.push(Rf006AutofixEdit {
+                start,
+                end,
+                replacement: ident.to_string(),
+            });
+        }
+
+        index = end;
+    }
+
+    edits
+}
+
+fn quoted_identifier_allows_safe_unquote(ident: &str, rule: &ReferencesQuoting) -> bool {
+    if is_ignored_token(ident, rule) {
+        return false;
+    }
+
+    if !rule.quoted_policy.allows(IdentifierKind::Other) {
+        return false;
+    }
+
+    if rule.prefer_quoted_keywords && is_keyword(ident) {
+        return false;
+    }
+
+    is_unnecessarily_quoted_identifier(ident, rule.case_sensitive)
+}
+
+fn can_unquote_identifier_safely(identifier: &str) -> bool {
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    let starts_ok = first.is_ascii_lowercase() || first == '_';
+    let rest_ok = chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+
+    starts_ok && rest_ok && !is_keyword(identifier)
 }
 
 fn candidate_triggers_rule(candidate: &IdentifierCandidate, rule: &ReferencesQuoting) -> bool {
@@ -238,6 +362,7 @@ fn is_keyword(token: &str) -> bool {
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -258,11 +383,37 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
     #[test]
     fn flags_unnecessary_quoted_identifier() {
-        let issues = run("SELECT \"good_name\" FROM t");
+        let sql = "SELECT \"good_name\" FROM t";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_RF_006);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT good_name FROM t");
+    }
+
+    #[test]
+    fn mixed_case_quoted_identifier_remains_report_only() {
+        let issues = run("SELECT \"MixedCase\" FROM t");
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_none(),
+            "mixed-case quoted identifiers remain report-only in conservative RF006 migration"
+        );
     }
 
     #[test]

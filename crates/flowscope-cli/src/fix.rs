@@ -748,9 +748,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_RF_003) {
         out = fix_mixed_reference_qualification(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_RF_006) {
-        out = fix_references_quoting(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_CP_001)
         || rule_filter.allows(issue_codes::LINT_CP_004)
         || rule_filter.allows(issue_codes::LINT_CP_005)
@@ -951,6 +948,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_RF_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
     {
         0
