@@ -710,9 +710,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_ST_005) {
         out = fix_subquery_to_cte(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_RF_003) {
-        out = fix_mixed_reference_qualification(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_TQ_002) {
         out = fix_tsql_procedure_begin_end(&out);
     }
@@ -909,6 +906,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_RF_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_004)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
@@ -1656,16 +1654,6 @@ fn is_simple_identifier(value: &str) -> bool {
     bytes[1..].iter().copied().all(is_ascii_ident_continue)
 }
 
-fn is_simple_qualified_identifier(value: &str) -> bool {
-    let mut parts = value.split('.');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some(left), Some(right), None) => {
-            is_simple_identifier(left) && is_simple_identifier(right)
-        }
-        _ => false,
-    }
-}
-
 fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     while idx < bytes.len() && is_ascii_whitespace_byte(bytes[idx]) {
         idx += 1;
@@ -1707,17 +1695,6 @@ fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> O
     } else {
         None
     }
-}
-
-fn find_ascii_keyword(bytes: &[u8], keyword_upper: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + keyword_upper.len() <= bytes.len() {
-        if match_ascii_keyword_at(bytes, i, keyword_upper).is_some() {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[derive(Debug, Clone)]
@@ -1886,36 +1863,6 @@ fn parse_subquery_alias_suffix(suffix: &str) -> Option<String> {
         return None;
     }
     Some(suffix[alias_start..alias_end].to_string())
-}
-
-fn extract_from_table_and_alias(sql: &str) -> Option<(String, String)> {
-    let bytes = sql.as_bytes();
-    let from_start = find_ascii_keyword(bytes, b"FROM", 0)?;
-    let mut i = skip_ascii_whitespace(bytes, from_start + b"FROM".len());
-    let table_start = i;
-    i = consume_ascii_identifier(bytes, i)?;
-    while i < bytes.len() && bytes[i] == b'.' {
-        let next = consume_ascii_identifier(bytes, i + 1)?;
-        i = next;
-    }
-    let table_name = sql[table_start..i].to_string();
-
-    let mut alias = String::new();
-    let after_table = skip_ascii_whitespace(bytes, i);
-    if after_table > i {
-        if let Some(as_end) = match_ascii_keyword_at(bytes, after_table, b"AS") {
-            let alias_start = skip_ascii_whitespace(bytes, as_end);
-            if alias_start > as_end {
-                if let Some(alias_end) = consume_ascii_identifier(bytes, alias_start) {
-                    alias = sql[alias_start..alias_end].to_string();
-                }
-            }
-        } else if let Some(alias_end) = consume_ascii_identifier(bytes, after_table) {
-            alias = sql[after_table..alias_end].to_string();
-        }
-    }
-
-    Some((table_name, alias))
 }
 
 fn is_sql_keyword(token: &str) -> bool {
@@ -2158,59 +2105,6 @@ fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_idx: usize) ->
     }
 
     None
-}
-
-fn fix_mixed_reference_qualification(sql: &str) -> String {
-    let Some((table_name, alias)) = extract_from_table_and_alias(sql) else {
-        return sql.to_string();
-    };
-    let prefix = if alias.is_empty() {
-        table_name.rsplit('.').next().unwrap_or(&table_name)
-    } else {
-        alias.as_str()
-    };
-    if prefix.is_empty() {
-        return sql.to_string();
-    }
-
-    let bytes = sql.as_bytes();
-    let Some(select_start) = find_ascii_keyword(bytes, b"SELECT", 0) else {
-        return sql.to_string();
-    };
-    let select_end = select_start + b"SELECT".len();
-    let Some(from_start) = find_ascii_keyword(bytes, b"FROM", select_end) else {
-        return sql.to_string();
-    };
-
-    let select_clause = &sql[select_end..from_start];
-    let items: Vec<String> = select_clause
-        .split(',')
-        .map(|item| item.trim().to_string())
-        .collect();
-    let has_qualified = items
-        .iter()
-        .any(|item| is_simple_qualified_identifier(item));
-    let has_unqualified = items.iter().any(|item| is_simple_identifier(item));
-    if !(has_qualified && has_unqualified) {
-        return sql.to_string();
-    }
-
-    let rewritten_items: Vec<String> = items
-        .into_iter()
-        .map(|item| {
-            if is_simple_identifier(&item) {
-                format!("{prefix}.{item}")
-            } else {
-                item
-            }
-        })
-        .collect();
-    let rewritten_clause = rewritten_items.join(", ");
-    format!(
-        "{}SELECT {rewritten_clause} FROM{}",
-        &sql[..select_start],
-        &sql[from_start + b"FROM".len()..]
-    )
 }
 
 fn fix_tsql_procedure_begin_end(sql: &str) -> String {
@@ -6399,6 +6293,34 @@ mod tests {
         assert!(
             out_al_disabled.sql.contains("alias_select"),
             "excluding AL_005 must not block RF_004 core autofix: {}",
+            out_al_disabled.sql
+        );
+    }
+
+    #[test]
+    fn rf003_core_autofix_respects_rule_filter() {
+        let sql = "select a.id, id2 from a";
+
+        let out_rf_disabled = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_RF_003.to_string()],
+        )
+        .expect("fix result");
+        assert_eq!(
+            out_rf_disabled.sql, sql,
+            "excluding RF_003 should block reference qualification core autofix"
+        );
+
+        let out_al_disabled = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_AL_005.to_string()],
+        )
+        .expect("fix result");
+        assert!(
+            out_al_disabled.sql.contains("a.id2"),
+            "excluding AL_005 must not block RF_003 core autofix: {}",
             out_al_disabled.sql
         );
     }
