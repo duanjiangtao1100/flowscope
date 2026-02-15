@@ -760,9 +760,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_CP_002) {
         out = fix_identifier_capitalisation(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_CP_003) {
-        out = fix_function_capitalisation(&out);
-    }
     if rule_filter.allows(issue_codes::LINT_TQ_002) {
         out = fix_tsql_procedure_begin_end(&out);
     }
@@ -937,6 +934,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_003)
@@ -2574,84 +2572,6 @@ fn fix_identifier_capitalisation(sql: &str) -> String {
                 out.push_str(&token);
             } else {
                 out.push_str(&token.to_ascii_lowercase());
-            }
-            continue;
-        }
-
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-/// CP_003: lowercase function names (word tokens immediately followed by `(`).
-fn fix_function_capitalisation(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if in_single {
-            out.push(chars[i]);
-            if chars[i] == '\'' {
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    out.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_double {
-            out.push(chars[i]);
-            if chars[i] == '"' {
-                if i + 1 < chars.len() && chars[i + 1] == '"' {
-                    out.push(chars[i + 1]);
-                    i += 2;
-                    continue;
-                }
-                in_double = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '\'' {
-            in_single = true;
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        if chars[i] == '"' {
-            in_double = true;
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        // Collect word tokens; lowercase if followed by `(` (function call)
-        if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
-            let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
-                i += 1;
-            }
-            let token: String = chars[start..i].iter().collect();
-
-            // Skip optional whitespace and check for `(`
-            let mut peek = i;
-            while peek < chars.len() && chars[peek].is_ascii_whitespace() {
-                peek += 1;
-            }
-            if peek < chars.len() && chars[peek] == '(' {
-                out.push_str(&token.to_ascii_lowercase());
-            } else {
-                out.push_str(&token);
             }
             continue;
         }
@@ -7195,75 +7115,6 @@ mod tests {
         let sql = "SELECT mycol, another_col FROM t WHERE col IS NOT NULL";
         let first = fix_identifier_capitalisation(sql);
         let second = fix_identifier_capitalisation(&first);
-        assert_eq!(first, second, "second pass should produce identical output");
-    }
-
-    // --- CP_003: function capitalisation ---
-
-    #[test]
-    fn cp003_lowercases_mixed_case_functions() {
-        let fixed = fix_function_capitalisation("SELECT COUNT(*), SUM(a) FROM t");
-        assert_eq!(fixed, "SELECT count(*), sum(a) FROM t");
-    }
-
-    #[test]
-    fn cp003_lowercases_builtin_functions() {
-        let fixed = fix_function_capitalisation("SELECT CAST(x AS INT), COALESCE(a, b) FROM t");
-        assert!(
-            fixed.contains("cast("),
-            "CAST should be lowercased: {fixed}"
-        );
-        assert!(
-            fixed.contains("coalesce("),
-            "COALESCE should be lowercased: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp003_handles_whitespace_before_paren() {
-        let fixed = fix_function_capitalisation("SELECT COUNT (*) FROM t");
-        assert!(
-            fixed.contains("count (*)") || fixed.contains("count(*)"),
-            "function with space before ( should be lowercased: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp003_handles_nested_functions() {
-        let fixed = fix_function_capitalisation("SELECT COALESCE(COUNT(*), 0) FROM t");
-        assert!(
-            fixed.contains("coalesce("),
-            "outer function should be lowercased: {fixed}"
-        );
-        assert!(
-            fixed.contains("count("),
-            "inner function should be lowercased: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp003_preserves_non_function_identifiers() {
-        let fixed = fix_function_capitalisation("SELECT MyCol FROM t");
-        assert_eq!(
-            fixed, "SELECT MyCol FROM t",
-            "non-function identifiers should be unchanged"
-        );
-    }
-
-    #[test]
-    fn cp003_preserves_quoted_content() {
-        let fixed = fix_function_capitalisation("SELECT 'COUNT(*)' FROM t");
-        assert!(
-            fixed.contains("'COUNT(*)'"),
-            "string literal should be unchanged: {fixed}"
-        );
-    }
-
-    #[test]
-    fn cp003_is_idempotent() {
-        let sql = "SELECT count(*), sum(a) FROM t";
-        let first = fix_function_capitalisation(sql);
-        let second = fix_function_capitalisation(&first);
         assert_eq!(first, second, "second pass should produce identical output");
     }
 
