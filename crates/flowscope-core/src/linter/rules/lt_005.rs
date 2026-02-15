@@ -105,7 +105,7 @@ impl LintRule for LayoutLongLines {
             })
             .collect();
 
-        let autofix_edits = legacy_long_line_autofix_edits(ctx.sql);
+        let autofix_edits = long_line_autofix_edits(ctx.sql);
         if let Some(first_issue) = issues.first_mut() {
             if !autofix_edits.is_empty() {
                 *first_issue = first_issue
@@ -288,27 +288,6 @@ fn line_ranges(sql: &str) -> Vec<(usize, usize)> {
 const LEGACY_MAX_LINE_LENGTH: usize = 300;
 const LEGACY_LINE_SPLIT_TARGET: usize = 280;
 
-fn legacy_long_line_autofix_edits(sql: &str) -> Vec<IssuePatchEdit> {
-    let mut edits = Vec::new();
-
-    for (line_start, line_end) in line_ranges(sql) {
-        let line = &sql[line_start..line_end];
-        let Some(replacement) = legacy_split_long_line(line) else {
-            continue;
-        };
-        if replacement == line {
-            continue;
-        }
-
-        edits.push(IssuePatchEdit::new(
-            Span::new(line_start, line_end),
-            replacement,
-        ));
-    }
-
-    edits
-}
-
 fn legacy_split_long_line(line: &str) -> Option<String> {
     if line.len() <= LEGACY_MAX_LINE_LENGTH {
         return None;
@@ -338,6 +317,30 @@ fn legacy_split_long_line(line: &str) -> Option<String> {
 
     rewritten.push_str(remaining);
     Some(rewritten)
+}
+
+/// Generate autofix edits for long lines by splitting at word boundaries.
+/// Only handles very long lines (>300 bytes) to avoid conflicting with other
+/// rules' fixes on shorter overflows.
+fn long_line_autofix_edits(sql: &str) -> Vec<IssuePatchEdit> {
+    let mut edits = Vec::new();
+
+    for (line_start, line_end) in line_ranges(sql) {
+        let line = &sql[line_start..line_end];
+        let Some(replacement) = legacy_split_long_line(line) else {
+            continue;
+        };
+        if replacement == line {
+            continue;
+        }
+
+        edits.push(IssuePatchEdit::new(
+            Span::new(line_start, line_end),
+            replacement,
+        ));
+    }
+
+    edits
 }
 
 fn line_is_comment_only_tokenized(

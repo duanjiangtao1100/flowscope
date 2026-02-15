@@ -130,14 +130,25 @@ def extract_rule_configs(configs: dict | None) -> dict | None:
 
     We flatten this to: {"references.special_chars": {"quoted_identifiers_policy": "aliases"}}
     which maps directly to the --rule-configs JSON format.
+
+    Also maps ``core.max_line_length`` → ``layout.long_lines.max_line_length``
+    so that LT05 fixtures using the SQLFluff global setting are exercised
+    correctly.
     """
     if not configs:
         return None
+    result: dict = {}
     rules = configs.get("rules")
-    if not rules or not isinstance(rules, dict):
-        return None
-    # Return rules dict as-is; keys are dotted rule names, values are option dicts.
-    return {k: v for k, v in rules.items() if isinstance(v, dict)}
+    if rules and isinstance(rules, dict):
+        result = {k: v for k, v in rules.items() if isinstance(v, dict)}
+
+    # Map core.max_line_length → layout.long_lines.max_line_length.
+    core = configs.get("core", {})
+    if "max_line_length" in core:
+        lt05_cfg = result.setdefault("layout.long_lines", {})
+        lt05_cfg.setdefault("max_line_length", core["max_line_length"])
+
+    return result if result else None
 
 
 def _build_flowscope_cmd(
