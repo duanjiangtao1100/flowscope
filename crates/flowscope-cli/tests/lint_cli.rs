@@ -1002,6 +1002,31 @@ fn test_lint_fix_applies_am008_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_st006_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("structure_column_order_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT a + 1, a FROM t\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT a, a + 1 FROM t\n",
+        "Expected ST006 core autofix to reorder simple projection targets ahead of complex expressions: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_st008_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("distinct_parenthesized_patch_fix.sql");

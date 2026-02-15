@@ -1993,19 +1993,6 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
         }
     }
 
-    if rule_filter.allows(issue_codes::LINT_ST_006) {
-        if let Some(first_simple_idx) = select.projection.iter().position(is_simple_projection_item)
-        {
-            if first_simple_idx > 0 {
-                let mut prefix = select
-                    .projection
-                    .drain(0..first_simple_idx)
-                    .collect::<Vec<_>>();
-                select.projection.append(&mut prefix);
-            }
-        }
-    }
-
     if rule_filter.allows(issue_codes::LINT_CV_012) {
         rewrite_implicit_where_joins(select);
     }
@@ -2781,17 +2768,6 @@ fn rewritten_left_join_operator(operator: JoinOperator) -> Option<JoinOperator> 
         JoinOperator::RightSemi(constraint) => Some(JoinOperator::LeftSemi(constraint)),
         JoinOperator::RightAnti(constraint) => Some(JoinOperator::LeftAnti(constraint)),
         _ => None,
-    }
-}
-
-fn is_simple_projection_item(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::UnnamedExpr(Expr::Identifier(_))
-        | SelectItem::UnnamedExpr(Expr::CompoundIdentifier(_)) => true,
-        SelectItem::ExprWithAlias { expr, .. } => {
-            matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-        }
-        _ => false,
     }
 }
 
