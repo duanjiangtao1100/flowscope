@@ -236,14 +236,15 @@ fn visit_order_safe_selects<F: FnMut(&Select)>(statement: &Statement, visitor: &
 
 fn visit_query_selects<F: FnMut(&Select)>(query: &Query, visitor: &mut F, in_set_operation: bool) {
     // Visit CTE definitions — these may or may not be order-sensitive.
-    // A CTE is order-sensitive if referenced in a set operation with SELECT *.
-    // For simplicity and SQLFluff parity: skip CTEs whose query body is used
-    // in a set operation context.
+    // A CTE is order-sensitive if referenced in a set operation whose leaf
+    // SELECTs use wildcards (SELECT *), since reordering the CTE projection
+    // would change the set operation result. When the set operation's leaf
+    // SELECTs use explicit columns (SELECT a, b), CTE order is irrelevant.
     if let Some(with) = &query.with {
         let body_is_set = matches!(query.body.as_ref(), SetExpr::SetOperation { .. });
+        let cte_order_matters = body_is_set && set_expr_has_wildcard_select(&query.body);
         for cte in &with.cte_tables {
-            // If the outer body is a set operation, CTE order matters.
-            visit_query_selects(&cte.query, visitor, body_is_set);
+            visit_query_selects(&cte.query, visitor, cte_order_matters);
         }
     }
 
@@ -344,6 +345,23 @@ fn visit_expr_selects<F: FnMut(&Select)>(expr: &Expr, visitor: &mut F) {
             }
         }
         _ => {}
+    }
+}
+
+/// Returns true if any leaf SELECT in a set expression uses a wildcard
+/// (`SELECT *` or `SELECT table.*`). When a set operation uses wildcards,
+/// the column order of referenced CTEs/subqueries is semantically significant.
+fn set_expr_has_wildcard_select(set_expr: &SetExpr) -> bool {
+    match set_expr {
+        SetExpr::Select(select) => select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _))),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_has_wildcard_select(left) || set_expr_has_wildcard_select(right)
+        }
+        SetExpr::Query(query) => set_expr_has_wildcard_select(&query.body),
+        _ => false,
     }
 }
 
@@ -898,6 +916,30 @@ UNION ALL
 SELECT * FROM T2";
         let issues = run(sql);
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn fail_cte_used_in_set_with_explicit_columns() {
+        // When the set operation uses explicit column lists (not SELECT *),
+        // CTE projection order is irrelevant and ST06 should still apply.
+        let sql = "\
+WITH T1 AS (
+  SELECT
+    'a'::varchar AS A,
+    1::bigint AS B
+),
+T2 AS (
+  SELECT
+    CASE WHEN COL > 1 THEN 'x' ELSE 'y' END AS A,
+    COL AS B
+  FROM T
+)
+SELECT A, B FROM T1
+UNION ALL
+SELECT A, B FROM T2";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_ST_006);
     }
 
     #[test]
