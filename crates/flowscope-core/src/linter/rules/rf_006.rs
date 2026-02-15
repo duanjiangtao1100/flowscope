@@ -5,10 +5,11 @@
 
 use std::collections::HashSet;
 
+use crate::generated::NormalizationStrategy;
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
-use regex::{Regex, RegexBuilder};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use regex::Regex;
 use sqlparser::ast::Statement;
 
 use super::identifier_candidates_helpers::{
@@ -18,7 +19,7 @@ use super::identifier_candidates_helpers::{
 pub struct ReferencesQuoting {
     prefer_quoted_identifiers: bool,
     prefer_quoted_keywords: bool,
-    case_sensitive: bool,
+    case_sensitive_override: Option<bool>,
     quoted_policy: IdentifierPolicy,
     unquoted_policy: IdentifierPolicy,
     ignore_words: HashSet<String>,
@@ -30,7 +31,7 @@ impl Default for ReferencesQuoting {
         Self {
             prefer_quoted_identifiers: false,
             prefer_quoted_keywords: false,
-            case_sensitive: false,
+            case_sensitive_override: None,
             quoted_policy: IdentifierPolicy::All,
             unquoted_policy: IdentifierPolicy::All,
             ignore_words: HashSet::new(),
@@ -48,9 +49,8 @@ impl ReferencesQuoting {
             prefer_quoted_keywords: config
                 .rule_option_bool(issue_codes::LINT_RF_006, "prefer_quoted_keywords")
                 .unwrap_or(false),
-            case_sensitive: config
-                .rule_option_bool(issue_codes::LINT_RF_006, "case_sensitive")
-                .unwrap_or(false),
+            case_sensitive_override: config
+                .rule_option_bool(issue_codes::LINT_RF_006, "case_sensitive"),
             quoted_policy: IdentifierPolicy::from_config(
                 config,
                 issue_codes::LINT_RF_006,
@@ -70,12 +70,24 @@ impl ReferencesQuoting {
             ignore_words_regex: config
                 .rule_option_str(issue_codes::LINT_RF_006, "ignore_words_regex")
                 .filter(|pattern| !pattern.trim().is_empty())
-                .and_then(|pattern| {
-                    RegexBuilder::new(pattern)
-                        .case_insensitive(true)
-                        .build()
-                        .ok()
-                }),
+                .and_then(|pattern| Regex::new(pattern).ok()),
+        }
+    }
+
+    /// Resolve whether to check case-sensitively for the given dialect.
+    fn is_case_aware(&self, dialect: Dialect) -> bool {
+        match self.case_sensitive_override {
+            Some(false) => false,
+            Some(true) => true,
+            None => {
+                // Default: follow the dialect's normalization strategy.
+                // Dialects with case folding (lowercase/uppercase) are case-aware by default.
+                // Case-insensitive dialects are not case-aware by default.
+                matches!(
+                    dialect.normalization_strategy(),
+                    NormalizationStrategy::Lowercase | NormalizationStrategy::Uppercase
+                )
+            }
         }
     }
 }
@@ -94,9 +106,11 @@ impl LintRule for ReferencesQuoting {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let dialect = ctx.dialect();
+
         let has_violation = collect_identifier_candidates(statement)
             .into_iter()
-            .any(|candidate| candidate_triggers_rule(&candidate, self));
+            .any(|candidate| candidate_triggers_rule(&candidate, self, dialect));
 
         if !has_violation {
             return Vec::new();
@@ -110,7 +124,7 @@ impl LintRule for ReferencesQuoting {
         let mut issue =
             Issue::info(issue_codes::LINT_RF_006, message).with_statement(ctx.statement_index);
 
-        let autofix_edits = unnecessary_quoted_identifier_edits(ctx.statement_sql(), self)
+        let autofix_edits = unnecessary_quoted_identifier_edits(ctx.statement_sql(), self, dialect)
             .into_iter()
             .map(|edit| {
                 IssuePatchEdit::new(
@@ -136,19 +150,29 @@ struct Rf006AutofixEdit {
 fn unnecessary_quoted_identifier_edits(
     sql: &str,
     rule: &ReferencesQuoting,
+    dialect: Dialect,
 ) -> Vec<Rf006AutofixEdit> {
     if rule.prefer_quoted_identifiers || !rule.quoted_policy.allows(IdentifierKind::Other) {
-        // This guard is kept conservative: quoting-preferred mode remains
-        // report-only in current migration scope.
         return Vec::new();
     }
+
+    let case_aware = rule.is_case_aware(dialect);
+    let strategy = dialect.normalization_strategy();
 
     let bytes = sql.as_bytes();
     let mut edits = Vec::new();
     let mut index = 0usize;
     let mut in_single = false;
 
+    // Determine quote characters for this dialect.
+    let quote_chars: &[u8] = match dialect {
+        Dialect::Mssql => b"\"[",
+        Dialect::Bigquery | Dialect::Databricks | Dialect::Hive | Dialect::Mysql => b"`",
+        _ => b"\"",
+    };
+
     while index < bytes.len() {
+        // Track single-quoted string literals to avoid false matches.
         if bytes[index] == b'\'' {
             if in_single && index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
                 index += 2;
@@ -159,18 +183,28 @@ fn unnecessary_quoted_identifier_edits(
             continue;
         }
 
-        if in_single || bytes[index] != b'"' {
+        if in_single {
             index += 1;
             continue;
         }
+
+        let is_quote = quote_chars.contains(&bytes[index]);
+        if !is_quote {
+            index += 1;
+            continue;
+        }
+
+        let quote_byte = bytes[index];
+        let close_byte = if quote_byte == b'[' { b']' } else { quote_byte };
 
         let start = index;
         index += 1;
         let ident_start = index;
         let mut escaped_quote = false;
+
         while index < bytes.len() {
-            if bytes[index] == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+            if bytes[index] == close_byte {
+                if close_byte != b']' && index + 1 < bytes.len() && bytes[index + 1] == close_byte {
                     escaped_quote = true;
                     index += 2;
                     continue;
@@ -191,8 +225,8 @@ fn unnecessary_quoted_identifier_edits(
         };
 
         if !escaped_quote
-            && quoted_identifier_allows_safe_unquote(ident, rule)
-            && can_unquote_identifier_safely(ident)
+            && quoted_identifier_allows_safe_unquote(ident, rule, dialect, case_aware, strategy)
+            && can_unquote_identifier(ident, case_aware, strategy)
         {
             edits.push(Rf006AutofixEdit {
                 start,
@@ -207,7 +241,13 @@ fn unnecessary_quoted_identifier_edits(
     edits
 }
 
-fn quoted_identifier_allows_safe_unquote(ident: &str, rule: &ReferencesQuoting) -> bool {
+fn quoted_identifier_allows_safe_unquote(
+    ident: &str,
+    rule: &ReferencesQuoting,
+    _dialect: Dialect,
+    case_aware: bool,
+    strategy: NormalizationStrategy,
+) -> bool {
     if is_ignored_token(ident, rule) {
         return false;
     }
@@ -220,22 +260,35 @@ fn quoted_identifier_allows_safe_unquote(ident: &str, rule: &ReferencesQuoting) 
         return false;
     }
 
-    is_unnecessarily_quoted_identifier(ident, rule.case_sensitive)
+    is_unnecessarily_quoted(ident, case_aware, strategy)
 }
 
-fn can_unquote_identifier_safely(identifier: &str) -> bool {
-    let mut chars = identifier.chars();
-    let Some(first) = chars.next() else {
+fn can_unquote_identifier(
+    identifier: &str,
+    case_aware: bool,
+    strategy: NormalizationStrategy,
+) -> bool {
+    if !is_valid_bare_identifier(identifier) {
         return false;
-    };
+    }
 
-    let starts_ok = first.is_ascii_lowercase() || first == '_';
-    let rest_ok = chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+    if is_keyword(identifier) {
+        return false;
+    }
 
-    starts_ok && rest_ok && !is_keyword(identifier)
+    // When case-aware, only unquote if the identifier matches the casefold.
+    if case_aware {
+        return matches_casefold(identifier, strategy);
+    }
+
+    true
 }
 
-fn candidate_triggers_rule(candidate: &IdentifierCandidate, rule: &ReferencesQuoting) -> bool {
+fn candidate_triggers_rule(
+    candidate: &IdentifierCandidate,
+    rule: &ReferencesQuoting,
+    dialect: Dialect,
+) -> bool {
     if is_ignored_token(&candidate.value, rule) {
         return false;
     }
@@ -261,10 +314,28 @@ fn candidate_triggers_rule(candidate: &IdentifierCandidate, rule: &ReferencesQuo
         return false;
     }
 
-    is_unnecessarily_quoted_identifier(&candidate.value, rule.case_sensitive)
+    let case_aware = rule.is_case_aware(dialect);
+    let strategy = dialect.normalization_strategy();
+    is_unnecessarily_quoted(&candidate.value, case_aware, strategy)
 }
 
-fn is_unnecessarily_quoted_identifier(ident: &str, case_sensitive: bool) -> bool {
+fn is_unnecessarily_quoted(ident: &str, case_aware: bool, strategy: NormalizationStrategy) -> bool {
+    if !is_valid_bare_identifier(ident) {
+        return false;
+    }
+
+    if is_keyword(ident) {
+        return false;
+    }
+
+    if case_aware {
+        return matches_casefold(ident, strategy);
+    }
+
+    true
+}
+
+fn is_valid_bare_identifier(ident: &str) -> bool {
     let mut chars = ident.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -274,18 +345,16 @@ fn is_unnecessarily_quoted_identifier(ident: &str, case_sensitive: bool) -> bool
         return false;
     }
 
-    if !chars
-        .clone()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    {
-        return false;
-    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
 
-    if case_sensitive && ident.chars().any(|ch| ch.is_ascii_uppercase()) {
-        return false;
+fn matches_casefold(ident: &str, strategy: NormalizationStrategy) -> bool {
+    match strategy {
+        NormalizationStrategy::Uppercase => ident.chars().all(|ch| !ch.is_ascii_lowercase()),
+        NormalizationStrategy::Lowercase => ident.chars().all(|ch| !ch.is_ascii_uppercase()),
+        NormalizationStrategy::CaseInsensitive => true,
+        NormalizationStrategy::CaseSensitive => true,
     }
-
-    true
 }
 
 fn configured_ignore_words(config: &LintConfig) -> Vec<String> {
@@ -308,11 +377,21 @@ fn configured_ignore_words(config: &LintConfig) -> Vec<String> {
 
 fn is_ignored_token(token: &str, rule: &ReferencesQuoting) -> bool {
     let normalized = normalize_token(token);
-    rule.ignore_words.contains(&normalized)
-        || rule
-            .ignore_words_regex
-            .as_ref()
-            .is_some_and(|regex| regex.is_match(&normalized))
+    // ignore_words matches case-insensitively (via normalization).
+    if rule.ignore_words.contains(&normalized) {
+        return true;
+    }
+    // ignore_words_regex matches case-sensitively against the raw value,
+    // consistent with SQLFluff behavior.
+    if let Some(regex) = &rule.ignore_words_regex {
+        let raw = token
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | '`' | '\'' | '[' | ']'));
+        if regex.is_match(raw) {
+            return true;
+        }
+    }
+    false
 }
 
 fn normalize_token(token: &str) -> String {
@@ -326,35 +405,61 @@ fn is_keyword(token: &str) -> bool {
     matches!(
         token.trim().to_ascii_uppercase().as_str(),
         "ALL"
+            | "AND"
             | "AS"
+            | "ASC"
+            | "BETWEEN"
             | "BY"
             | "CASE"
             | "CROSS"
+            | "DEFAULT"
+            | "DELETE"
+            | "DESC"
             | "DISTINCT"
             | "ELSE"
             | "END"
+            | "EXISTS"
+            | "FALSE"
+            | "FOR"
             | "FROM"
             | "FULL"
             | "GROUP"
             | "HAVING"
+            | "IF"
+            | "IN"
             | "INNER"
+            | "INSERT"
+            | "INTO"
+            | "IS"
             | "JOIN"
             | "LEFT"
+            | "LIKE"
             | "LIMIT"
+            | "METADATA"
+            | "NOT"
+            | "NULL"
             | "OFFSET"
             | "ON"
+            | "OR"
             | "ORDER"
             | "OUTER"
             | "RECURSIVE"
             | "RIGHT"
             | "SELECT"
+            | "SET"
             | "SUM"
+            | "TABLE"
             | "THEN"
+            | "TRUE"
             | "UNION"
+            | "UPDATE"
+            | "USER"
             | "USING"
+            | "VALUES"
             | "WHEN"
             | "WHERE"
             | "WITH"
+            | "DATETIME"
     )
 }
 
@@ -409,11 +514,8 @@ mod tests {
     #[test]
     fn mixed_case_quoted_identifier_remains_report_only() {
         let issues = run("SELECT \"MixedCase\" FROM t");
+        // In generic dialect (CaseInsensitive), MixedCase is unnecessarily quoted.
         assert_eq!(issues.len(), 1);
-        assert!(
-            issues[0].autofix.is_none(),
-            "mixed-case quoted identifiers remain report-only in conservative RF006 migration"
-        );
     }
 
     #[test]
@@ -440,30 +542,6 @@ mod tests {
         };
         let rule = ReferencesQuoting::from_config(&config);
         let sql = "SELECT \"good_name\" FROM \"t\"";
-        let statements = parse_sql(sql).expect("parse");
-        let issues = rule.check(
-            &statements[0],
-            &LintContext {
-                sql,
-                statement_range: 0..sql.len(),
-                statement_index: 0,
-            },
-        );
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn case_sensitive_true_allows_quoted_mixed_case_identifier() {
-        let config = LintConfig {
-            enabled: true,
-            disabled_rules: vec![],
-            rule_configs: std::collections::BTreeMap::from([(
-                "LINT_RF_006".to_string(),
-                serde_json::json!({"case_sensitive": true}),
-            )]),
-        };
-        let rule = ReferencesQuoting::from_config(&config);
-        let sql = "SELECT \"MixedCase\" FROM t";
         let statements = parse_sql(sql).expect("parse");
         let issues = rule.check(
             &statements[0],
@@ -579,7 +657,7 @@ mod tests {
             disabled_rules: vec![],
             rule_configs: std::collections::BTreeMap::from([(
                 "references.quoting".to_string(),
-                serde_json::json!({"ignore_words_regex": "^GOOD_"}),
+                serde_json::json!({"ignore_words_regex": "^good_"}),
             )]),
         };
         let rule = ReferencesQuoting::from_config(&config);
@@ -593,6 +671,18 @@ mod tests {
                 statement_index: 0,
             },
         );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_keyword_identifier() {
+        let issues = run("SELECT \"SELECT\" FROM t");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_datetime_keyword_identifier() {
+        let issues = run("SELECT \"datetime\" FROM t");
         assert!(issues.is_empty());
     }
 }

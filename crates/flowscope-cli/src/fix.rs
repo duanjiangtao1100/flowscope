@@ -5597,7 +5597,9 @@ mod tests {
     }
 
     #[test]
-    fn references_quoting_fix_keeps_case_sensitive_identifier_quotes() {
+    fn references_quoting_fix_unquotes_case_insensitive_dialect() {
+        // In a case-insensitive dialect (Generic), mixed-case quoted identifiers
+        // are unnecessarily quoted because case doesn't matter.
         let sql = "SELECT \"CamelCase\" FROM t UNION SELECT 2";
         let out = apply_lint_fixes(
             sql,
@@ -5606,13 +5608,31 @@ mod tests {
         )
         .expect("fix result");
         assert!(
-            out.sql.contains("\"CamelCase\""),
-            "case-sensitive identifier must remain quoted: {}",
+            out.sql.contains("CamelCase") && !out.sql.contains("\"CamelCase\""),
+            "case-insensitive dialect should unquote: {}",
             out.sql
         );
         assert!(
             out.sql.to_ascii_uppercase().contains("DISTINCT SELECT"),
             "expected another fix to persist output: {}",
+            out.sql
+        );
+    }
+
+    #[test]
+    fn references_quoting_fix_keeps_case_sensitive_identifier_quotes() {
+        // In Postgres (lowercase casefold), mixed-case identifiers must stay
+        // quoted because unquoting would fold to lowercase.
+        let sql = "SELECT \"CamelCase\" FROM t UNION SELECT 2";
+        let out = apply_lint_fixes(
+            sql,
+            Dialect::Postgres,
+            &[issue_codes::LINT_LT_011.to_string()],
+        )
+        .expect("fix result");
+        assert!(
+            out.sql.contains("\"CamelCase\""),
+            "case-sensitive identifier must remain quoted: {}",
             out.sql
         );
     }

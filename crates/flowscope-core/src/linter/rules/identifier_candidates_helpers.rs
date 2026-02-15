@@ -64,6 +64,8 @@ pub(crate) struct IdentifierCandidate {
     pub(crate) value: String,
     pub(crate) quoted: bool,
     pub(crate) kind: IdentifierKind,
+    /// The quote character used, if any (e.g. `"`, `` ` ``, `[`).
+    pub(crate) quote_char: Option<char>,
 }
 
 pub(crate) fn collect_identifier_candidates(statement: &Statement) -> Vec<IdentifierCandidate> {
@@ -108,6 +110,7 @@ pub(crate) fn collect_identifier_candidates(statement: &Statement) -> Vec<Identi
     collect_cte_identifiers_in_statement(statement, &mut candidates);
     collect_show_statement_identifiers(statement, &mut candidates);
     collect_assignment_target_identifiers(statement, &mut candidates);
+    collect_create_table_column_identifiers(statement, &mut candidates);
     candidates
 }
 
@@ -144,6 +147,17 @@ fn collect_table_factor_identifiers(
             collect_table_factor_identifiers(table, candidates);
         }
         _ => {}
+    }
+}
+
+fn collect_create_table_column_identifiers(
+    statement: &Statement,
+    candidates: &mut Vec<IdentifierCandidate>,
+) {
+    if let Statement::CreateTable(create) = statement {
+        for col in &create.columns {
+            push_ident_candidate(&col.name, IdentifierKind::Other, candidates);
+        }
     }
 }
 
@@ -282,6 +296,7 @@ fn push_ident_candidate(
         value: ident.value.clone(),
         quoted: ident.quote_style.is_some(),
         kind,
+        quote_char: ident.quote_style,
     });
 }
 

@@ -54,7 +54,7 @@ FLOWSCOPE_BIN = REPO_ROOT / "target" / "release" / "flowscope"
 # Map SQLFluff dialect names → FlowScope dialect names.
 # None means "not supported by FlowScope — skip".
 DIALECT_MAP: dict[str, str | None] = {
-    "ansi": "generic",
+    "ansi": "ansi",
     "bigquery": "bigquery",
     "clickhouse": "clickhouse",
     "databricks": "databricks",
@@ -119,8 +119,45 @@ def build_flowscope() -> None:
     print("Build complete.\n", flush=True)
 
 
+def extract_rule_configs(configs: dict | None) -> dict | None:
+    """Extract rules: section from SQLFluff fixture configs as a flat dict.
+
+    SQLFluff fixtures use:
+        configs:
+          rules:
+            references.special_chars:
+              quoted_identifiers_policy: aliases
+
+    We flatten this to: {"references.special_chars": {"quoted_identifiers_policy": "aliases"}}
+    which maps directly to the --rule-configs JSON format.
+    """
+    if not configs:
+        return None
+    rules = configs.get("rules")
+    if not rules or not isinstance(rules, dict):
+        return None
+    # Return rules dict as-is; keys are dotted rule names, values are option dicts.
+    return {k: v for k, v in rules.items() if isinstance(v, dict)}
+
+
+def _build_flowscope_cmd(
+    base_args: list[str],
+    dialect: str,
+    filepath: str,
+    rule_configs: dict | None = None,
+) -> list[str]:
+    """Build the flowscope CLI command with optional --rule-configs."""
+    cmd = [str(FLOWSCOPE_BIN)] + base_args + [filepath, "--dialect", dialect]
+    if rule_configs:
+        cmd.extend(["--rule-configs", json.dumps(rule_configs)])
+    return cmd
+
+
 def run_flowscope_lint(
-    sql: str, dialect: str = "generic", rule: str | None = None
+    sql: str,
+    dialect: str = "generic",
+    rule: str | None = None,
+    rule_configs: dict | None = None,
 ) -> list[dict]:
     """Run FlowScope lint and return violations for the target rule."""
     with tempfile.NamedTemporaryFile(
@@ -129,16 +166,11 @@ def run_flowscope_lint(
         f.write(sql)
         f.flush()
         try:
+            cmd = _build_flowscope_cmd(
+                ["--lint", "--format", "json"], dialect, f.name, rule_configs
+            )
             result = subprocess.run(
-                [
-                    str(FLOWSCOPE_BIN),
-                    "--lint",
-                    "--format",
-                    "json",
-                    f.name,
-                    "--dialect",
-                    dialect,
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -159,7 +191,11 @@ def run_flowscope_lint(
             os.unlink(f.name)
 
 
-def run_flowscope_fix(sql: str, dialect: str = "generic") -> str | None:
+def run_flowscope_fix(
+    sql: str,
+    dialect: str = "generic",
+    rule_configs: dict | None = None,
+) -> str | None:
     """Run FlowScope --fix and return the fixed SQL."""
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".sql", delete=False
@@ -167,17 +203,14 @@ def run_flowscope_fix(sql: str, dialect: str = "generic") -> str | None:
         f.write(sql)
         f.flush()
         try:
+            cmd = _build_flowscope_cmd(
+                ["--lint", "--fix", "--format", "json"],
+                dialect,
+                f.name,
+                rule_configs,
+            )
             result = subprocess.run(
-                [
-                    str(FLOWSCOPE_BIN),
-                    "--lint",
-                    "--fix",
-                    "--format",
-                    "json",
-                    f.name,
-                    "--dialect",
-                    dialect,
-                ],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -300,7 +333,10 @@ def main() -> None:
 
             total_cases += 1
 
-            fs_violations = run_flowscope_lint(sql, fs_dialect, rule_code)
+            case_rule_configs = extract_rule_configs(case.get("configs"))
+            fs_violations = run_flowscope_lint(
+                sql, fs_dialect, rule_code, case_rule_configs
+            )
             fs_has = len(fs_violations) > 0
 
             if case["type"] == "pass":
@@ -342,7 +378,7 @@ def main() -> None:
                 if "fix_str" in case:
                     r_fix_total += 1
                     total_fix_cases += 1
-                    fs_fixed = run_flowscope_fix(sql, fs_dialect)
+                    fs_fixed = run_flowscope_fix(sql, fs_dialect, case_rule_configs)
                     expected = case["fix_str"]
 
                     if fs_fixed is not None and normalize_whitespace(

@@ -7,8 +7,8 @@ use std::collections::HashSet;
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue};
-use regex::{Regex, RegexBuilder};
+use crate::types::{issue_codes, Dialect, Issue};
+use regex::Regex;
 use sqlparser::ast::Statement;
 
 use super::identifier_candidates_helpers::{
@@ -19,6 +19,7 @@ pub struct ReferencesSpecialChars {
     quoted_policy: IdentifierPolicy,
     unquoted_policy: IdentifierPolicy,
     additional_allowed_characters: HashSet<char>,
+    allow_space_in_identifier: bool,
     ignore_words: HashSet<String>,
     ignore_words_regex: Option<Regex>,
 }
@@ -39,6 +40,9 @@ impl ReferencesSpecialChars {
                 "all",
             ),
             additional_allowed_characters: configured_additional_allowed_characters(config),
+            allow_space_in_identifier: config
+                .rule_option_bool(issue_codes::LINT_RF_005, "allow_space_in_identifier")
+                .unwrap_or(false),
             ignore_words: configured_ignore_words(config)
                 .into_iter()
                 .map(|word| normalize_token(&word))
@@ -46,12 +50,7 @@ impl ReferencesSpecialChars {
             ignore_words_regex: config
                 .rule_option_str(issue_codes::LINT_RF_005, "ignore_words_regex")
                 .filter(|pattern| !pattern.trim().is_empty())
-                .and_then(|pattern| {
-                    RegexBuilder::new(pattern)
-                        .case_insensitive(true)
-                        .build()
-                        .ok()
-                }),
+                .and_then(|pattern| Regex::new(pattern).ok()),
         }
     }
 }
@@ -62,6 +61,7 @@ impl Default for ReferencesSpecialChars {
             quoted_policy: IdentifierPolicy::All,
             unquoted_policy: IdentifierPolicy::All,
             additional_allowed_characters: HashSet::new(),
+            allow_space_in_identifier: false,
             ignore_words: HashSet::new(),
             ignore_words_regex: None,
         }
@@ -82,9 +82,10 @@ impl LintRule for ReferencesSpecialChars {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let dialect = ctx.dialect();
         let has_special_chars = collect_identifier_candidates(statement)
             .into_iter()
-            .any(|candidate| candidate_triggers_rule(&candidate, self));
+            .any(|candidate| candidate_triggers_rule(&candidate, self, dialect));
 
         if has_special_chars {
             vec![Issue::warning(
@@ -98,7 +99,11 @@ impl LintRule for ReferencesSpecialChars {
     }
 }
 
-fn candidate_triggers_rule(candidate: &IdentifierCandidate, rule: &ReferencesSpecialChars) -> bool {
+fn candidate_triggers_rule(
+    candidate: &IdentifierCandidate,
+    rule: &ReferencesSpecialChars,
+    dialect: Dialect,
+) -> bool {
     if is_ignored_token(&candidate.value, rule) {
         return false;
     }
@@ -112,13 +117,95 @@ fn candidate_triggers_rule(candidate: &IdentifierCandidate, rule: &ReferencesSpe
         return false;
     }
 
-    contains_disallowed_identifier_chars(&candidate.value, &rule.additional_allowed_characters)
+    // Snowflake pivot references use identifiers that look like "'VALUE'" -
+    // these are valid Snowflake syntax and should not be flagged.
+    if candidate.quoted && candidate.value.starts_with('\'') && candidate.value.ends_with('\'') {
+        return false;
+    }
+
+    // BigQuery allows hyphens, dots, and trailing wildcards in backtick identifiers
+    // by default. SparkSQL/Databricks allows arbitrary file paths in backtick identifiers.
+    if candidate.quote_char == Some('`') {
+        match dialect {
+            Dialect::Bigquery => {
+                // BigQuery allows `-` and `.` throughout backtick identifiers,
+                // but `*` only as a trailing wildcard suffix (e.g., `table_*`).
+                let value = &candidate.value;
+                let has_mid_star = value
+                    .char_indices()
+                    .any(|(i, ch)| ch == '*' && i + 1 < value.len());
+                if has_mid_star {
+                    return true;
+                }
+                return contains_disallowed_identifier_chars_with_extras(
+                    value,
+                    &rule.additional_allowed_characters,
+                    rule.allow_space_in_identifier,
+                    &['-', '.', '*'],
+                );
+            }
+            Dialect::Databricks => {
+                // SparkSQL/Databricks backtick identifiers can contain file
+                // paths with any characters - do not flag them.
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    // BigQuery allows hyphens in unquoted identifiers as well.
+    if matches!(dialect, Dialect::Bigquery) && !candidate.quoted {
+        return contains_disallowed_identifier_chars_with_extras(
+            &candidate.value,
+            &rule.additional_allowed_characters,
+            rule.allow_space_in_identifier,
+            &['-', '.'],
+        );
+    }
+
+    // Snowflake allows $ in identifiers (e.g. METADATA$FILENAME).
+    if matches!(dialect, Dialect::Snowflake) && !candidate.quoted {
+        return contains_disallowed_identifier_chars_with_extras(
+            &candidate.value,
+            &rule.additional_allowed_characters,
+            rule.allow_space_in_identifier,
+            &['$'],
+        );
+    }
+
+    contains_disallowed_identifier_chars(
+        &candidate.value,
+        &rule.additional_allowed_characters,
+        rule.allow_space_in_identifier,
+    )
 }
 
-fn contains_disallowed_identifier_chars(ident: &str, additional_allowed: &HashSet<char>) -> bool {
-    ident
-        .chars()
-        .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || additional_allowed.contains(&ch)))
+fn contains_disallowed_identifier_chars(
+    ident: &str,
+    additional_allowed: &HashSet<char>,
+    allow_space: bool,
+) -> bool {
+    ident.chars().any(|ch| {
+        !(ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || (allow_space && ch == ' ')
+            || additional_allowed.contains(&ch))
+    })
+}
+
+fn contains_disallowed_identifier_chars_with_extras(
+    ident: &str,
+    additional_allowed: &HashSet<char>,
+    allow_space: bool,
+    extras: &[char],
+) -> bool {
+    ident.chars().any(|ch| {
+        !(ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || (allow_space && ch == ' ')
+            || extras.contains(&ch)
+            || additional_allowed.contains(&ch))
+    })
 }
 
 fn configured_additional_allowed_characters(config: &LintConfig) -> HashSet<char> {
@@ -163,11 +250,21 @@ fn configured_ignore_words(config: &LintConfig) -> Vec<String> {
 
 fn is_ignored_token(token: &str, rule: &ReferencesSpecialChars) -> bool {
     let normalized = normalize_token(token);
-    rule.ignore_words.contains(&normalized)
-        || rule
-            .ignore_words_regex
-            .as_ref()
-            .is_some_and(|regex| regex.is_match(&normalized))
+    // ignore_words matches case-insensitively (via normalization).
+    if rule.ignore_words.contains(&normalized) {
+        return true;
+    }
+    // ignore_words_regex matches case-sensitively against the raw value,
+    // consistent with SQLFluff behavior.
+    if let Some(regex) = &rule.ignore_words_regex {
+        let raw = token
+            .trim()
+            .trim_matches(|ch| matches!(ch, '"' | '`' | '\'' | '[' | ']'));
+        if regex.is_match(raw) {
+            return true;
+        }
+    }
+    false
 }
 
 fn normalize_token(token: &str) -> String {
@@ -281,7 +378,46 @@ mod tests {
                 disabled_rules: vec![],
                 rule_configs: std::collections::BTreeMap::from([(
                     "LINT_RF_005".to_string(),
+                    serde_json::json!({"ignore_words_regex": "^bad-"}),
+                )]),
+            },
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn ignore_words_regex_is_case_sensitive() {
+        let issues = run_with_config(
+            "SELECT \"bad-name\" FROM t",
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "LINT_RF_005".to_string(),
                     serde_json::json!({"ignore_words_regex": "^BAD-"}),
+                )]),
+            },
+        );
+        assert_eq!(issues.len(), 1, "regex should be case-sensitive");
+    }
+
+    #[test]
+    fn flags_create_table_column_with_space() {
+        let issues = run("CREATE TABLE DBO.ColumnNames (\n    \"Internal Space\" INT\n)");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_RF_005);
+    }
+
+    #[test]
+    fn allow_space_in_identifier_permits_space() {
+        let issues = run_with_config(
+            "CREATE TABLE DBO.ColumnNames (\n    \"Internal Space\" INT\n)",
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "references.special_chars".to_string(),
+                    serde_json::json!({"allow_space_in_identifier": true}),
                 )]),
             },
         );
