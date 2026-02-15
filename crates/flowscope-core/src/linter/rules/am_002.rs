@@ -82,7 +82,11 @@ fn check_query_body(
             check_query_body(left, unions, ctx, issues);
             let union_span = unions.next();
 
-            if matches!(set_quantifier, SetQuantifier::None | SetQuantifier::ByName) {
+            if matches!(set_quantifier, SetQuantifier::None | SetQuantifier::ByName)
+                // PostgreSQL treats bare UNION as UNION DISTINCT unambiguously,
+                // so flagging it would be noise.
+                && !matches!(ctx.dialect(), Dialect::Postgres)
+            {
                 let mut issue = Issue::warning(
                     issue_codes::LINT_AM_002,
                     "Use UNION DISTINCT or UNION ALL instead of bare UNION.",
@@ -326,7 +330,8 @@ fn relative_location(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_sql;
+    use crate::linter::rule::with_active_dialect;
+    use crate::parser::{parse_sql, parse_sql_with_dialect};
     use crate::types::IssueAutofixApplicability;
 
     fn check_sql(sql: &str) -> Vec<Issue> {
@@ -341,6 +346,25 @@ mod tests {
         for stmt in &stmts {
             issues.extend(rule.check(stmt, &ctx));
         }
+        issues
+    }
+
+    fn check_sql_in_dialect(sql: &str, dialect: Dialect) -> Vec<Issue> {
+        let stmts = parse_sql_with_dialect(sql, dialect).unwrap();
+        let rule = BareUnion;
+        let mut issues = Vec::new();
+        with_active_dialect(dialect, || {
+            for stmt in &stmts {
+                issues.extend(rule.check(
+                    stmt,
+                    &LintContext {
+                        sql,
+                        statement_range: 0..sql.len(),
+                        statement_index: 0,
+                    },
+                ));
+            }
+        });
         issues
     }
 
@@ -454,6 +478,16 @@ mod tests {
         let span = issues[0].span.expect("UNION issue should include a span");
         let union_pos = sql.find("UNION").expect("query should contain UNION");
         assert_eq!(span.start, union_pos);
+    }
+
+    #[test]
+    fn postgres_bare_union_is_allowed() {
+        // SQLFluff: test_postgres — PostgreSQL treats bare UNION as UNION DISTINCT.
+        let issues = check_sql_in_dialect(
+            "select a, b from tbl1 union select c, d from tbl2",
+            Dialect::Postgres,
+        );
+        assert!(issues.is_empty());
     }
 
     #[test]
