@@ -710,9 +710,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_ST_005) {
         out = fix_subquery_to_cte(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_TQ_002) {
-        out = fix_tsql_procedure_begin_end(&out);
-    }
 
     out
 }
@@ -905,6 +902,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_004)
@@ -2105,63 +2103,6 @@ fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_idx: usize) ->
     }
 
     None
-}
-
-fn fix_tsql_procedure_begin_end(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let Some(create_end) = match_ascii_keyword_at(bytes, i, b"CREATE") else {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        };
-        let proc_start = skip_ascii_whitespace(bytes, create_end);
-        if proc_start == create_end {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        let Some(proc_end) = match_ascii_keyword_at(bytes, proc_start, b"PROC")
-            .or_else(|| match_ascii_keyword_at(bytes, proc_start, b"PROCEDURE"))
-        else {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        };
-
-        let ident_start = skip_ascii_whitespace(bytes, proc_end);
-        if ident_start == proc_end {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        let Some(ident_end) = consume_ascii_identifier(bytes, ident_start) else {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        };
-
-        let mut quote_start = ident_end;
-        while quote_start < bytes.len() && is_ascii_whitespace_byte(bytes[quote_start]) {
-            quote_start += 1;
-        }
-        if quote_start >= bytes.len() || bytes[quote_start] != b'\'' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-
-        out.push_str("CREATE PROCEDURE ");
-        out.push_str(&sql[ident_start..ident_end]);
-        out.push_str(" BEGIN END");
-        out.push_str(&sql[ident_end..quote_start + 1]);
-        i = quote_start + 1;
-    }
-
-    out
 }
 
 struct LocatedToken {

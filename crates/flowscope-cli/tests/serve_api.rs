@@ -544,6 +544,31 @@ async fn lint_fix_applies_tq003_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_tq002_core_autofix_in_patch_mode() {
+    let mut config = default_config();
+    config.dialect = Dialect::Mssql;
+    let state = test_state(config, vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "CREATE PROCEDURE p AS SELECT 1;\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "CREATE PROCEDURE p AS BEGIN SELECT 1; END;\n",
+        "expected TQ002 core autofix to wrap procedure body with BEGIN/END"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cp001_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

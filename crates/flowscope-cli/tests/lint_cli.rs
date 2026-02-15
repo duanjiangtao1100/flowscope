@@ -839,6 +839,37 @@ fn test_lint_fix_applies_tq003_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_tq002_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("tsql_procedure_begin_end_patch_fix.sql");
+    std::fs::write(&sql_path, "CREATE PROCEDURE p AS SELECT 1;\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--dialect",
+            "mssql",
+            "--lint",
+            "--fix",
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "CREATE PROCEDURE p AS BEGIN SELECT 1; END;\n",
+        "Expected TQ002 core autofix to wrap procedure body with BEGIN/END: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_cp001_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("keyword_capitalisation_patch_fix.sql");
