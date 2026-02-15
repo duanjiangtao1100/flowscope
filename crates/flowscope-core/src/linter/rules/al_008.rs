@@ -500,6 +500,16 @@ mod tests {
     }
 
     #[test]
+    fn flags_multiple_reused_aliases_in_projection() {
+        // SQLFluff: test_fail_locs — `foo` reused on lines 3 and 6; `bar` on line 5.
+        // Note: fixture SQL has trailing comma and no FROM clause.
+        let sql = "select\n  foo,\n  b as foo,\n  c as bar,\n  bar,\n  d foo\nfrom t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_AL_008);
+    }
+
+    #[test]
     fn alias_case_check_quoted_cs_naked_lower_allows_nonmatching_quoted_case() {
         let sql = "select \"FOO\", FOO from t";
         let statements = parse_sql(sql).expect("parse");

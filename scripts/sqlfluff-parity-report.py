@@ -170,6 +170,13 @@ def extract_rule_configs(configs: dict | None) -> dict | None:
                 lt03_cfg = result.setdefault("layout.operators", {})
                 lt03_cfg.setdefault("line_position", op_cfg["line_position"])
 
+    # Map layout.type.comma.line_position → layout.commas.line_position for LT04.
+    if layout_type and isinstance(layout_type, dict):
+        comma_cfg = layout_type.get("comma", {})
+        if isinstance(comma_cfg, dict) and "line_position" in comma_cfg:
+            lt04_cfg = result.setdefault("layout.commas", {})
+            lt04_cfg.setdefault("line_position", comma_cfg["line_position"])
+
     return result if result else None
 
 
