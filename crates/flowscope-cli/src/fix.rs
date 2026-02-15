@@ -2015,13 +2015,6 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
                     right_ref.as_deref(),
                 );
             }
-            if rule_filter.allows(issue_codes::LINT_ST_009) {
-                rewrite_join_condition_order(
-                    &mut join.join_operator,
-                    right_ref.as_deref(),
-                    left_ref.as_deref(),
-                );
-            }
 
             fix_table_factor(&mut join.relation, rule_filter);
             fix_join_operator(&mut join.join_operator, rule_filter);
@@ -3066,113 +3059,6 @@ fn rewrite_using_join_constraint(
     }
 }
 
-fn rewrite_join_condition_order(
-    join_operator: &mut JoinOperator,
-    current_source: Option<&str>,
-    previous_source: Option<&str>,
-) {
-    let (Some(current_source), Some(previous_source)) = (current_source, previous_source) else {
-        return;
-    };
-
-    let current_source = current_source.to_ascii_uppercase();
-    let previous_source = previous_source.to_ascii_uppercase();
-
-    let Some(constraint) = join_constraint_mut(join_operator) else {
-        return;
-    };
-
-    let JoinConstraint::On(on_expr) = constraint else {
-        return;
-    };
-
-    rewrite_reversed_join_pairs(on_expr, &current_source, &previous_source);
-}
-
-fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_source: &str) {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            if *op == BinaryOperator::Eq {
-                let left_prefix = expr_qualified_prefix(left);
-                let right_prefix = expr_qualified_prefix(right);
-                if left_prefix.as_deref() == Some(current_source)
-                    && right_prefix.as_deref() == Some(previous_source)
-                {
-                    std::mem::swap(left, right);
-                }
-            }
-
-            rewrite_reversed_join_pairs(left, current_source, previous_source);
-            rewrite_reversed_join_pairs(right, current_source, previous_source);
-        }
-        Expr::UnaryOp { expr: inner, .. }
-        | Expr::Nested(inner)
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::IsTrue(inner)
-        | Expr::IsNotTrue(inner)
-        | Expr::IsFalse(inner)
-        | Expr::IsNotFalse(inner)
-        | Expr::IsUnknown(inner)
-        | Expr::IsNotUnknown(inner)
-        | Expr::Cast { expr: inner, .. } => {
-            rewrite_reversed_join_pairs(inner, current_source, previous_source)
-        }
-        Expr::InList {
-            expr: target, list, ..
-        } => {
-            rewrite_reversed_join_pairs(target, current_source, previous_source);
-            for item in list {
-                rewrite_reversed_join_pairs(item, current_source, previous_source);
-            }
-        }
-        Expr::Between {
-            expr: target,
-            low,
-            high,
-            ..
-        } => {
-            rewrite_reversed_join_pairs(target, current_source, previous_source);
-            rewrite_reversed_join_pairs(low, current_source, previous_source);
-            rewrite_reversed_join_pairs(high, current_source, previous_source);
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                rewrite_reversed_join_pairs(operand, current_source, previous_source);
-            }
-            for case_when in conditions {
-                rewrite_reversed_join_pairs(
-                    &mut case_when.condition,
-                    current_source,
-                    previous_source,
-                );
-                rewrite_reversed_join_pairs(&mut case_when.result, current_source, previous_source);
-            }
-            if let Some(else_result) = else_result {
-                rewrite_reversed_join_pairs(else_result, current_source, previous_source);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn expr_qualified_prefix(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() > 1 => {
-            parts.first().map(|ident| ident.value.to_ascii_uppercase())
-        }
-        Expr::Nested(inner)
-        | Expr::UnaryOp { expr: inner, .. }
-        | Expr::Cast { expr: inner, .. } => expr_qualified_prefix(inner),
-        _ => None,
-    }
-}
-
 fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter) {
     match relation {
         TableFactor::Table {
@@ -3217,13 +3103,6 @@ fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter) {
                         &mut join.join_operator,
                         left_ref.as_deref(),
                         right_ref.as_deref(),
-                    );
-                }
-                if rule_filter.allows(issue_codes::LINT_ST_009) {
-                    rewrite_join_condition_order(
-                        &mut join.join_operator,
-                        right_ref.as_deref(),
-                        left_ref.as_deref(),
                     );
                 }
 

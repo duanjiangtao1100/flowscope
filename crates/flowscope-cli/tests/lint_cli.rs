@@ -1027,6 +1027,37 @@ fn test_lint_fix_applies_st006_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_st009_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir
+        .path()
+        .join("structure_join_condition_order_patch_fix.sql");
+    std::fs::write(
+        &sql_path,
+        "SELECT foo.a, bar.b FROM foo LEFT JOIN bar ON bar.a = foo.a\n",
+    )
+    .expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT foo.a, bar.b FROM foo LEFT JOIN bar ON foo.a = bar.a\n",
+        "Expected ST009 core autofix to reorder join predicate source sides: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_st002_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("structure_simple_case_patch_fix.sql");
