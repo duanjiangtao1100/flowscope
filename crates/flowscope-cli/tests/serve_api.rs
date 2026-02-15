@@ -629,6 +629,29 @@ async fn lint_fix_applies_am005_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_am008_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT foo.a, bar.b FROM foo INNER JOIN bar\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT foo.a, bar.b FROM foo CROSS JOIN bar\n",
+        "expected AM008 core autofix to rewrite conditionless INNER JOIN to CROSS JOIN"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_st008_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

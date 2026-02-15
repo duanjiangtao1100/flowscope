@@ -800,6 +800,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_005)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_AM_008)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_004)
@@ -2062,18 +2063,12 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
         rewrite_implicit_where_joins(select);
     }
 
-    let has_where_clause = select.selection.is_some();
-
     for table_with_joins in &mut select.from {
         if rule_filter.allows(issue_codes::LINT_CV_008) {
             rewrite_right_join_to_left(table_with_joins);
         }
 
-        fix_table_factor(
-            &mut table_with_joins.relation,
-            rule_filter,
-            has_where_clause,
-        );
+        fix_table_factor(&mut table_with_joins.relation, rule_filter);
 
         let mut left_ref = table_factor_reference_name(&table_with_joins.relation);
 
@@ -2094,8 +2089,8 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
                 );
             }
 
-            fix_table_factor(&mut join.relation, rule_filter, has_where_clause);
-            fix_join_operator(&mut join.join_operator, rule_filter, has_where_clause);
+            fix_table_factor(&mut join.relation, rule_filter);
+            fix_join_operator(&mut join.join_operator, rule_filter);
 
             if right_ref.is_some() {
                 left_ref = right_ref;
@@ -3255,7 +3250,7 @@ fn expr_qualified_prefix(expr: &Expr) -> Option<String> {
     }
 }
 
-fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter, has_where_clause: bool) {
+fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter) {
     match relation {
         TableFactor::Table {
             args, with_hints, ..
@@ -3288,11 +3283,7 @@ fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter, has_wh
                 rewrite_right_join_to_left(table_with_joins);
             }
 
-            fix_table_factor(
-                &mut table_with_joins.relation,
-                rule_filter,
-                has_where_clause,
-            );
+            fix_table_factor(&mut table_with_joins.relation, rule_filter);
 
             let mut left_ref = table_factor_reference_name(&table_with_joins.relation);
 
@@ -3313,8 +3304,8 @@ fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter, has_wh
                     );
                 }
 
-                fix_table_factor(&mut join.relation, rule_filter, has_where_clause);
-                fix_join_operator(&mut join.join_operator, rule_filter, has_where_clause);
+                fix_table_factor(&mut join.relation, rule_filter);
+                fix_join_operator(&mut join.join_operator, rule_filter);
 
                 if right_ref.is_some() {
                     left_ref = right_ref;
@@ -3328,7 +3319,7 @@ fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter, has_wh
             default_on_null,
             ..
         } => {
-            fix_table_factor(table, rule_filter, has_where_clause);
+            fix_table_factor(table, rule_filter);
             for func in aggregate_functions {
                 fix_expr(&mut func.expr, rule_filter);
             }
@@ -3345,7 +3336,7 @@ fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter, has_wh
             columns,
             ..
         } => {
-            fix_table_factor(table, rule_filter, has_where_clause);
+            fix_table_factor(table, rule_filter);
             fix_expr(value, rule_filter);
             for column in columns {
                 fix_expr(&mut column.expr, rule_filter);
@@ -3357,7 +3348,7 @@ fn fix_table_factor(relation: &mut TableFactor, rule_filter: &RuleFilter, has_wh
     }
 }
 
-fn fix_join_operator(op: &mut JoinOperator, rule_filter: &RuleFilter, has_where_clause: bool) {
+fn fix_join_operator(op: &mut JoinOperator, rule_filter: &RuleFilter) {
     match op {
         JoinOperator::Join(constraint)
         | JoinOperator::Inner(constraint)
@@ -3383,28 +3374,6 @@ fn fix_join_operator(op: &mut JoinOperator, rule_filter: &RuleFilter, has_where_
         }
         JoinOperator::CrossApply | JoinOperator::OuterApply => {}
     }
-
-    if rule_filter.allows(issue_codes::LINT_AM_008)
-        && !has_where_clause
-        && operator_requires_join_condition(op)
-        && !join_constraint_is_explicit(op)
-    {
-        *op = JoinOperator::CrossJoin(JoinConstraint::None);
-    }
-}
-
-fn operator_requires_join_condition(join_operator: &JoinOperator) -> bool {
-    matches!(
-        join_operator,
-        JoinOperator::Join(_)
-            | JoinOperator::Inner(_)
-            | JoinOperator::Left(_)
-            | JoinOperator::LeftOuter(_)
-            | JoinOperator::Right(_)
-            | JoinOperator::RightOuter(_)
-            | JoinOperator::FullOuter(_)
-            | JoinOperator::StraightJoin(_)
-    )
 }
 
 fn join_constraint_is_explicit(join_operator: &JoinOperator) -> bool {
