@@ -5,7 +5,7 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
-use sqlparser::ast::{Query, Select, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{Query, Select, SetExpr, Statement, TableFactor, UpdateTableFromKind};
 use std::collections::{HashMap, HashSet};
 
 use super::column_count_helpers::{
@@ -65,6 +65,20 @@ fn lint_statement_set_ops(
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 lint_query_set_ops(query, outer_ctes, violations);
+            }
+        }
+        Statement::Update {
+            from: Some(from_kind),
+            ..
+        } => {
+            let tables = match from_kind {
+                UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
+            };
+            for twj in tables {
+                lint_table_factor_set_ops(&twj.relation, outer_ctes, violations);
+                for join in &twj.joins {
+                    lint_table_factor_set_ops(&join.relation, outer_ctes, violations);
+                }
             }
         }
         _ => {}
@@ -324,5 +338,14 @@ mod tests {
             "select j.* from ((select * from t1) as a1 natural join (select a from t2) as b1) as j union all select x from t3",
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn update_from_with_set_column_mismatch() {
+        // SQLFluff: test_fail_cte_no_select_final_statement
+        let sql = "UPDATE sometable SET sometable.baz = mycte.bar FROM (SELECT foo, bar FROM mytable1 UNION ALL SELECT bar FROM mytable2) as k";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_AM_007);
     }
 }

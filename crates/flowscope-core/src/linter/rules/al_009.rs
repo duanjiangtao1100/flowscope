@@ -2,6 +2,7 @@
 //!
 //! SQLFluff AL09 parity: avoid aliasing a column to its own name.
 
+use crate::generated::NormalizationStrategy;
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
@@ -78,13 +79,20 @@ impl LintRule for AliasingSelfAliasColumn {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let mut violating_aliases = Vec::new();
 
+        // Resolve Dialect mode to the concrete normalization strategy at check time
+        // so the matching logic uses the actual dialect rules.
+        let strategy = match self.alias_case_check {
+            AliasCaseCheck::Dialect => Some(ctx.dialect().normalization_strategy()),
+            _ => None,
+        };
+
         visit_selects_in_statement(statement, &mut |select| {
             for item in &select.projection {
                 let SelectItem::ExprWithAlias { expr, alias } = item else {
                     continue;
                 };
 
-                if aliases_expression_to_itself(expr, alias, self.alias_case_check) {
+                if aliases_expression_to_itself(expr, alias, self.alias_case_check, strategy) {
                     violating_aliases.push(alias.clone());
                 }
             }
@@ -354,6 +362,7 @@ fn aliases_expression_to_itself(
     expr: &Expr,
     alias: &Ident,
     alias_case_check: AliasCaseCheck,
+    dialect_strategy: Option<NormalizationStrategy>,
 ) -> bool {
     let Some(source_name) = expression_name(expr) else {
         return false;
@@ -364,7 +373,7 @@ fn aliases_expression_to_itself(
         quoted: alias.quote_style.is_some(),
     };
 
-    names_match(source_name, alias_name, alias_case_check)
+    names_match(source_name, alias_name, alias_case_check, dialect_strategy)
 }
 
 fn expression_name(expr: &Expr) -> Option<NameRef<'_>> {
@@ -382,15 +391,38 @@ fn expression_name(expr: &Expr) -> Option<NameRef<'_>> {
     }
 }
 
-fn names_match(left: NameRef<'_>, right: NameRef<'_>, alias_case_check: AliasCaseCheck) -> bool {
+fn names_match(
+    left: NameRef<'_>,
+    right: NameRef<'_>,
+    alias_case_check: AliasCaseCheck,
+    dialect_strategy: Option<NormalizationStrategy>,
+) -> bool {
     match alias_case_check {
         AliasCaseCheck::CaseInsensitive => left.name.eq_ignore_ascii_case(right.name),
         AliasCaseCheck::CaseSensitive => left.name == right.name,
         AliasCaseCheck::Dialect => {
-            if left.quoted || right.quoted {
+            let strategy = dialect_strategy.unwrap_or(NormalizationStrategy::CaseInsensitive);
+
+            // When quoting differs between the column and alias, the user
+            // deliberately chose different quoting styles. This signals
+            // intent rather than a redundant self-alias, so never flag it.
+            if left.quoted != right.quoted {
+                return false;
+            }
+
+            if left.quoted {
+                // Both quoted — exact match required.
                 left.name == right.name
             } else {
-                left.name.eq_ignore_ascii_case(right.name)
+                // Both unquoted — compare using the dialect's folding strategy.
+                match strategy {
+                    NormalizationStrategy::CaseSensitive => left.name == right.name,
+                    NormalizationStrategy::CaseInsensitive
+                    | NormalizationStrategy::Lowercase
+                    | NormalizationStrategy::Uppercase => {
+                        left.name.eq_ignore_ascii_case(right.name)
+                    }
+                }
             }
         }
         AliasCaseCheck::QuotedCsNakedUpper | AliasCaseCheck::QuotedCsNakedLower => {
@@ -423,8 +455,9 @@ fn normalize_name_for_mode(name_ref: NameRef<'_>, mode: AliasCaseCheck) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_sql;
-    use crate::types::IssueAutofixApplicability;
+    use crate::linter::rule::with_active_dialect;
+    use crate::parser::{parse_sql, parse_sql_with_dialect};
+    use crate::types::{Dialect, IssueAutofixApplicability};
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -443,6 +476,25 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn run_in_dialect(sql: &str, dialect: Dialect) -> Vec<Issue> {
+        let statements = parse_sql_with_dialect(sql, dialect).expect("parse");
+        let rule = AliasingSelfAliasColumn::default();
+        let mut issues = Vec::new();
+        with_active_dialect(dialect, || {
+            for (index, statement) in statements.iter().enumerate() {
+                issues.extend(rule.check(
+                    statement,
+                    &LintContext {
+                        sql,
+                        statement_range: 0..sql.len(),
+                        statement_index: index,
+                    },
+                ));
+            }
+        });
+        issues
     }
 
     #[test]
@@ -635,5 +687,43 @@ mod tests {
         let edit = &autofix.edits[0];
         assert_eq!(&sql[edit.span.start..edit.span.end], " a");
         assert_eq!(edit.replacement, "");
+    }
+
+    // --- SQLFluff parity: dialect-aware matching ---
+
+    #[test]
+    fn clickhouse_case_sensitive_no_false_positives() {
+        // SQLFluff: test_pass_different_case_clickhouse
+        // ClickHouse is CaseSensitive — different case means different identifier.
+        let sql = "select col_b as Col_B, COL_C as col_c, Col_D as COL_D from foo";
+        let issues = run_in_dialect(sql, Dialect::Clickhouse);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn clickhouse_quoted_case_sensitive_no_false_positives() {
+        // SQLFluff: test_pass_different_case_clickhouse (quoted portion)
+        let sql = r#"select "col_b" as "Col_B", "COL_C" as "col_c", "Col_D" as "COL_D" from foo"#;
+        let issues = run_in_dialect(sql, Dialect::Clickhouse);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn different_quotes_not_flagged() {
+        // SQLFluff: test_pass_different_quotes (ansi dialect)
+        // When one side is quoted and the other is not, the identifier
+        // semantics differ (quoted preserves case, unquoted folds to upper
+        // in ANSI). These should not be flagged as self-aliases.
+        let sql = r#"select "col_b" as col_b, COL_C as "COL_C", "Col_D" as Col_D from foo"#;
+        let issues = run_in_dialect(sql, Dialect::Ansi);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn bigquery_backtick_self_alias_detected() {
+        // SQLFluff: test_fail_bigquery_quoted_column_no_space_with_as
+        let sql = "SELECT `col`as`col` FROM clients as c";
+        let issues = run_in_dialect(sql, Dialect::Bigquery);
+        assert_eq!(issues.len(), 1);
     }
 }

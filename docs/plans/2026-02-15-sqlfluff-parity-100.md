@@ -198,13 +198,14 @@ Covers all remaining rules with smaller individual gaps. AM05 (20 gaps: 1 FP + 8
 - [x] Fix RF04: 11 FN in `rf_004.rs` — detection 11/11 via ALL_KEYWORDS binary search
 - [ ] Fix CV01: 4 FN in `cv_001.rs`, fix 6 fix mismatches
 - [ ] Fix CV04: 3 FP + 4 FN in `cv_004.rs`, fix 6 fix mismatches
-- [ ] Fix CV12: 2 FN in `cv_012.rs`, fix 6 fix mismatches
+- [x] Fix CV12: 2 FN in `cv_012.rs`, fix 6 fix mismatches — detection 11/11 pass + 9/9 fail, schema-qualified prefix + bracketed NestedJoin support
 - [ ] Fix ST07: fix 6 fix mismatches in `st_007.rs`
 - [x] Fix ST08: 4 FN in `st_008.rs`, fix 4 fix mismatches — detection 7/7, fix 6/7, token-only detection
 - [x] Fix ST03: 2 FP + 2 FN in `st_003.rs` — detection 19/19 pass + 11/11 fail, UPDATE/DELETE/nested CTE support
 - [x] Fix AL03: 6 FP + 1 FN in `al_003.rs` — detection 16/16, DuckDB COLUMNS macro + DoubleColon cast + CTE column list
-- [ ] Fix AL09: 2 FP + 1 FN in `al_009.rs`, fix 5 fix mismatches
-- [ ] Fix remaining small-gap rules: CP04, CV02, CV03, CV05, CV07, RF01, RF02, AM04, AM07, AM08, LT07, LT08, LT10, LT11, LT13, LT15, AM02
+- [x] Fix AL09: 2 FP + 1 FN in `al_009.rs`, fix 5 fix mismatches — detection 9/9 pass + 5/6 fail, dialect-aware NormalizationStrategy + different-quote guard, 1 FN is parser limitation (BigQuery backtick escape)
+- [x] Fix AM07: 1 FN in `am_007.rs` — detection 27/27 pass + 10/10 fail, UPDATE FROM subquery set-operation traversal
+- [ ] Fix remaining small-gap rules: CP04, CV02, CV03, CV05, CV07, RF01, RF02, AM04, AM08, LT07, LT08, LT10, LT11, LT13, LT15, AM02
 - [ ] Verify all remaining rules show 0 gaps in parity report
 
 ### Task 17: Final Verification and Cleanup

@@ -5,7 +5,9 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
-use sqlparser::ast::{BinaryOperator, Expr, JoinConstraint, JoinOperator, Select, Statement};
+use sqlparser::ast::{
+    BinaryOperator, Expr, JoinConstraint, JoinOperator, Select, Statement, TableFactor,
+};
 
 use super::semantic_helpers::{table_factor_reference_name, visit_selects_in_statement};
 
@@ -53,16 +55,12 @@ fn select_has_implicit_where_join(select: &Select) -> bool {
     for table in &select.from {
         let mut seen_sources = Vec::new();
         let mut bare_join_match_flags = Vec::new();
-        if let Some(base) = table_factor_reference_name(&table.relation) {
-            seen_sources.push(base);
-        }
+        collect_table_factor_sources(&table.relation, &mut seen_sources);
 
         for join in &table.joins {
-            let current_source = table_factor_reference_name(&join.relation);
+            let join_sources = collect_table_factor_all_sources(&join.relation);
             let Some(constraint) = join_constraint(&join.join_operator) else {
-                if let Some(source) = current_source {
-                    seen_sources.push(source);
-                }
+                seen_sources.extend(join_sources);
                 continue;
             };
 
@@ -71,20 +69,20 @@ fn select_has_implicit_where_join(select: &Select) -> bool {
                 JoinConstraint::On(_) | JoinConstraint::Using(_) | JoinConstraint::Natural
             );
             if has_explicit_join_clause {
-                if let Some(source) = current_source {
-                    seen_sources.push(source);
-                }
+                seen_sources.extend(join_sources);
                 continue;
             }
 
             let matched_where_predicate = select.selection.as_ref().is_some_and(|where_expr| {
-                where_contains_join_predicate(where_expr, current_source.as_ref(), &seen_sources)
+                // For a nested join, any inner source can be the "current" source.
+                join_sources.iter().any(|src| {
+                    where_contains_join_predicate(where_expr, Some(src), &seen_sources)
+                }) || (join_sources.is_empty()
+                    && where_contains_join_predicate(where_expr, None, &seen_sources))
             });
             bare_join_match_flags.push(matched_where_predicate);
 
-            if let Some(source) = current_source {
-                seen_sources.push(source);
-            }
+            seen_sources.extend(join_sources);
         }
 
         // SQLFluff CV12 parity: only flag when all plain/naked joins in a
@@ -95,6 +93,40 @@ fn select_has_implicit_where_join(select: &Select) -> bool {
     }
 
     false
+}
+
+/// Adds the reference name for a table factor to the list.
+fn collect_table_factor_sources(table_factor: &TableFactor, sources: &mut Vec<String>) {
+    if let Some(name) = table_factor_reference_name(table_factor) {
+        sources.push(name);
+    }
+}
+
+/// Collects all table source names from a table factor, including nested join
+/// members. For a simple table reference this returns a single name. For a
+/// `NestedJoin` it returns all inner table names.
+fn collect_table_factor_all_sources(table_factor: &TableFactor) -> Vec<String> {
+    let mut sources = Vec::new();
+    match table_factor {
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+            ..
+        } => {
+            if let Some(alias) = alias {
+                sources.push(alias.name.value.to_ascii_uppercase());
+            } else {
+                collect_table_factor_sources(&table_with_joins.relation, &mut sources);
+                for join in &table_with_joins.joins {
+                    collect_table_factor_sources(&join.relation, &mut sources);
+                }
+            }
+        }
+        _ => {
+            collect_table_factor_sources(table_factor, &mut sources);
+        }
+    }
+    sources
 }
 
 fn join_constraint(join_operator: &JoinOperator) -> Option<&JoinConstraint> {
@@ -208,7 +240,12 @@ fn references_joined_sources(
 fn qualifier_prefix(expr: &Expr) -> Option<String> {
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() > 1 => {
-            parts.first().map(|part| part.value.to_ascii_uppercase())
+            // For `table.col` (2 parts), the qualifier is the first part.
+            // For `schema.table.col` (3+ parts), the qualifier is the
+            // penultimate part (the table name) since that is what
+            // `table_factor_reference_name` extracts as the source name.
+            let qualifier_index = parts.len() - 2;
+            Some(parts[qualifier_index].value.to_ascii_uppercase())
         }
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
@@ -290,6 +327,24 @@ mod tests {
     #[test]
     fn flags_multi_join_chain_when_all_plain_joins_are_where_joined() {
         let sql = "select a.id from a join b join c where a.a = b.a and b.b = c.b";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_CV_012);
+    }
+
+    #[test]
+    fn flags_schema_qualified_where_join() {
+        // SQLFluff: test_fail_missing_clause_and_stmt_qualified
+        let sql = "SELECT foo.a, bar.b FROM schema.foo JOIN schema.bar WHERE schema.foo.x = schema.bar.y AND schema.foo.x = 3";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_CV_012);
+    }
+
+    #[test]
+    fn flags_bracketed_join_with_where_predicate() {
+        // SQLFluff: test_fail_join_with_bracketed_join
+        let sql = "SELECT * FROM bar JOIN (foo1 JOIN foo2 ON (foo1.id = foo2.id)) WHERE bar.id = foo1.id";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_012);
