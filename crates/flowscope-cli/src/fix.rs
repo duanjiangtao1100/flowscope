@@ -727,14 +727,11 @@ fn try_core_only_fix_plan(
     })
 }
 
-fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, dialect: Dialect) -> String {
+fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> String {
     let mut out = sql.to_string();
 
     if rule_filter.allows(issue_codes::LINT_LT_002) {
         out = fix_indentation(&out);
-    }
-    if rule_filter.allows(issue_codes::LINT_LT_001) {
-        out = fix_operator_spacing(&out, dialect);
     }
     if rule_filter.allows(issue_codes::LINT_LT_005) {
         out = fix_long_lines(&out);
@@ -1496,30 +1493,6 @@ fn char_to_byte_offsets(text: &str) -> Vec<usize> {
     offsets
 }
 
-fn apply_span_edits(sql: &str, mut edits: Vec<SpanEdit>) -> String {
-    if edits.is_empty() {
-        return sql.to_string();
-    }
-
-    edits.sort_by_key(|edit| (edit.start, edit.end));
-    edits.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.replacement == b.replacement);
-
-    let mut out = sql.to_string();
-    let mut last_start = usize::MAX;
-    for edit in edits.into_iter().rev() {
-        if edit.start > edit.end || edit.end > out.len() {
-            continue;
-        }
-        if edit.start >= last_start {
-            continue;
-        }
-        out.replace_range(edit.start..edit.end, &edit.replacement);
-        last_start = edit.start;
-    }
-
-    out
-}
-
 fn table_alias_occurrences(sql: &str, dialect: Dialect) -> Option<Vec<TableAliasOccurrence>> {
     let statements = parse_sql_with_dialect(sql, dialect).ok()?;
     let tokens = tokenize_with_offsets(sql, dialect)?;
@@ -1785,45 +1758,6 @@ fn normalize_line_indent(
     format!("{}{}", spaces, &line[end_of_ws..])
 }
 
-fn fix_operator_spacing(sql: &str, dialect: Dialect) -> String {
-    let Some(tokens) = tokenize_with_offsets(sql, dialect) else {
-        return sql.to_string();
-    };
-    let mut edits = Vec::new();
-
-    for (idx, token) in tokens.iter().enumerate() {
-        if !is_spacing_operator_token(&token.token) {
-            continue;
-        }
-        let Some(prev_idx) = prev_non_trivia_token(&tokens, idx) else {
-            continue;
-        };
-        let Some(next_idx) = next_non_trivia_token(&tokens, idx + 1) else {
-            continue;
-        };
-
-        let before_start = tokens[prev_idx].end;
-        let before_end = token.start;
-        if before_start <= before_end {
-            let gap = &sql[before_start..before_end];
-            if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
-                edits.push(SpanEdit::replace(before_start, before_end, " "));
-            }
-        }
-
-        let after_start = token.end;
-        let after_end = tokens[next_idx].start;
-        if after_start <= after_end {
-            let gap = &sql[after_start..after_end];
-            if !gap.contains('\n') && !gap.contains('\r') && gap != " " {
-                edits.push(SpanEdit::replace(after_start, after_end, " "));
-            }
-        }
-    }
-
-    apply_span_edits(sql, edits)
-}
-
 /// Maximum line length before `fix_long_lines` will attempt to split.
 const MAX_LINE_LENGTH: usize = 300;
 /// Target split position when breaking long lines.
@@ -2085,22 +2019,6 @@ fn next_non_trivia_token(tokens: &[LocatedToken], mut start: usize) -> Option<us
         start += 1;
     }
     None
-}
-
-fn prev_non_trivia_token(tokens: &[LocatedToken], start: usize) -> Option<usize> {
-    if start == 0 {
-        return None;
-    }
-    let mut idx = start - 1;
-    loop {
-        if !is_trivia_token(&tokens[idx].token) {
-            return Some(idx);
-        }
-        if idx == 0 {
-            return None;
-        }
-        idx -= 1;
-    }
 }
 
 fn token_matches_keyword(token: &Token, keyword: &str) -> bool {
@@ -3035,21 +2953,6 @@ fn is_trivia_token(token: &Token) -> bool {
                 | Whitespace::SingleLineComment { .. }
                 | Whitespace::MultiLineComment(_)
         )
-    )
-}
-
-fn is_spacing_operator_token(token: &Token) -> bool {
-    matches!(
-        token,
-        Token::Eq
-            | Token::Neq
-            | Token::Lt
-            | Token::Gt
-            | Token::LtEq
-            | Token::GtEq
-            | Token::Plus
-            | Token::Minus
-            | Token::DoubleEq
     )
 }
 
@@ -7012,13 +6915,16 @@ mod tests {
 
     #[test]
     fn spacing_fixes_do_not_rewrite_single_quoted_literals() {
-        let operator_fixed = fix_operator_spacing("SELECT a=1, 'x=y' FROM t", Dialect::Generic);
+        let operator_fixed =
+            apply_lint_fixes("SELECT payload->>'id', 'x=y' FROM t", Dialect::Generic, &[])
+                .expect("operator spacing fix result")
+                .sql;
         assert!(
             operator_fixed.contains("'x=y'"),
             "operator spacing must not mutate literals: {operator_fixed}"
         );
         assert!(
-            operator_fixed.contains("a = 1"),
+            operator_fixed.contains("payload ->>"),
             "operator spacing should still apply: {operator_fixed}"
         );
 

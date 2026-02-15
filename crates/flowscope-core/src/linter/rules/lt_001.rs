@@ -4,7 +4,7 @@
 //! where spacing is expected.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
@@ -25,37 +25,54 @@ impl LintRule for LayoutSpacing {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        spacing_violation_spans(ctx)
+        spacing_violations(ctx)
             .into_iter()
-            .map(|(start, end)| {
-                Issue::info(
+            .map(|((start, end), edits)| {
+                let mut issue = Issue::info(
                     issue_codes::LINT_LT_001,
                     "Operator spacing appears inconsistent.",
                 )
                 .with_statement(ctx.statement_index)
-                .with_span(ctx.span_from_statement_offset(start, end))
+                .with_span(ctx.span_from_statement_offset(start, end));
+                if !edits.is_empty() {
+                    let edits = edits
+                        .into_iter()
+                        .map(|(edit_start, edit_end, replacement)| {
+                            IssuePatchEdit::new(
+                                ctx.span_from_statement_offset(edit_start, edit_end),
+                                replacement,
+                            )
+                        })
+                        .collect();
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+                }
+                issue
             })
             .collect()
     }
 }
 
-fn spacing_violation_spans(ctx: &LintContext) -> Vec<(usize, usize)> {
+type Lt01Span = (usize, usize);
+type Lt01AutofixEdit = (usize, usize, &'static str);
+type Lt01Violation = (Lt01Span, Vec<Lt01AutofixEdit>);
+
+fn spacing_violations(ctx: &LintContext) -> Vec<Lt01Violation> {
     let sql = ctx.statement_sql();
-    let mut spans = Vec::new();
+    let mut violations = Vec::new();
     let tokens = tokenized_for_context(ctx).or_else(|| tokenized(sql, ctx.dialect()));
     let Some(tokens) = tokens else {
-        return spans;
+        return violations;
     };
 
-    collect_json_arrow_spacing_violations(sql, &tokens, &mut spans);
-    collect_compact_text_bracket_violations(sql, &tokens, &mut spans);
-    collect_compact_numeric_scale_violations(sql, &tokens, &mut spans);
-    collect_exists_line_paren_violations(sql, &tokens, &mut spans);
+    collect_json_arrow_spacing_violations(sql, &tokens, &mut violations);
+    collect_compact_text_bracket_violations(sql, &tokens, &mut violations);
+    collect_compact_numeric_scale_violations(sql, &tokens, &mut violations);
+    collect_exists_line_paren_violations(sql, &tokens, &mut violations);
 
-    spans.sort_unstable();
-    spans.dedup();
+    violations.sort_unstable_by_key(|(span, _)| *span);
+    violations.dedup_by_key(|(span, _)| *span);
 
-    spans
+    violations
 }
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
@@ -112,7 +129,7 @@ fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<TokenWithSpan>> {
 fn collect_json_arrow_spacing_violations(
     sql: &str,
     tokens: &[TokenWithSpan],
-    spans: &mut Vec<(usize, usize)>,
+    violations: &mut Vec<Lt01Violation>,
 ) {
     for (index, token) in tokens.iter().enumerate() {
         if !matches!(token.token, Token::Arrow | Token::LongArrow) {
@@ -127,14 +144,27 @@ fn collect_json_arrow_spacing_violations(
         };
 
         if !has_trivia_between(tokens, prev_index, index) {
-            if let Some((start, _)) = token_offsets(sql, token) {
-                spans.push(single_char_span(sql, start));
+            if let (Some((prev_start, prev_end)), Some((arrow_start, _arrow_end))) = (
+                token_offsets(sql, &tokens[prev_index]),
+                token_offsets(sql, token),
+            ) {
+                let _ = prev_start;
+                let edits = safe_inline_gap_for_space(sql, prev_end, arrow_start)
+                    .map(|(start, end)| vec![(start, end, " ")])
+                    .unwrap_or_default();
+                violations.push((single_char_span(sql, arrow_start), edits));
             }
         }
 
         if !has_trivia_between(tokens, index, next_index) {
-            if let Some((start, _)) = token_offsets(sql, &tokens[next_index]) {
-                spans.push(single_char_span(sql, start));
+            if let (Some((_arrow_start, arrow_end)), Some((next_start, _next_end))) = (
+                token_offsets(sql, token),
+                token_offsets(sql, &tokens[next_index]),
+            ) {
+                let edits = safe_inline_gap_for_space(sql, arrow_end, next_start)
+                    .map(|(start, end)| vec![(start, end, " ")])
+                    .unwrap_or_default();
+                violations.push((single_char_span(sql, next_start), edits));
             }
         }
     }
@@ -143,7 +173,7 @@ fn collect_json_arrow_spacing_violations(
 fn collect_compact_text_bracket_violations(
     sql: &str,
     tokens: &[TokenWithSpan],
-    spans: &mut Vec<(usize, usize)>,
+    violations: &mut Vec<Lt01Violation>,
 ) {
     for (index, token) in tokens.iter().enumerate() {
         let Token::Word(word) = &token.token else {
@@ -163,8 +193,14 @@ fn collect_compact_text_bracket_violations(
             continue;
         }
 
-        if let Some((start, _)) = token_offsets(sql, &tokens[next_index]) {
-            spans.push(single_char_span(sql, start));
+        if let (Some((_word_start, word_end)), Some((bracket_start, _bracket_end))) = (
+            token_offsets(sql, token),
+            token_offsets(sql, &tokens[next_index]),
+        ) {
+            let edits = safe_inline_gap_for_space(sql, word_end, bracket_start)
+                .map(|(start, end)| vec![(start, end, " ")])
+                .unwrap_or_default();
+            violations.push((single_char_span(sql, bracket_start), edits));
         }
     }
 }
@@ -172,7 +208,7 @@ fn collect_compact_text_bracket_violations(
 fn collect_compact_numeric_scale_violations(
     sql: &str,
     tokens: &[TokenWithSpan],
-    spans: &mut Vec<(usize, usize)>,
+    violations: &mut Vec<Lt01Violation>,
 ) {
     for (index, token) in tokens.iter().enumerate() {
         if !matches!(token.token, Token::Comma) {
@@ -206,8 +242,14 @@ fn collect_compact_numeric_scale_violations(
             continue;
         }
 
-        if let Some((start, _)) = token_offsets(sql, &tokens[next_index]) {
-            spans.push(single_char_span(sql, start));
+        if let (Some((_comma_start, comma_end)), Some((next_start, _next_end))) = (
+            token_offsets(sql, token),
+            token_offsets(sql, &tokens[next_index]),
+        ) {
+            let edits = safe_inline_gap_for_space(sql, comma_end, next_start)
+                .map(|(start, end)| vec![(start, end, " ")])
+                .unwrap_or_default();
+            violations.push((single_char_span(sql, next_start), edits));
         }
     }
 }
@@ -215,7 +257,7 @@ fn collect_compact_numeric_scale_violations(
 fn collect_exists_line_paren_violations(
     sql: &str,
     tokens: &[TokenWithSpan],
-    spans: &mut Vec<(usize, usize)>,
+    violations: &mut Vec<Lt01Violation>,
 ) {
     for (index, token) in tokens.iter().enumerate() {
         let Token::Word(word) = &token.token else {
@@ -247,8 +289,20 @@ fn collect_exists_line_paren_violations(
         }
 
         if let Some((paren_start, _)) = token_offsets(sql, &tokens[next_index]) {
-            spans.push(single_char_span(sql, paren_start));
+            violations.push((single_char_span(sql, paren_start), Vec::new()));
         }
+    }
+}
+
+fn safe_inline_gap_for_space(sql: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    if start > end || end > sql.len() {
+        return None;
+    }
+    let gap = &sql[start..end];
+    if gap.chars().all(char::is_whitespace) && !gap.contains('\n') && !gap.contains('\r') {
+        Some((start, end))
+    } else {
+        None
     }
 }
 
@@ -430,6 +484,7 @@ fn relative_location(
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -450,6 +505,31 @@ mod tests {
             .collect()
     }
 
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
+    fn apply_all_issue_autofixes(sql: &str, issues: &[Issue]) -> String {
+        let mut out = sql.to_string();
+        let mut edits = issues
+            .iter()
+            .filter_map(|issue| issue.autofix.as_ref())
+            .flat_map(|autofix| autofix.edits.clone())
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        out
+    }
+
     #[test]
     fn does_not_flag_simple_spacing() {
         assert!(run("SELECT * FROM t WHERE a = 1").is_empty());
@@ -457,7 +537,8 @@ mod tests {
 
     #[test]
     fn flags_compact_json_arrow_operator() {
-        let issues = run("SELECT payload->>'id' FROM t");
+        let sql = "SELECT payload->>'id' FROM t";
+        let issues = run(sql);
         assert_eq!(
             issues
                 .iter()
@@ -465,18 +546,43 @@ mod tests {
                 .count(),
             2,
         );
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.autofix.as_ref().is_some_and(
+                    |autofix| autofix.applicability == IssueAutofixApplicability::Safe
+                )),
+            "expected safe autofix metadata for compact json-arrow spacing violations"
+        );
+
+        let fixed = apply_all_issue_autofixes(sql, &issues);
+        assert_eq!(fixed, "SELECT payload ->> 'id' FROM t");
     }
 
     #[test]
     fn flags_compact_type_bracket_and_numeric_scale() {
-        assert!(!run("SELECT ARRAY['x']::text[]").is_empty());
-        assert!(!run("SELECT 1::numeric(5,2)").is_empty());
+        let type_sql = "SELECT ARRAY['x']::text[]";
+        let type_issues = run(type_sql);
+        assert!(!type_issues.is_empty());
+        let type_fixed = apply_issue_autofix(type_sql, &type_issues[0]).expect("apply autofix");
+        assert_eq!(type_fixed, "SELECT ARRAY['x']::text []");
+
+        let numeric_sql = "SELECT 1::numeric(5,2)";
+        let numeric_issues = run(numeric_sql);
+        assert!(!numeric_issues.is_empty());
+        let numeric_fixed =
+            apply_issue_autofix(numeric_sql, &numeric_issues[0]).expect("apply autofix");
+        assert_eq!(numeric_fixed, "SELECT 1::numeric(5, 2)");
     }
 
     #[test]
     fn flags_exists_parenthesis_layout_case() {
         let issues = run("SELECT\n    EXISTS (\n        SELECT 1\n    ) AS has_row");
         assert!(!issues.is_empty());
+        assert!(
+            issues.iter().all(|issue| issue.autofix.is_none()),
+            "EXISTS newline layout violations remain report-only in conservative LT001 migration"
+        );
     }
 
     #[test]
