@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue};
+use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{Query, Select, SetExpr, Statement, TableFactor};
 use std::collections::HashSet;
 
@@ -96,15 +96,275 @@ impl LintRule for StructureSubquery {
             }
         });
 
+        if violations == 0 {
+            return Vec::new();
+        }
+
+        let autofix_edits =
+            st005_subquery_to_cte_rewrite(ctx.statement_sql(), self.forbid_subquery_in)
+                .filter(|rewritten| rewritten != ctx.statement_sql())
+                .map(|rewritten| {
+                    vec![IssuePatchEdit::new(
+                        ctx.span_from_statement_offset(0, ctx.statement_sql().len()),
+                        rewritten,
+                    )]
+                })
+                .unwrap_or_default();
+
         (0..violations)
-            .map(|_| {
-                Issue::info(
+            .map(|index| {
+                let mut issue = Issue::info(
                     issue_codes::LINT_ST_005,
                     "Join/From clauses should not contain subqueries. Use CTEs instead.",
                 )
-                .with_statement(ctx.statement_index)
+                .with_statement(ctx.statement_index);
+                if index == 0 && !autofix_edits.is_empty() {
+                    issue = issue.with_autofix_edits(
+                        IssueAutofixApplicability::Unsafe,
+                        autofix_edits.clone(),
+                    );
+                }
+                issue
             })
             .collect()
+    }
+}
+
+fn st005_subquery_to_cte_rewrite(
+    sql: &str,
+    forbid_subquery_in: ForbidSubqueryIn,
+) -> Option<String> {
+    if !forbid_subquery_in.forbid_from() {
+        return None;
+    }
+
+    let bytes = sql.as_bytes();
+    let mut index = skip_ascii_whitespace(bytes, 0);
+    let select_end = match_ascii_keyword_at(bytes, index, b"SELECT")?;
+    index = skip_ascii_whitespace(bytes, select_end);
+    if index == select_end || index >= bytes.len() || bytes[index] != b'*' {
+        return None;
+    }
+    index += 1;
+
+    let from_start = skip_ascii_whitespace(bytes, index);
+    if from_start == index {
+        return None;
+    }
+    let from_end = match_ascii_keyword_at(bytes, from_start, b"FROM")?;
+    let open_paren_index = skip_ascii_whitespace(bytes, from_end);
+    if open_paren_index == from_end
+        || open_paren_index >= bytes.len()
+        || bytes[open_paren_index] != b'('
+    {
+        return None;
+    }
+
+    let close_paren_index = find_matching_parenthesis_outside_quotes(sql, open_paren_index)?;
+    let subquery = sql[open_paren_index + 1..close_paren_index].trim();
+    if !subquery.to_ascii_lowercase().starts_with("select") {
+        return None;
+    }
+
+    let suffix = &sql[close_paren_index + 1..];
+    let alias = parse_subquery_alias_suffix(suffix)?;
+
+    let mut rewritten = format!("WITH {alias} AS ({subquery}) SELECT * FROM {alias}");
+    if suffix.trim_end().ends_with(';') {
+        rewritten.push(';');
+    }
+    Some(rewritten)
+}
+
+fn parse_subquery_alias_suffix(suffix: &str) -> Option<String> {
+    let bytes = suffix.as_bytes();
+    let mut index = skip_ascii_whitespace(bytes, 0);
+    if let Some(as_end) = match_ascii_keyword_at(bytes, index, b"AS") {
+        let after_as = skip_ascii_whitespace(bytes, as_end);
+        if after_as == as_end {
+            return None;
+        }
+        index = after_as;
+    }
+
+    let alias_start = index;
+    let alias_end = consume_ascii_identifier(bytes, alias_start)?;
+    index = skip_ascii_whitespace(bytes, alias_end);
+    if index < bytes.len() && bytes[index] == b';' {
+        index += 1;
+        index = skip_ascii_whitespace(bytes, index);
+    }
+    if index != bytes.len() {
+        return None;
+    }
+
+    Some(suffix[alias_start..alias_end].to_string())
+}
+
+fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_index: usize) -> Option<usize> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Outside,
+        SingleQuote,
+        DoubleQuote,
+        BacktickQuote,
+        BracketQuote,
+    }
+
+    let bytes = sql.as_bytes();
+    if open_paren_index >= bytes.len() || bytes[open_paren_index] != b'(' {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut mode = Mode::Outside;
+    let mut index = open_paren_index;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+
+        match mode {
+            Mode::Outside => {
+                if byte == b'\'' {
+                    mode = Mode::SingleQuote;
+                    index += 1;
+                    continue;
+                }
+                if byte == b'"' {
+                    mode = Mode::DoubleQuote;
+                    index += 1;
+                    continue;
+                }
+                if byte == b'`' {
+                    mode = Mode::BacktickQuote;
+                    index += 1;
+                    continue;
+                }
+                if byte == b'[' {
+                    mode = Mode::BracketQuote;
+                    index += 1;
+                    continue;
+                }
+                if byte == b'(' {
+                    depth += 1;
+                    index += 1;
+                    continue;
+                }
+                if byte == b')' {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                index += 1;
+            }
+            Mode::SingleQuote => {
+                if byte == b'\'' {
+                    if next == Some(b'\'') {
+                        index += 2;
+                    } else {
+                        mode = Mode::Outside;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Mode::DoubleQuote => {
+                if byte == b'"' {
+                    if next == Some(b'"') {
+                        index += 2;
+                    } else {
+                        mode = Mode::Outside;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Mode::BacktickQuote => {
+                if byte == b'`' {
+                    if next == Some(b'`') {
+                        index += 2;
+                    } else {
+                        mode = Mode::Outside;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            Mode::BracketQuote => {
+                if byte == b']' {
+                    if next == Some(b']') {
+                        index += 2;
+                    } else {
+                        mode = Mode::Outside;
+                        index += 1;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn is_ascii_whitespace_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c)
+}
+
+fn is_ascii_ident_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_ascii_ident_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && is_ascii_whitespace_byte(bytes[index]) {
+        index += 1;
+    }
+    index
+}
+
+fn consume_ascii_identifier(bytes: &[u8], start: usize) -> Option<usize> {
+    if start >= bytes.len() || !is_ascii_ident_start(bytes[start]) {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < bytes.len() && is_ascii_ident_continue(bytes[index]) {
+        index += 1;
+    }
+    Some(index)
+}
+
+fn is_word_boundary_for_keyword(bytes: &[u8], index: usize) -> bool {
+    index == 0 || index >= bytes.len() || !is_ascii_ident_continue(bytes[index])
+}
+
+fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> Option<usize> {
+    let end = start.checked_add(keyword_upper.len())?;
+    if end > bytes.len() {
+        return None;
+    }
+    if !is_word_boundary_for_keyword(bytes, start.saturating_sub(1))
+        || !is_word_boundary_for_keyword(bytes, end)
+    {
+        return None;
+    }
+    let matches = bytes[start..end]
+        .iter()
+        .zip(keyword_upper.iter())
+        .all(|(actual, expected)| actual.to_ascii_uppercase() == *expected);
+    if matches {
+        Some(end)
+    } else {
+        None
     }
 }
 
@@ -277,6 +537,7 @@ mod tests {
     use super::*;
     use crate::linter::{config::LintConfig, rule::LintContext, Linter};
     use crate::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse sql");
@@ -288,6 +549,17 @@ mod tests {
             statement_index: 0,
         };
         linter.check_statement(stmt, &ctx)
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -373,6 +645,33 @@ mod tests {
             },
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn forbid_subquery_in_from_emits_unsafe_cte_autofix_for_simple_case() {
+        let sql = "SELECT * FROM (SELECT 1) sub";
+        let statements = parse_sql(sql).expect("parse sql");
+        let rule = StructureSubquery::from_config(&LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "LINT_ST_005".to_string(),
+                serde_json::json!({"forbid_subquery_in": "from"}),
+            )]),
+        });
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Unsafe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "WITH sub AS (SELECT 1) SELECT * FROM sub");
     }
 
     #[test]

@@ -707,9 +707,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_AL_005) {
         out = fix_unused_table_aliases(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_ST_005) {
-        out = fix_subquery_to_cte(&out);
-    }
 
     out
 }
@@ -901,6 +898,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_013)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
@@ -1632,6 +1630,7 @@ fn fix_unused_table_aliases(sql: &str) -> String {
     apply_byte_removals(sql, removals)
 }
 
+#[cfg(test)]
 fn is_ascii_whitespace_byte(byte: u8) -> bool {
     matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | 0x0b | 0x0c)
 }
@@ -1652,6 +1651,7 @@ fn is_simple_identifier(value: &str) -> bool {
     bytes[1..].iter().copied().all(is_ascii_ident_continue)
 }
 
+#[cfg(test)]
 fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     while idx < bytes.len() && is_ascii_whitespace_byte(bytes[idx]) {
         idx += 1;
@@ -1659,6 +1659,7 @@ fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
     idx
 }
 
+#[cfg(test)]
 fn consume_ascii_identifier(bytes: &[u8], start: usize) -> Option<usize> {
     if start >= bytes.len() || !is_ascii_ident_start(bytes[start]) {
         return None;
@@ -1674,6 +1675,7 @@ fn is_word_boundary_for_keyword(bytes: &[u8], idx: usize) -> bool {
     idx == 0 || idx >= bytes.len() || !is_ascii_ident_continue(bytes[idx])
 }
 
+#[cfg(test)]
 fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> Option<usize> {
     let end = start.checked_add(keyword_upper.len())?;
     if end > bytes.len() {
@@ -1839,6 +1841,7 @@ fn is_generated_alias_identifier(alias: &str) -> bool {
     saw_digit
 }
 
+#[cfg(test)]
 fn parse_subquery_alias_suffix(suffix: &str) -> Option<String> {
     let bytes = suffix.as_bytes();
     let mut i = skip_ascii_whitespace(bytes, 0);
@@ -1947,6 +1950,7 @@ fn is_sql_keyword(token: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn fix_subquery_to_cte(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut i = skip_ascii_whitespace(bytes, 0);
@@ -1993,6 +1997,7 @@ fn fix_subquery_to_cte(sql: &str) -> String {
     rewritten
 }
 
+#[cfg(test)]
 fn find_matching_parenthesis_outside_quotes(sql: &str, open_paren_idx: usize) -> Option<usize> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Mode {
@@ -5991,15 +5996,31 @@ mod tests {
     }
 
     #[test]
-    fn text_fix_pipeline_converts_subquery_to_cte() {
-        let fixed = apply_text_fixes(
-            "SELECT * FROM (SELECT 1) sub",
-            &RuleFilter::default(),
+    fn st005_core_autofix_applies_in_unsafe_mode_with_from_config() {
+        let sql = "SELECT * FROM (SELECT 1) sub";
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "structure.subquery".to_string(),
+                serde_json::json!({"forbid_subquery_in": "from"}),
+            )]),
+        };
+
+        let fixed = apply_lint_fixes_with_options(
+            sql,
             Dialect::Generic,
-        );
+            &lint_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result")
+        .sql;
         assert!(
             fixed.to_ascii_uppercase().contains("WITH SUB AS"),
-            "expected CTE rewrite, got: {fixed}"
+            "expected unsafe core ST005 autofix to rewrite to CTE, got: {fixed}"
         );
     }
 

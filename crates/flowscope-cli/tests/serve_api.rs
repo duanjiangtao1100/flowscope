@@ -569,6 +569,35 @@ async fn lint_fix_applies_tq002_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_st005_core_autofix_in_unsafe_mode_with_from_config() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT * FROM (SELECT 1) sub\n",
+            "unsafe_fixes": true,
+            "rule_configs": {
+                "structure.subquery": {
+                    "forbid_subquery_in": "from"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "WITH sub AS (SELECT 1) SELECT * FROM sub\n",
+        "expected unsafe ST005 core autofix to rewrite FROM subquery to CTE"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_cp001_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);

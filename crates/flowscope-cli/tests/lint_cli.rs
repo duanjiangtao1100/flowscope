@@ -870,6 +870,38 @@ fn test_lint_fix_applies_tq002_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_st005_core_autofix_in_unsafe_mode_with_from_config() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("st005_from_subquery_core_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT * FROM (SELECT 1) sub\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--unsafe-fixes",
+            "--rule-configs",
+            r#"{"structure.subquery":{"forbid_subquery_in":"from"}}"#,
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with unsafe fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "WITH sub AS (SELECT 1) SELECT * FROM sub\n",
+        "Expected unsafe ST005 core autofix to rewrite FROM subquery to CTE: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_cp001_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("keyword_capitalisation_patch_fix.sql");
