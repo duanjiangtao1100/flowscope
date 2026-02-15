@@ -191,16 +191,16 @@ LT03 (`lt_003.rs`, layout.operators, 15 gaps: 1 FP + 8 FN + 6 fix mismatch), LT0
 
 Covers all remaining rules with smaller individual gaps. AM05 (20 gaps: 1 FP + 8 FN + 11 fix), AM06 (7 FN), JJ01 (14: 6 FN + 8 fix), RF03 (18: 7 FP + 4 FN + 7 fix), RF04 (11 FN), CV01 (10: 4 FN + 6 fix), CV04 (13: 3 FP + 4 FN + 6 fix), CV12 (8: 2 FN + 6 fix), ST07 (6 fix), ST08 (8: 4 FN + 4 fix), ST03 (4: 2 FP + 2 FN), AL03 (7: 6 FP + 1 FN), AL09 (8: 2 FP + 1 FN + 5 fix), CP04 (5: 1 FP + 4 fix), CV02 (2 fix), CV03 (4: 1 FP + 1 FN + 2 fix), CV05 (2 fix), CV07 (2 fix), RF01 (3: 1 FP + 2 FN), RF02 (5 FP), AM04 (2 FP), AM07 (1 FN), AM08 (1 FP), LT07 (2 fix), LT08 (3 fix), LT10 (1 fix), LT11 (1 fix), LT13 (4: 3 FP + 1 fix), LT15 (3: 2 FP + 1 FN), AM02 (2: 1 FP + 1 fix).
 
-- [ ] Fix AM05: 1 FP + 8 FN in `am_005.rs`, fix 11 fix mismatches
+- [x] Fix AM05: 1 FP + 8 FN in `am_005.rs`, fix 11 fix mismatches
 - [ ] Fix AM06: 7 FN in `am_006.rs`
-- [ ] Fix JJ01: 6 FN in `jj_001.rs`, fix 8 fix mismatches
+- [x] Fix JJ01: 6 FN in `jj_001.rs`, fix 8 fix mismatches — detection 8/8, fix 4/8 (templating pipeline limits)
 - [ ] Fix RF03: 7 FP + 4 FN in `rf_003.rs`, fix 7 fix mismatches
-- [ ] Fix RF04: 11 FN in `rf_004.rs`
+- [x] Fix RF04: 11 FN in `rf_004.rs` — detection 11/11 via ALL_KEYWORDS binary search
 - [ ] Fix CV01: 4 FN in `cv_001.rs`, fix 6 fix mismatches
 - [ ] Fix CV04: 3 FP + 4 FN in `cv_004.rs`, fix 6 fix mismatches
 - [ ] Fix CV12: 2 FN in `cv_012.rs`, fix 6 fix mismatches
 - [ ] Fix ST07: fix 6 fix mismatches in `st_007.rs`
-- [ ] Fix ST08: 4 FN in `st_008.rs`, fix 4 fix mismatches
+- [x] Fix ST08: 4 FN in `st_008.rs`, fix 4 fix mismatches — detection 7/7, fix 6/7, token-only detection
 - [ ] Fix ST03: 2 FP + 2 FN in `st_003.rs`
 - [ ] Fix AL03: 6 FP + 1 FN in `al_003.rs`
 - [ ] Fix AL09: 2 FP + 1 FN in `al_009.rs`, fix 5 fix mismatches

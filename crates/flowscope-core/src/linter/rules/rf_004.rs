@@ -10,6 +10,7 @@ use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use regex::{Regex, RegexBuilder};
 use sqlparser::ast::Statement;
+use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::identifier_candidates_helpers::{
@@ -358,10 +359,7 @@ fn is_ascii_ident_continue(byte: u8) -> bool {
 }
 
 fn is_alias_keyword_token(alias: &str) -> bool {
-    matches!(
-        alias.to_ascii_uppercase().as_str(),
-        "SELECT" | "FROM" | "WHERE" | "GROUP" | "ORDER" | "JOIN" | "ON"
-    )
+    is_keyword(alias)
 }
 
 fn statement_contains_keyword_identifier(statement: &Statement, rule: &ReferencesKeywords) -> bool {
@@ -371,6 +369,10 @@ fn statement_contains_keyword_identifier(statement: &Statement, rule: &Reference
 }
 
 fn candidate_triggers_rule(candidate: &IdentifierCandidate, rule: &ReferencesKeywords) -> bool {
+    // SQLFluff skips 1-character identifiers (e.g. datepart keywords like "d").
+    if candidate.value.len() <= 1 {
+        return false;
+    }
     if is_ignored_token(&candidate.value, rule) || !is_keyword(&candidate.value) {
         return false;
     }
@@ -417,39 +419,8 @@ fn normalize_token(token: &str) -> String {
 }
 
 fn is_keyword(token: &str) -> bool {
-    matches!(
-        token.trim().to_ascii_uppercase().as_str(),
-        "ALL"
-            | "AS"
-            | "BY"
-            | "CASE"
-            | "CROSS"
-            | "DISTINCT"
-            | "ELSE"
-            | "END"
-            | "FROM"
-            | "FULL"
-            | "GROUP"
-            | "HAVING"
-            | "INNER"
-            | "JOIN"
-            | "LEFT"
-            | "LIMIT"
-            | "OFFSET"
-            | "ON"
-            | "ORDER"
-            | "OUTER"
-            | "RECURSIVE"
-            | "RIGHT"
-            | "SELECT"
-            | "SUM"
-            | "THEN"
-            | "UNION"
-            | "USING"
-            | "WHEN"
-            | "WHERE"
-            | "WITH"
-    )
+    let upper = token.trim().to_ascii_uppercase();
+    ALL_KEYWORDS.binary_search(&upper.as_str()).is_ok()
 }
 
 #[cfg(test)]
@@ -604,5 +575,95 @@ mod tests {
             },
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn flags_keyword_as_column_name_in_create_table() {
+        // SQLFluff: test_fail_keyword_as_identifier_column
+        let issues = run("CREATE TABLE artist(create TEXT)");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_RF_004);
+    }
+
+    #[test]
+    fn flags_keyword_as_column_alias() {
+        // SQLFluff: test_fail_keyword_as_identifier_column_alias
+        let issues = run("SELECT 1 as parameter");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_RF_004);
+    }
+
+    #[test]
+    fn flags_keyword_as_table_alias() {
+        // SQLFluff: test_fail_keyword_as_identifier_table_alias
+        let issues = run("SELECT x FROM tbl AS parameter");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_RF_004);
+    }
+
+    #[test]
+    fn does_not_flag_non_alias_with_aliases_policy() {
+        // SQLFluff: test_pass_valid_identifier_not_alias
+        // Default unquoted_identifiers_policy is "aliases", so bare column
+        // references that are not aliases should not trigger.
+        assert!(run("SELECT parameter").is_empty());
+    }
+
+    #[test]
+    fn flags_non_alias_with_all_policy() {
+        // SQLFluff: test_fail_keyword_as_identifier_not_alias_all
+        let issues = run_with_config(
+            "SELECT parameter",
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "references.keywords".to_string(),
+                    serde_json::json!({"unquoted_identifiers_policy": "all"}),
+                )]),
+            },
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn flags_column_alias_with_column_aliases_policy() {
+        // SQLFluff: test_fail_keyword_as_identifier_column_alias_config
+        let issues = run_with_config(
+            "SELECT x AS date FROM tbl AS parameter",
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "references.keywords".to_string(),
+                    serde_json::json!({"unquoted_identifiers_policy": "column_aliases"}),
+                )]),
+            },
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn flags_quoted_keyword_column_in_create_table() {
+        // SQLFluff: test_fail_keyword_as_quoted_identifier_column
+        let issues = run_with_config(
+            "CREATE TABLE \"artist\"(\"create\" TEXT)",
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "references.keywords".to_string(),
+                    serde_json::json!({"quoted_identifiers_policy": "aliases"}),
+                )]),
+            },
+        );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn flags_keyword_as_column_name_postgres() {
+        // SQLFluff: test_fail_keyword_as_column_name_postgres
+        let issues = run("CREATE TABLE test_table (type varchar(30) NOT NULL)");
+        assert_eq!(issues.len(), 1);
     }
 }

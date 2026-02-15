@@ -208,30 +208,45 @@ fn am005_autofix_candidates_from_positioned_tokens(
             && previous.is_some_and(|index| is_outer_join_side_keyword(&tokens[index].token));
         let is_plain = is_plain_join_sequence(tokens, previous, previous_previous);
 
-        let replacement = match qualify_mode {
-            FullyQualifyJoinTypes::Inner => is_plain.then_some("INNER JOIN"),
-            FullyQualifyJoinTypes::Outer => requires_outer_keyword.then_some("OUTER JOIN"),
-            FullyQualifyJoinTypes::Both => {
-                if is_plain {
-                    Some("INNER JOIN")
-                } else if requires_outer_keyword {
-                    Some("OUTER JOIN")
-                } else {
-                    None
-                }
-            }
+        let join_token = &tokens[token_index];
+        let source_is_lower = token_word_value(&join_token.token)
+            .map_or(false, |v| v == v.to_ascii_lowercase());
+
+        let needs_inner = match qualify_mode {
+            FullyQualifyJoinTypes::Inner | FullyQualifyJoinTypes::Both => is_plain,
+            FullyQualifyJoinTypes::Outer => false,
+        };
+        let needs_outer = match qualify_mode {
+            FullyQualifyJoinTypes::Outer | FullyQualifyJoinTypes::Both => requires_outer_keyword,
+            FullyQualifyJoinTypes::Inner => false,
         };
 
-        let Some(replacement) = replacement else {
+        if needs_inner {
+            let replacement = if source_is_lower {
+                "inner join"
+            } else {
+                "INNER JOIN"
+            };
+            let span = Span::new(join_token.start, join_token.end);
+            candidates.push(Am005AutofixCandidate {
+                span,
+                edits: vec![IssuePatchEdit::new(span, replacement)],
+            });
+        } else if needs_outer {
+            // Insert OUTER keyword before JOIN, preserving case.
+            // Only replace the JOIN token span with "OUTER JOIN" to avoid
+            // expanding the edit span over the side keyword (LEFT/RIGHT/FULL).
+            let outer_kw = if source_is_lower { "outer" } else { "OUTER" };
+            let join_kw = if source_is_lower { "join" } else { "JOIN" };
+            let replacement = format!("{outer_kw} {join_kw}");
+            let span = Span::new(join_token.start, join_token.end);
+            candidates.push(Am005AutofixCandidate {
+                span,
+                edits: vec![IssuePatchEdit::new(span, &replacement)],
+            });
+        } else {
             continue;
-        };
-
-        let join = &tokens[token_index];
-        let span = Span::new(join.start, join.end);
-        candidates.push(Am005AutofixCandidate {
-            span,
-            edits: vec![IssuePatchEdit::new(span, replacement)],
-        });
+        }
     }
 
     candidates
@@ -271,6 +286,13 @@ fn is_plain_join_sequence(
 
 fn token_word_equals(token: &Token, expected_upper: &str) -> bool {
     matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(expected_upper))
+}
+
+fn token_word_value(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(word) => Some(&word.value),
+        _ => None,
+    }
 }
 
 fn is_outer_join_side_keyword(token: &Token) -> bool {
@@ -786,5 +808,17 @@ mod tests {
             &sql[autofix.edits[0].span.start..autofix.edits[0].span.end],
             "JOIN"
         );
+    }
+
+    #[test]
+    fn inner_mode_lowercase_join_preserves_case() {
+        let sql = "SELECT a FROM t join u ON t.id = u.id\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AM005 autofix");
+        assert_eq!(autofix.edits[0].replacement, "inner join");
     }
 }

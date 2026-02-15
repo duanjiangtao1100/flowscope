@@ -427,6 +427,7 @@ fn rule_uses_document_scope(code: &str) -> bool {
             | crate::types::issue_codes::LINT_CP_003
             | crate::types::issue_codes::LINT_CP_004
             | crate::types::issue_codes::LINT_CP_005
+            | crate::types::issue_codes::LINT_JJ_001
     )
 }
 
@@ -449,6 +450,16 @@ fn document_scope_sql_for_rule<'a>(
     if !rule_uses_document_scope(code) {
         return Cow::Borrowed(document.sql);
     }
+
+    // JJ01 checks Jinja delimiter padding in the raw source, so it must
+    // always see the untemplated SQL when templating has been applied.
+    if code == crate::types::issue_codes::LINT_JJ_001 {
+        if let Some(source_sql) = document.source_sql {
+            return Cow::Borrowed(source_sql);
+        }
+        return Cow::Borrowed(document.sql);
+    }
+
     if !config
         .core_option_bool("ignore_templated_areas")
         .unwrap_or(false)

@@ -54,32 +54,44 @@ impl LintRule for JinjaPadding {
 
 fn jinja_padding_violation_span(ctx: &LintContext) -> Option<(usize, usize)> {
     let sql = ctx.statement_sql();
-    let tokens = token_spans_for_context(ctx).or_else(|| token_spans(sql, ctx.dialect()))?;
 
-    for token in &tokens {
-        if let Some(span) = token_text_violation(sql, token) {
-            return Some(span);
+    // Token-based detection (works well when sqlparser can tokenize the input).
+    if let Some(tokens) = token_spans_for_context(ctx).or_else(|| token_spans(sql, ctx.dialect()))
+    {
+        for token in &tokens {
+            if let Some(span) = token_text_violation(sql, token) {
+                return Some(span);
+            }
+        }
+
+        for pair in tokens.windows(2) {
+            let left = &pair[0];
+            let right = &pair[1];
+            if is_open_delimiter_tokens(&left.token, &right.token) {
+                let delimiter_start = left.start;
+                let delimiter_end = right.end;
+                if has_incorrect_padding_after(sql, delimiter_end) {
+                    return Some((delimiter_start, delimiter_end));
+                }
+            }
+
+            if is_close_delimiter_tokens(&left.token, &right.token) {
+                let delimiter_start = left.start;
+                let delimiter_end = right.end;
+                if has_incorrect_padding_before(sql, delimiter_start) {
+                    return Some((delimiter_start, delimiter_end));
+                }
+            }
         }
     }
 
-    for pair in tokens.windows(2) {
-        let left = &pair[0];
-        let right = &pair[1];
-        if is_open_delimiter_tokens(&left.token, &right.token) {
-            let delimiter_start = left.start;
-            let delimiter_end = right.end;
-            if has_missing_padding_after(sql, delimiter_end) {
-                return Some((delimiter_start, delimiter_end));
-            }
-        }
-
-        if is_close_delimiter_tokens(&left.token, &right.token) {
-            let delimiter_start = left.start;
-            let delimiter_end = right.end;
-            if has_missing_padding_before(sql, delimiter_start) {
-                return Some((delimiter_start, delimiter_end));
-            }
-        }
+    // Text-based fallback: check whether the autofix engine would produce any
+    // edits. This catches multi-space violations and cases where the token-based
+    // detection misses Jinja delimiters (e.g. when sqlparser splits them across
+    // tokens differently than expected).
+    let edits = jinja_padding_autofix_edits(sql);
+    if let Some(edit) = edits.first() {
+        return Some((edit.start, edit.end));
     }
 
     None
@@ -159,7 +171,7 @@ fn token_text_violation(sql: &str, token: &TokenSpan) -> Option<(usize, usize)> 
         for (idx, _) in text.match_indices(pattern) {
             let delimiter_start = token.start + idx;
             let delimiter_end = delimiter_start + pattern.len();
-            if has_missing_padding_after(sql, delimiter_end) {
+            if has_incorrect_padding_after(sql, delimiter_end) {
                 return Some((delimiter_start, delimiter_end));
             }
         }
@@ -168,7 +180,7 @@ fn token_text_violation(sql: &str, token: &TokenSpan) -> Option<(usize, usize)> 
     for pattern in &CLOSE_DELIMITERS {
         for (idx, _) in text.match_indices(pattern) {
             let delimiter_start = token.start + idx;
-            if has_missing_padding_before(sql, delimiter_start) {
+            if has_incorrect_padding_before(sql, delimiter_start) {
                 return Some((delimiter_start, delimiter_start + pattern.len()));
             }
         }
@@ -225,7 +237,16 @@ where
                             std::str::from_utf8(open).expect("template delimiter is ascii");
                         let close_text =
                             std::str::from_utf8(close).expect("template delimiter is ascii");
-                        let replacement = format!("{open_text} {} {close_text}", inner.trim());
+
+                        // Detect trim markers (+/-) attached to delimiters.
+                        let trimmed = inner.trim();
+                        let (open_marker, content, close_marker) =
+                            extract_trim_markers(trimmed);
+                        let content = content.trim();
+
+                        let replacement = format!(
+                            "{open_text}{open_marker} {content} {close_marker}{close_text}"
+                        );
                         let end = j + close.len();
                         if replacement != sql[i..end] {
                             edits.push(JinjaPaddingEdit {
@@ -252,6 +273,31 @@ where
     edits
 }
 
+/// Extracts optional trim markers from Jinja tag content.
+/// `+` and `-` at the start/end of content are trim markers.
+/// Returns (open_marker, remaining_content, close_marker).
+fn extract_trim_markers(content: &str) -> (&str, &str, &str) {
+    let bytes = content.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+
+    let open_marker = if !bytes.is_empty() && (bytes[0] == b'+' || bytes[0] == b'-') {
+        start = 1;
+        &content[..1]
+    } else {
+        ""
+    };
+
+    let close_marker = if end > start && (bytes[end - 1] == b'+' || bytes[end - 1] == b'-') {
+        end -= 1;
+        &content[end..end + 1]
+    } else {
+        ""
+    };
+
+    (open_marker, &content[start..end], close_marker)
+}
+
 const OPEN_DELIMITERS: [&str; 3] = ["{{", "{%", "{#"];
 const CLOSE_DELIMITERS: [&str; 3] = ["}}", "%}", "#}"];
 
@@ -273,29 +319,57 @@ fn is_close_delimiter_tokens(left: &Token, right: &Token) -> bool {
     )
 }
 
-fn has_missing_padding_after(sql: &str, delimiter_end: usize) -> bool {
-    match sql
-        .get(delimiter_end..)
-        .and_then(|remainder| remainder.chars().next())
-    {
-        Some(next) => !is_padding_or_trim_marker(next),
-        None => true,
+fn has_incorrect_padding_after(sql: &str, delimiter_end: usize) -> bool {
+    let remainder = match sql.get(delimiter_end..) {
+        Some(r) => r,
+        None => return true,
+    };
+    let mut chars = remainder.chars();
+    let first = match chars.next() {
+        Some(ch) => ch,
+        None => return true,
+    };
+
+    // After a trim marker (+/-), require a space before content.
+    if is_trim_marker(first) {
+        return !matches!(chars.next(), Some(' '));
     }
+
+    if first != ' ' {
+        return true; // missing padding entirely
+    }
+
+    // Check for excess whitespace (more than one space).
+    let spaces = 1 + chars.take_while(|ch| *ch == ' ').count();
+    spaces > 1
 }
 
-fn has_missing_padding_before(sql: &str, delimiter_start: usize) -> bool {
+fn has_incorrect_padding_before(sql: &str, delimiter_start: usize) -> bool {
     if delimiter_start == 0 {
         return true;
     }
+    let mut rchars = sql[..delimiter_start].chars().rev();
+    let prev = match rchars.next() {
+        Some(ch) => ch,
+        None => return true,
+    };
 
-    match sql[..delimiter_start].chars().next_back() {
-        Some(prev) => !is_padding_or_trim_marker(prev),
-        None => true,
+    // Before a trim marker (+/-), require a space before the marker.
+    if is_trim_marker(prev) {
+        return !matches!(rchars.next(), Some(' '));
     }
+
+    if prev != ' ' {
+        return true; // missing padding entirely
+    }
+
+    // Check for excess whitespace (more than one space).
+    let spaces = 1 + rchars.take_while(|ch| *ch == ' ').count();
+    spaces > 1
 }
 
-fn is_padding_or_trim_marker(ch: char) -> bool {
-    ch.is_whitespace() || ch == '-'
+fn is_trim_marker(ch: char) -> bool {
+    ch == '-' || ch == '+'
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -432,5 +506,45 @@ mod tests {
     fn allows_jinja_trim_markers() {
         assert!(run("SELECT '{{- foo -}}' AS templated").is_empty());
         assert!(run("SELECT '{%- if x -%}' AS templated").is_empty());
+        assert!(run("SELECT '{{+ foo +}}' AS templated").is_empty());
+        assert!(run("SELECT '{%+ if x -%}' AS templated").is_empty());
+    }
+
+    #[test]
+    fn allows_raw_jinja_with_trim_markers_and_correct_spacing() {
+        // SQLFluff: test_simple_modified — should pass
+        assert!(detect("SELECT 1 from {%+ if true -%} foo {%- endif %}\n").is_none());
+    }
+
+    fn detect(sql: &str) -> Option<(usize, usize)> {
+        jinja_padding_violation_span(&LintContext {
+            sql,
+            statement_range: 0..sql.len(),
+            statement_index: 0,
+        })
+    }
+
+    #[test]
+    fn flags_raw_jinja_expression_no_space() {
+        // SQLFluff: test_fail_jinja_tags_no_space
+        assert!(detect("SELECT 1 from {{ref('foo')}}\n").is_some());
+    }
+
+    #[test]
+    fn flags_raw_jinja_expression_multiple_spaces() {
+        // SQLFluff: test_fail_jinja_tags_multiple_spaces
+        assert!(detect("SELECT 1 from {{      ref('foo')       }}\n").is_some());
+    }
+
+    #[test]
+    fn flags_raw_jinja_expression_plus_trim_no_space() {
+        // SQLFluff: test_fail_jinja_tags_no_space_2
+        assert!(detect("SELECT 1 from {{+ref('foo')-}}\n").is_some());
+    }
+
+    #[test]
+    fn flags_raw_jinja_no_content() {
+        // SQLFluff: test_fail_jinja_tags_no_space_no_content
+        assert!(detect("SELECT {{\"\"  -}}1\n").is_some());
     }
 }

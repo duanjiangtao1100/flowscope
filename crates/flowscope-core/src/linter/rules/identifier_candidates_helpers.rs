@@ -156,7 +156,9 @@ fn collect_create_table_column_identifiers(
 ) {
     if let Statement::CreateTable(create) = statement {
         for col in &create.columns {
-            push_ident_candidate(&col.name, IdentifierKind::Other, candidates);
+            // SQLFluff treats column definitions as an alias-equivalent context,
+            // so use ColumnAlias to match `aliases` policy behavior.
+            push_ident_candidate(&col.name, IdentifierKind::ColumnAlias, candidates);
         }
     }
 }

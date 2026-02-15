@@ -5,11 +5,9 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
-use sqlparser::ast::{Distinct, Expr, SelectItem, Statement};
+use sqlparser::ast::Statement;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-
-use super::semantic_helpers::visit_selects_in_statement;
 
 pub struct StructureDistinct;
 
@@ -26,32 +24,16 @@ impl LintRule for StructureDistinct {
         "'DISTINCT' used with parentheses."
     }
 
-    fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let mut violations = 0usize;
+    fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let candidates = st008_autofix_candidates(ctx.statement_sql(), ctx.dialect());
 
-        visit_selects_in_statement(statement, &mut |select| {
-            if distinct_parenthesized_projection(select) {
-                violations += 1;
-            }
-        });
-
-        let mut autofix_candidates = st008_autofix_candidates(ctx.statement_sql(), ctx.dialect());
-        autofix_candidates.sort_by_key(|candidate| candidate.span.start);
-        let candidates_align = autofix_candidates.len() == violations;
-
-        (0..violations)
-            .map(|index| {
-                let mut issue =
-                    Issue::info(issue_codes::LINT_ST_008, "DISTINCT used with parentheses.")
-                        .with_statement(ctx.statement_index);
-                if candidates_align {
-                    let candidate = &autofix_candidates[index];
-                    issue = issue.with_span(candidate.span).with_autofix_edits(
-                        IssueAutofixApplicability::Safe,
-                        candidate.edits.clone(),
-                    );
-                }
-                issue
+        candidates
+            .into_iter()
+            .map(|candidate| {
+                Issue::info(issue_codes::LINT_ST_008, "DISTINCT used with parentheses.")
+                    .with_statement(ctx.statement_index)
+                    .with_span(candidate.span)
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, candidate.edits)
             })
             .collect()
     }
@@ -61,21 +43,6 @@ impl LintRule for StructureDistinct {
 struct St008AutofixCandidate {
     span: Span,
     edits: Vec<IssuePatchEdit>,
-}
-
-fn distinct_parenthesized_projection(select: &sqlparser::ast::Select) -> bool {
-    if !matches!(select.distinct, Some(Distinct::Distinct)) {
-        return false;
-    }
-
-    if select.projection.len() != 1 {
-        return false;
-    }
-
-    matches!(
-        select.projection[0],
-        SelectItem::UnnamedExpr(Expr::Nested(_))
-    )
 }
 
 fn st008_autofix_candidates(sql: &str, dialect: Dialect) -> Vec<St008AutofixCandidate> {
@@ -89,22 +56,38 @@ fn st008_autofix_candidates(sql: &str, dialect: Dialect) -> Vec<St008AutofixCand
             continue;
         }
 
-        let Some(left_paren_index) = next_non_trivia_index(&tokens, distinct_index + 1) else {
+        let Some(next_index) = next_non_trivia_index(&tokens, distinct_index + 1) else {
             continue;
         };
+
+        // Skip `DISTINCT ON(...)` — valid Postgres syntax.
+        if matches!(&tokens[next_index].token, Token::Word(word) if word.keyword == Keyword::ON) {
+            continue;
+        }
+
+        let left_paren_index = next_index;
         if !matches!(tokens[left_paren_index].token, Token::LParen) {
             continue;
         }
 
-        let Some((right_paren_index, has_projection_comma)) =
+        // Check if there's already a space between DISTINCT and `(`.
+        let has_space_before_paren = has_whitespace_between(&tokens, distinct_index, left_paren_index);
+
+        let Some((right_paren_index, has_projection_comma, has_subquery)) =
             find_matching_distinct_rparen(&tokens, left_paren_index)
         else {
             continue;
         };
-        if has_projection_comma {
+        if has_projection_comma || has_subquery {
             continue;
         }
-        if !next_token_allows_single_projection(&tokens, right_paren_index + 1) {
+
+        // Determine whether parens can be removed or only a space is needed.
+        let paren_removable =
+            next_token_allows_paren_removal(&tokens, right_paren_index + 1);
+
+        // If parens are needed and there's already a space, no violation.
+        if !paren_removable && has_space_before_paren {
             continue;
         }
 
@@ -126,12 +109,23 @@ fn st008_autofix_candidates(sql: &str, dialect: Dialect) -> Vec<St008AutofixCand
             continue;
         }
 
-        candidates.push(St008AutofixCandidate {
-            span: Span::new(distinct_start, distinct_end),
-            edits: vec![
+        let edits = if paren_removable {
+            // Remove parentheses: `DISTINCT(x)` → `DISTINCT x`
+            vec![
                 IssuePatchEdit::new(Span::new(distinct_end, left_paren_end), " "),
                 IssuePatchEdit::new(Span::new(right_paren_start, right_paren_end), ""),
-            ],
+            ]
+        } else {
+            // Keep parentheses but add space: `DISTINCT(x) * y` → `DISTINCT (x) * y`
+            vec![IssuePatchEdit::new(
+                Span::new(distinct_end, distinct_end),
+                " ",
+            )]
+        };
+
+        candidates.push(St008AutofixCandidate {
+            span: Span::new(distinct_start, distinct_end),
+            edits,
         });
     }
 
@@ -148,19 +142,22 @@ fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
     tokenizer.tokenize_with_location().ok()
 }
 
+/// Finds the matching `)` for the opening `(` at `left_paren_index`.
+/// Returns `(index, has_comma, has_subquery)`.
 fn find_matching_distinct_rparen(
     tokens: &[TokenWithSpan],
     left_paren_index: usize,
-) -> Option<(usize, bool)> {
+) -> Option<(usize, bool, bool)> {
     let mut depth = 0usize;
     let mut has_projection_comma = false;
+    let mut has_subquery = false;
 
     for (index, token) in tokens.iter().enumerate().skip(left_paren_index) {
         if is_trivia_token(&token.token) {
             continue;
         }
 
-        match token.token {
+        match &token.token {
             Token::LParen => {
                 depth += 1;
             }
@@ -170,11 +167,14 @@ fn find_matching_distinct_rparen(
                 }
                 depth -= 1;
                 if depth == 0 {
-                    return Some((index, has_projection_comma));
+                    return Some((index, has_projection_comma, has_subquery));
                 }
             }
             Token::Comma if depth == 1 => {
                 has_projection_comma = true;
+            }
+            Token::Word(word) if depth == 1 && word.keyword == Keyword::SELECT => {
+                has_subquery = true;
             }
             _ => {}
         }
@@ -183,14 +183,18 @@ fn find_matching_distinct_rparen(
     None
 }
 
-fn next_token_allows_single_projection(tokens: &[TokenWithSpan], start: usize) -> bool {
+/// Returns true when the parentheses around the DISTINCT expression can be
+/// safely removed.  When the next meaningful token after the closing paren is
+/// an operator, the parens serve as grouping and should be kept.
+fn next_token_allows_paren_removal(tokens: &[TokenWithSpan], start: usize) -> bool {
     let Some(index) = next_non_trivia_index(tokens, start) else {
         return true;
     };
 
     match &tokens[index].token {
-        Token::Comma => false,
-        Token::SemiColon | Token::RParen => true,
+        // A comma means there are more projections — parens can still be removed
+        // since they only wrap the first projection item.
+        Token::Comma | Token::SemiColon | Token::RParen => true,
         Token::Word(word) => {
             matches!(
                 word.keyword,
@@ -212,6 +216,10 @@ fn next_token_allows_single_projection(tokens: &[TokenWithSpan], start: usize) -
         }
         _ => false,
     }
+}
+
+fn has_whitespace_between(tokens: &[TokenWithSpan], start: usize, end: usize) -> bool {
+    (start + 1..end).any(|i| is_trivia_token(&tokens[i].token))
 }
 
 fn next_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
@@ -330,9 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn does_not_flag_when_projection_has_multiple_items() {
-        let issues = run("SELECT DISTINCT(a), b FROM t");
-        assert!(issues.is_empty());
+    fn flags_multiple_projections_removes_parens() {
+        // SQLFluff: test_fail_distinct_with_parenthesis_6
+        let sql = "SELECT DISTINCT(a), b\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT DISTINCT a, b\n");
     }
 
     #[test]
@@ -353,5 +365,68 @@ mod tests {
 
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(fixed, "SELECT DISTINCT a FROM t");
+    }
+
+    #[test]
+    fn adds_space_when_parens_needed_for_grouping() {
+        // SQLFluff: test_fail_distinct_with_parenthesis_2
+        let sql = "SELECT DISTINCT(a + b) * c";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT DISTINCT (a + b) * c");
+    }
+
+    #[test]
+    fn does_not_flag_distinct_with_space_and_needed_parens() {
+        // SQLFluff: test_fail_distinct_with_parenthesis_4
+        assert!(run("SELECT DISTINCT (a + b) * c").is_empty());
+    }
+
+    #[test]
+    fn flags_distinct_space_paren_single_column() {
+        // SQLFluff: test_fail_distinct_with_parenthesis_3
+        let sql = "SELECT DISTINCT (a)";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT DISTINCT a");
+    }
+
+    #[test]
+    fn flags_distinct_inside_count() {
+        // SQLFluff: test_fail_distinct_column_inside_count
+        let sql = "SELECT COUNT(DISTINCT(unique_key))\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT COUNT(DISTINCT unique_key)\n");
+    }
+
+    #[test]
+    fn flags_distinct_concat_inside_count() {
+        // SQLFluff: test_fail_distinct_concat_inside_count
+        let sql = "SELECT COUNT(DISTINCT(CONCAT(col1, '-', col2, '-', col3)))\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT COUNT(DISTINCT CONCAT(col1, '-', col2, '-', col3))\n"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_distinct_on_postgres() {
+        // SQLFluff: test_fail_distinct_with_parenthesis_7
+        // DISTINCT ON(...) is valid Postgres syntax, not flagged.
+        assert!(run("SELECT DISTINCT ON(bcolor) bcolor, fcolor FROM t").is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_distinct_subquery_inside_count() {
+        // SQLFluff: test_pass_distinct_subquery_inside_count
+        let sql = "SELECT COUNT(DISTINCT(SELECT ANY_VALUE(id) FROM UNNEST(tag) t))";
+        assert!(run(sql).is_empty());
     }
 }
