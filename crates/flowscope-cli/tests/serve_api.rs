@@ -472,7 +472,8 @@ async fn lint_fix_applies_al005_core_autofix_in_patch_mode() {
         &app,
         "/api/lint-fix",
         json!({
-            "sql": "SELECT users.name FROM users AS u JOIN orders AS o ON users.id = orders.user_id\n"
+            "sql": "SELECT users.name FROM users AS u JOIN orders AS o ON users.id = orders.user_id\n",
+            "disabled_rules": ["LINT_AM_005"]
         }),
     )
     .await;
@@ -555,6 +556,29 @@ async fn lint_fix_applies_am003_core_autofix_in_patch_mode() {
         json["sql"].as_str().unwrap(),
         "SELECT * FROM t ORDER BY a DESC, b ASC NULLS LAST\n",
         "expected AM003 core autofix to add ASC to implicit ORDER BY terms in mixed clauses"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_applies_am005_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT a FROM t JOIN u ON t.id = u.id\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT a FROM t INNER JOIN u ON t.id = u.id\n",
+        "expected AM005 core autofix to qualify bare JOIN with INNER"
     );
 }
 

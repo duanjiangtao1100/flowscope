@@ -5,7 +5,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{JoinOperator, Select, Statement};
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
@@ -86,17 +86,197 @@ impl LintRule for AmbiguousJoinStyle {
             FullyQualifyJoinTypes::Outer => outer_unqualified_count,
             FullyQualifyJoinTypes::Both => plain_join_count + outer_unqualified_count,
         };
+        let mut autofix_candidates = am005_autofix_candidates_for_context(ctx, self.qualify_mode);
+        autofix_candidates.sort_by_key(|candidate| candidate.span.start);
+        let candidates_align = autofix_candidates.len() == violation_count;
 
         (0..violation_count)
-            .map(|_| {
-                Issue::warning(
+            .map(|index| {
+                let mut issue = Issue::warning(
                     issue_codes::LINT_AM_005,
                     "Join clauses should be fully qualified.",
                 )
-                .with_statement(ctx.statement_index)
+                .with_statement(ctx.statement_index);
+                if candidates_align {
+                    let candidate = &autofix_candidates[index];
+                    issue = issue.with_span(candidate.span).with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        candidate.edits.clone(),
+                    );
+                }
+                issue
             })
             .collect()
     }
+}
+
+#[derive(Clone, Debug)]
+struct PositionedToken {
+    token: Token,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+struct Am005AutofixCandidate {
+    span: Span,
+    edits: Vec<IssuePatchEdit>,
+}
+
+fn am005_autofix_candidates_for_context(
+    ctx: &LintContext,
+    qualify_mode: FullyQualifyJoinTypes,
+) -> Vec<Am005AutofixCandidate> {
+    let from_document_tokens = ctx.with_document_tokens(|tokens| {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut positioned = Vec::new();
+        for token in tokens {
+            let (start, end) = token_with_span_offsets(ctx.sql, token)?;
+            if start < ctx.statement_range.start || end > ctx.statement_range.end {
+                continue;
+            }
+            positioned.push(PositionedToken {
+                token: token.token.clone(),
+                start,
+                end,
+            });
+        }
+
+        Some(positioned)
+    });
+
+    if let Some(positioned) = from_document_tokens {
+        return am005_autofix_candidates_from_positioned_tokens(&positioned, qualify_mode);
+    }
+
+    let dialect = ctx.dialect().to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), ctx.statement_sql());
+    let Ok(tokens) = tokenizer.tokenize_with_location() else {
+        return Vec::new();
+    };
+
+    let mut positioned = Vec::new();
+    for token in &tokens {
+        let Some((start, end)) = token_with_span_offsets(ctx.statement_sql(), token) else {
+            continue;
+        };
+        positioned.push(PositionedToken {
+            token: token.token.clone(),
+            start: ctx.statement_range.start + start,
+            end: ctx.statement_range.start + end,
+        });
+    }
+
+    am005_autofix_candidates_from_positioned_tokens(&positioned, qualify_mode)
+}
+
+fn am005_autofix_candidates_from_positioned_tokens(
+    tokens: &[PositionedToken],
+    qualify_mode: FullyQualifyJoinTypes,
+) -> Vec<Am005AutofixCandidate> {
+    let significant_indexes: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| (!is_trivia(&token.token)).then_some(index))
+        .collect();
+
+    let mut candidates = Vec::new();
+
+    for (position, token_index) in significant_indexes.iter().copied().enumerate() {
+        if !token_word_equals(&tokens[token_index].token, "JOIN") {
+            continue;
+        }
+
+        let previous = position
+            .checked_sub(1)
+            .and_then(|index| significant_indexes.get(index))
+            .copied();
+        let previous_previous = position
+            .checked_sub(2)
+            .and_then(|index| significant_indexes.get(index))
+            .copied();
+
+        let has_explicit_outer = previous.is_some_and(|index| {
+            token_word_equals(&tokens[index].token, "OUTER")
+                && previous_previous
+                    .is_some_and(|inner| is_outer_join_side_keyword(&tokens[inner].token))
+        });
+        let requires_outer_keyword = !has_explicit_outer
+            && previous.is_some_and(|index| is_outer_join_side_keyword(&tokens[index].token));
+        let is_plain = is_plain_join_sequence(tokens, previous, previous_previous);
+
+        let replacement = match qualify_mode {
+            FullyQualifyJoinTypes::Inner => is_plain.then_some("INNER JOIN"),
+            FullyQualifyJoinTypes::Outer => requires_outer_keyword.then_some("OUTER JOIN"),
+            FullyQualifyJoinTypes::Both => {
+                if is_plain {
+                    Some("INNER JOIN")
+                } else if requires_outer_keyword {
+                    Some("OUTER JOIN")
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some(replacement) = replacement else {
+            continue;
+        };
+
+        let join = &tokens[token_index];
+        let span = Span::new(join.start, join.end);
+        candidates.push(Am005AutofixCandidate {
+            span,
+            edits: vec![IssuePatchEdit::new(span, replacement)],
+        });
+    }
+
+    candidates
+}
+
+fn is_plain_join_sequence(
+    tokens: &[PositionedToken],
+    previous: Option<usize>,
+    previous_previous: Option<usize>,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+
+    if token_word_equals(&tokens[previous].token, "OUTER")
+        && previous_previous.is_some_and(|index| is_outer_join_side_keyword(&tokens[index].token))
+    {
+        return false;
+    }
+
+    if is_outer_join_side_keyword(&tokens[previous].token)
+        || token_word_equals(&tokens[previous].token, "INNER")
+        || token_word_equals(&tokens[previous].token, "CROSS")
+        || token_word_equals(&tokens[previous].token, "SEMI")
+        || token_word_equals(&tokens[previous].token, "ANTI")
+        || token_word_equals(&tokens[previous].token, "ASOF")
+        || token_word_equals(&tokens[previous].token, "OUTER")
+        || token_word_equals(&tokens[previous].token, "APPLY")
+        || token_word_equals(&tokens[previous].token, "STRAIGHT")
+        || token_word_equals(&tokens[previous].token, "STRAIGHT_JOIN")
+    {
+        return false;
+    }
+
+    true
+}
+
+fn token_word_equals(token: &Token, expected_upper: &str) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(expected_upper))
+}
+
+fn is_outer_join_side_keyword(token: &Token) -> bool {
+    token_word_equals(token, "LEFT")
+        || token_word_equals(token, "RIGHT")
+        || token_word_equals(token, "FULL")
 }
 
 fn count_unqualified_outer_joins(statement: &Statement, ctx: &LintContext) -> usize {
@@ -292,6 +472,7 @@ fn is_trivia(token: &Token) -> bool {
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -551,5 +732,59 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_AM_005);
+    }
+
+    #[test]
+    fn inner_mode_plain_join_emits_safe_autofix_patch() {
+        let sql = "SELECT a FROM t JOIN u ON t.id = u.id";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AM005 core autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "INNER JOIN");
+        assert_eq!(
+            &sql[autofix.edits[0].span.start..autofix.edits[0].span.end],
+            "JOIN"
+        );
+    }
+
+    #[test]
+    fn outer_mode_full_join_emits_safe_outer_keyword_patch() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "ambiguous.join".to_string(),
+                serde_json::json!({"fully_qualify_join_types": "outer"}),
+            )]),
+        };
+        let rule = AmbiguousJoinStyle::from_config(&config);
+        let sql = "SELECT a FROM t FULL JOIN u ON t.id = u.id";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected AM005 full join core autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+        assert_eq!(autofix.edits[0].replacement, "OUTER JOIN");
+        assert_eq!(
+            &sql[autofix.edits[0].span.start..autofix.edits[0].span.end],
+            "JOIN"
+        );
     }
 }

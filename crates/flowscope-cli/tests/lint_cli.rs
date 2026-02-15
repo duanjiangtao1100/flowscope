@@ -754,7 +754,13 @@ fn test_lint_fix_applies_al005_core_autofix_in_patch_mode() {
     .expect("write sql");
 
     let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
-        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .args([
+            "--lint",
+            "--fix",
+            "--exclude-rules",
+            "LINT_AM_005",
+            sql_path.to_str().expect("sql path"),
+        ])
         .output()
         .expect("run CLI with fix");
 
@@ -863,6 +869,31 @@ fn test_lint_fix_applies_am003_core_autofix_in_patch_mode() {
     assert_eq!(
         after, "SELECT * FROM t ORDER BY a DESC, b ASC NULLS LAST\n",
         "Expected AM003 core autofix to add ASC to implicit ORDER BY terms in mixed clauses: {after:?}"
+    );
+}
+
+#[test]
+fn test_lint_fix_applies_am005_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("ambiguous_join_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT a FROM t JOIN u ON t.id = u.id\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT a FROM t INNER JOIN u ON t.id = u.id\n",
+        "Expected AM005 core autofix to qualify bare JOIN with INNER: {after:?}"
     );
 }
 

@@ -94,20 +94,11 @@ impl Default for FixOptions {
 #[derive(Debug, Clone, Default)]
 struct RuleFilter {
     disabled: HashSet<String>,
-    am005_mode: Am005QualifyMode,
     al007_force_enable: bool,
     al009_case_check: Al009AliasCaseCheck,
     al001_mode: Al001FixMode,
     cv011_style: Cv011CastingStyle,
     st005_forbid_subquery_in: St005ForbidSubqueryIn,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum Am005QualifyMode {
-    #[default]
-    Inner,
-    Outer,
-    Both,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -170,16 +161,6 @@ impl RuleFilter {
                 )
             })
             .collect();
-        let am005_mode = match lint_config
-            .rule_option_str(issue_codes::LINT_AM_005, "fully_qualify_join_types")
-            .unwrap_or("inner")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "outer" => Am005QualifyMode::Outer,
-            "both" => Am005QualifyMode::Both,
-            _ => Am005QualifyMode::Inner,
-        };
         let al007_force_enable = lint_config
             .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
             .unwrap_or(false);
@@ -231,7 +212,6 @@ impl RuleFilter {
         };
         Self {
             disabled,
-            am005_mode,
             al007_force_enable,
             al009_case_check,
             al001_mode,
@@ -323,7 +303,6 @@ pub fn apply_lint_fixes_with_options(
         }
 
         let mut rewritten_sql = render_statements(&statements, sql);
-        rewritten_sql = apply_am005_full_outer_keyword_fix(&rewritten_sql, &safe_rule_filter);
         rewritten_sql =
             apply_al001_alias_style_fix(sql, &rewritten_sql, dialect, &safe_rule_filter);
 
@@ -339,7 +318,6 @@ pub fn apply_lint_fixes_with_options(
                 fix_statement(stmt, &rule_filter);
             }
             let mut unsafe_sql = render_statements(&unsafe_statements, sql);
-            unsafe_sql = apply_am005_full_outer_keyword_fix(&unsafe_sql, &rule_filter);
             unsafe_sql = apply_al001_alias_style_fix(sql, &unsafe_sql, dialect, &rule_filter);
             if unsafe_sql != rewritten_sql {
                 rewrite_candidates.extend(build_fix_candidates_from_rewrite(
@@ -696,21 +674,6 @@ fn try_core_only_fix_plan(
     })
 }
 
-fn apply_am005_full_outer_keyword_fix(sql: &str, rule_filter: &RuleFilter) -> String {
-    if !rule_filter.allows(issue_codes::LINT_AM_005) {
-        return sql.to_string();
-    }
-
-    if !matches!(
-        rule_filter.am005_mode,
-        Am005QualifyMode::Outer | Am005QualifyMode::Both
-    ) {
-        return sql.to_string();
-    }
-
-    replace_full_join_outside_single_quotes(sql)
-}
-
 fn apply_al001_alias_style_fix(
     original_sql: &str,
     fixed_sql: &str,
@@ -860,6 +823,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_003)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_AM_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_004)
@@ -1490,62 +1454,6 @@ fn ident_span_offsets(sql: &str, ident: &Ident) -> Option<(usize, usize)> {
 
 fn is_as_token(token: &Token) -> bool {
     matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case("AS"))
-}
-
-fn replace_full_join_outside_single_quotes(sql: &str) -> String {
-    const NEEDLE: &[u8] = b"FULL JOIN";
-    const REPLACEMENT: &str = "full outer join";
-
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len() + 16);
-    let mut idx = 0usize;
-    let mut in_single = false;
-
-    while idx < bytes.len() {
-        if bytes[idx] == b'\'' {
-            if in_single && idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
-                out.push_str("''");
-                idx += 2;
-                continue;
-            }
-            in_single = !in_single;
-            out.push('\'');
-            idx += 1;
-            continue;
-        }
-
-        if !in_single
-            && idx + NEEDLE.len() <= bytes.len()
-            && equals_ignore_ascii_case(&bytes[idx..idx + NEEDLE.len()], NEEDLE)
-            && keyword_boundary(bytes, idx.saturating_sub(1), idx)
-            && keyword_boundary(bytes, idx + NEEDLE.len(), idx + NEEDLE.len())
-        {
-            out.push_str(REPLACEMENT);
-            idx += NEEDLE.len();
-            continue;
-        }
-
-        out.push(bytes[idx] as char);
-        idx += 1;
-    }
-
-    out
-}
-
-fn equals_ignore_ascii_case(left: &[u8], right_upper_ascii: &[u8]) -> bool {
-    left.len() == right_upper_ascii.len()
-        && left
-            .iter()
-            .zip(right_upper_ascii)
-            .all(|(l, r)| l.to_ascii_uppercase() == *r)
-}
-
-fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
-    if idx == 0 || idx >= bytes.len() {
-        return true;
-    }
-    let ch = bytes[check_idx] as char;
-    !(ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]
@@ -3578,38 +3486,6 @@ fn fix_join_operator(op: &mut JoinOperator, rule_filter: &RuleFilter, has_where_
         && !join_constraint_is_explicit(op)
     {
         *op = JoinOperator::CrossJoin(JoinConstraint::None);
-        return;
-    }
-
-    if rule_filter.allows(issue_codes::LINT_AM_005) {
-        match rule_filter.am005_mode {
-            Am005QualifyMode::Inner => {
-                if let JoinOperator::Join(constraint) = op {
-                    *op = JoinOperator::Inner(constraint.clone());
-                }
-            }
-            Am005QualifyMode::Outer => qualify_outer_join_keyword(op),
-            Am005QualifyMode::Both => {
-                if let JoinOperator::Join(constraint) = op {
-                    *op = JoinOperator::Inner(constraint.clone());
-                } else {
-                    qualify_outer_join_keyword(op);
-                }
-            }
-        }
-    }
-}
-
-fn qualify_outer_join_keyword(op: &mut JoinOperator) {
-    match op {
-        JoinOperator::Left(constraint) => {
-            *op = JoinOperator::LeftOuter(constraint.clone());
-        }
-        JoinOperator::Right(constraint) => {
-            *op = JoinOperator::RightOuter(constraint.clone());
-        }
-        JoinOperator::FullOuter(_) => {}
-        _ => {}
     }
 }
 
@@ -4100,20 +3976,6 @@ mod tests {
     }
 
     #[test]
-    fn am005_mode_reads_from_lint_config() {
-        let lint_config = LintConfig {
-            enabled: true,
-            disabled_rules: vec![],
-            rule_configs: std::collections::BTreeMap::from([(
-                "ambiguous.join".to_string(),
-                serde_json::json!({"fully_qualify_join_types": "outer"}),
-            )]),
-        };
-        let filter = RuleFilter::from_lint_config(&lint_config);
-        assert_eq!(filter.am005_mode, Am005QualifyMode::Outer);
-    }
-
-    #[test]
     fn am005_outer_mode_full_join_fix_output() {
         let lint_config = LintConfig {
             enabled: true,
@@ -4139,16 +4001,6 @@ mod tests {
             out.sql
         );
         assert_eq!(fix_count_for_code(&out.counts, issue_codes::LINT_AM_005), 1);
-    }
-
-    #[test]
-    fn replace_full_join_outside_single_quotes_rewrites_keyword() {
-        let sql = "SELECT a FROM t FULL JOIN u ON t.id = u.id";
-        let rewritten = replace_full_join_outside_single_quotes(sql);
-        assert_eq!(
-            rewritten,
-            "SELECT a FROM t full outer join u ON t.id = u.id"
-        );
     }
 
     fn fix_count_for_code(counts: &FixCounts, code: &str) -> usize {
@@ -5748,10 +5600,15 @@ mod tests {
 
     #[test]
     fn st005_ast_fix_rewrites_simple_join_derived_subquery_to_cte() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_AM_005.to_string()],
+            rule_configs: std::collections::BTreeMap::new(),
+        };
         let sql = "SELECT t.id FROM t JOIN (SELECT id FROM u) sub ON t.id = sub.id";
-        assert_rule_case(sql, issue_codes::LINT_ST_005, 1, 0, 1);
+        assert_rule_case_with_config(sql, issue_codes::LINT_ST_005, 1, 0, 1, &lint_config);
 
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let out = apply_fix_with_config(sql, &lint_config);
         assert!(
             out.sql.to_ascii_uppercase().contains("WITH SUB AS"),
             "expected AST ST_005 rewrite to emit CTE: {}",
@@ -6311,7 +6168,12 @@ mod tests {
     #[test]
     fn cv012_multi_join_chain() {
         let sql = "SELECT * FROM a JOIN b JOIN c WHERE a.id = b.id AND b.id = c.id";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix");
+        let out = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_AM_005.to_string()],
+        )
+        .expect("fix");
         let lower = out.sql.to_ascii_lowercase();
         // Both joins should get ON clauses.
         let on_count = lower.matches(" on ").count();
