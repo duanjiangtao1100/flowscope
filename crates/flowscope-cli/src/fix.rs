@@ -95,17 +95,7 @@ impl Default for FixOptions {
 struct RuleFilter {
     disabled: HashSet<String>,
     al007_force_enable: bool,
-    cv011_style: Cv011CastingStyle,
     st005_forbid_subquery_in: St005ForbidSubqueryIn,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum Cv011CastingStyle {
-    #[default]
-    Consistent,
-    Shorthand,
-    Cast,
-    Convert,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -144,17 +134,6 @@ impl RuleFilter {
         let al007_force_enable = lint_config
             .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
             .unwrap_or(false);
-        let cv011_style = match lint_config
-            .rule_option_str(issue_codes::LINT_CV_011, "preferred_type_casting_style")
-            .unwrap_or("consistent")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "shorthand" => Cv011CastingStyle::Shorthand,
-            "cast" => Cv011CastingStyle::Cast,
-            "convert" => Cv011CastingStyle::Convert,
-            _ => Cv011CastingStyle::Consistent,
-        };
         let st005_forbid_subquery_in = match lint_config
             .rule_option_str(issue_codes::LINT_ST_005, "forbid_subquery_in")
             .unwrap_or("join")
@@ -168,7 +147,6 @@ impl RuleFilter {
         Self {
             disabled,
             al007_force_enable,
-            cv011_style,
             st005_forbid_subquery_in,
         }
     }
@@ -787,6 +765,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_004)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_011)
         || code.eq_ignore_ascii_case(issue_codes::LINT_RF_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_JJ_001)
     {
@@ -3353,57 +3332,15 @@ fn fix_expr(expr: &mut Expr, rule_filter: &RuleFilter) {
         _ => {}
     }
 
-    if rule_filter.allows(issue_codes::LINT_CV_011) {
-        rewrite_cast_style(expr, rule_filter.cv011_style);
-    }
+    // CV11 cast-style rewriting is now handled entirely by the core autofix
+    // in cv_011.rs, which correctly supports first-seen consistent mode,
+    // CONVERT conversions, and chained :: expressions.
 
     if rule_filter.allows(issue_codes::LINT_ST_004) {
         if let Some(rewritten) = nested_case_rewrite(expr) {
             *expr = rewritten;
         }
     }
-}
-
-fn rewrite_cast_style(expr: &mut Expr, preferred_style: Cv011CastingStyle) {
-    let Expr::Cast {
-        kind,
-        expr: inner,
-        format,
-        ..
-    } = expr
-    else {
-        return;
-    };
-
-    match preferred_style {
-        Cv011CastingStyle::Cast | Cv011CastingStyle::Consistent => {
-            if *kind == CastKind::DoubleColon {
-                *kind = CastKind::Cast;
-            }
-        }
-        Cv011CastingStyle::Shorthand => {
-            if *kind == CastKind::Cast
-                && format.is_none()
-                && cast_expr_can_use_shorthand(inner.as_ref())
-            {
-                *kind = CastKind::DoubleColon;
-            }
-        }
-        Cv011CastingStyle::Convert => {}
-    }
-}
-
-fn cast_expr_can_use_shorthand(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Identifier(_)
-            | Expr::CompoundIdentifier(_)
-            | Expr::Value(_)
-            | Expr::Function(_)
-            | Expr::Cast { .. }
-            | Expr::Nested(_)
-            | Expr::TypedString { .. }
-    )
 }
 
 fn fix_function(func: &mut Function, rule_filter: &RuleFilter) {
