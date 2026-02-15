@@ -63,13 +63,20 @@ RF05 (`rf_005.rs`, references.special_chars) has 29 FP + 7 FN = 36 detection gap
 
 ### Task 4: CV06 — Semicolons (52 gaps)
 
-CV06 (`cv_006.rs`, convention.terminator) detects missing/misplaced statement terminators. Currently 19 FN + 3 FP + 30 fix mismatches. The 30 fix mismatches suggest the autofix edits are producing wrong semicolon placement or not handling multi-statement files correctly.
+CV06 (`cv_006.rs`, convention.terminator) detects missing/misplaced statement terminators.
 
-- [ ] Analyze 19 FN cases: identify which terminator patterns are missed (e.g., trailing semicolons in specific positions, multi-statement boundaries)
-- [ ] Analyze 3 FP cases: identify where FlowScope incorrectly requires terminators
-- [ ] Fix `cv_006.rs` detection logic to match SQLFluff's terminator expectations
-- [ ] Fix 30 fix mismatches: correct autofix byte-range edits for semicolon insertion/removal/repositioning
-- [ ] Verify 0 FN, 0 FP, 0 fix mismatches for CV06 in parity report
+- [x] Analyze FN/FP cases (actual: 0 FN base, 1 FP; plan numbers were stale)
+- [x] Fix FP on `test_pass_newline_inline_comment` (inline comment newline handling)
+- [x] Fix `cv_006.rs` detection: token-based multiline check, `actual_code_end()`, `find_inline_comment_in_statement()`
+- [x] Implement two-edit autofix strategy to avoid comment protected range overlaps
+- [x] Parity result: 0 FP, 1 FN, 27/35 fix matches (77%)
+
+Remaining gaps (8 fix mismatches, 1 FN):
+- 3 block comment cases: need complex reordering of block comments vs semicolons
+- 3 cross-rule interference: LT01 removes space, LT02/CP01 change indentation/case
+- 1 multiline + multiple comments: protected range prevents correct `;` placement
+- 1 multi-statement: second statement fix not applied
+- 1 FN: multiline SQL + block comment included in statement range by parser
 
 ### Task 5: ST05 — Subquery Style (40 gaps)
 
