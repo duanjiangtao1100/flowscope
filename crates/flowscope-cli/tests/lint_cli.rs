@@ -964,6 +964,37 @@ fn test_lint_fix_applies_cp005_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_cv010_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("quoted_literal_style_patch_fix.sql");
+    std::fs::write(&sql_path, "select 'abc' as a, \"good_name\" as b from t\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--exclude-rules",
+            "LINT_RF_006",
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "select 'abc' as a, good_name as b from t\n",
+        "Expected CV010 core autofix to unquote safe double-quoted identifiers: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_rf006_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("references_quoting_patch_fix.sql");

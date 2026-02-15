@@ -98,7 +98,6 @@ struct RuleFilter {
     al007_force_enable: bool,
     al009_case_check: Al009AliasCaseCheck,
     al001_mode: Al001FixMode,
-    cv010_style: Cv010QuotedLiteralStyle,
     cv011_style: Cv011CastingStyle,
     st005_forbid_subquery_in: St005ForbidSubqueryIn,
 }
@@ -127,14 +126,6 @@ enum Al009AliasCaseCheck {
     QuotedCsNakedUpper,
     QuotedCsNakedLower,
     CaseSensitive,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum Cv010QuotedLiteralStyle {
-    #[default]
-    Consistent,
-    SingleQuotes,
-    DoubleQuotes,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -217,16 +208,6 @@ impl RuleFilter {
                 _ => Al001FixMode::Explicit,
             }
         };
-        let cv010_style = match lint_config
-            .rule_option_str(issue_codes::LINT_CV_010, "preferred_quoted_literal_style")
-            .unwrap_or("consistent")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "single_quotes" | "single" => Cv010QuotedLiteralStyle::SingleQuotes,
-            "double_quotes" | "double" => Cv010QuotedLiteralStyle::DoubleQuotes,
-            _ => Cv010QuotedLiteralStyle::Consistent,
-        };
         let cv011_style = match lint_config
             .rule_option_str(issue_codes::LINT_CV_011, "preferred_type_casting_style")
             .unwrap_or("consistent")
@@ -254,7 +235,6 @@ impl RuleFilter {
             al007_force_enable,
             al009_case_check,
             al001_mode,
-            cv010_style,
             cv011_style,
             st005_forbid_subquery_in,
         }
@@ -742,9 +722,6 @@ fn apply_text_fixes(sql: &str, rule_filter: &RuleFilter, _dialect: Dialect) -> S
     if rule_filter.allows(issue_codes::LINT_ST_005) {
         out = fix_subquery_to_cte(&out);
     }
-    if rule_filter.allows(issue_codes::LINT_CV_010) {
-        out = fix_quoted_literal_style(&out, rule_filter.cv010_style);
-    }
     if rule_filter.allows(issue_codes::LINT_RF_003) {
         out = fix_mixed_reference_qualification(&out);
     }
@@ -922,6 +899,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_010)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
@@ -1597,48 +1575,6 @@ fn keyword_boundary(bytes: &[u8], check_idx: usize, idx: usize) -> bool {
     !(ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn replace_outside_single_quotes<F>(sql: &str, mut transform: F) -> String
-where
-    F: FnMut(&str) -> String,
-{
-    let mut out = String::with_capacity(sql.len());
-    let mut outside = String::new();
-    let mut chars = sql.chars().peekable();
-    let mut in_single = false;
-
-    while let Some(ch) = chars.next() {
-        if in_single {
-            out.push(ch);
-            if ch == '\'' {
-                if matches!(chars.peek(), Some('\'')) {
-                    out.push(chars.next().expect("peek confirmed quote"));
-                } else {
-                    in_single = false;
-                }
-            }
-            continue;
-        }
-
-        if ch == '\'' {
-            if !outside.is_empty() {
-                out.push_str(&transform(&outside));
-                outside.clear();
-            }
-            out.push(ch);
-            in_single = true;
-            continue;
-        }
-
-        outside.push(ch);
-    }
-
-    if !outside.is_empty() {
-        out.push_str(&transform(&outside));
-    }
-
-    out
-}
-
 /// Maximum line length before `fix_long_lines` will attempt to split.
 const MAX_LINE_LENGTH: usize = 300;
 /// Target split position when breaking long lines.
@@ -2030,53 +1966,6 @@ fn extract_from_table_and_alias(sql: &str) -> Option<(String, String)> {
     Some((table_name, alias))
 }
 
-fn rewrite_double_quoted_identifiers(segment: &str) -> String {
-    let bytes = segment.as_bytes();
-    let mut out = String::with_capacity(segment.len());
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            out.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-
-        let mut j = i + 1;
-        let mut escaped = false;
-        while j < bytes.len() {
-            if bytes[j] == b'"' {
-                if j + 1 < bytes.len() && bytes[j + 1] == b'"' {
-                    escaped = true;
-                    j += 2;
-                    continue;
-                }
-                break;
-            }
-            j += 1;
-        }
-        if j >= bytes.len() {
-            out.push('"');
-            i += 1;
-            continue;
-        }
-
-        if !escaped {
-            let ident = &segment[i + 1..j];
-            if is_simple_identifier(ident) && can_unquote_identifier_safely(ident) {
-                out.push_str(ident);
-                i = j + 1;
-                continue;
-            }
-        }
-
-        out.push_str(&segment[i..j + 1]);
-        i = j + 1;
-    }
-
-    out
-}
-
 fn is_sql_keyword(token: &str) -> bool {
     matches!(
         token.to_ascii_uppercase().as_str(),
@@ -2395,37 +2284,6 @@ fn fix_mixed_reference_qualification(sql: &str) -> String {
         &sql[..select_start],
         &sql[from_start + b"FROM".len()..]
     )
-}
-
-fn fix_quoted_literal_style(sql: &str, preferred_style: Cv010QuotedLiteralStyle) -> String {
-    match preferred_style {
-        Cv010QuotedLiteralStyle::DoubleQuotes => {
-            // In most supported dialects, rewriting `'value'` -> `"value"` changes
-            // semantics (string literal vs quoted identifier), so keep this no-op.
-            sql.to_string()
-        }
-        Cv010QuotedLiteralStyle::Consistent | Cv010QuotedLiteralStyle::SingleQuotes => {
-            // Safely reduce mixed quote-style findings by removing identifier quotes
-            // only when unquoting preserves meaning.
-            fix_references_quoting(sql)
-        }
-    }
-}
-
-fn fix_references_quoting(sql: &str) -> String {
-    replace_outside_single_quotes(sql, rewrite_double_quoted_identifiers)
-}
-
-fn can_unquote_identifier_safely(identifier: &str) -> bool {
-    let mut chars = identifier.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-
-    let starts_ok = first.is_ascii_lowercase() || first == '_';
-    let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-
-    starts_ok && rest_ok && !is_sql_keyword(identifier)
 }
 
 fn fix_tsql_procedure_begin_end(sql: &str) -> String {

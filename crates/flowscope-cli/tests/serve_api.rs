@@ -659,6 +659,30 @@ async fn lint_fix_applies_cp005_core_autofix_in_patch_mode() {
 }
 
 #[tokio::test]
+async fn lint_fix_applies_cv010_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "select 'abc' as a, \"good_name\" as b from t\n",
+            "disabled_rules": ["LINT_RF_006"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "select 'abc' as a, good_name as b from t\n",
+        "expected CV010 core autofix to unquote safe double-quoted identifiers"
+    );
+}
+
+#[tokio::test]
 async fn lint_fix_applies_rf006_core_autofix_in_patch_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
