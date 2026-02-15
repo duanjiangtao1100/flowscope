@@ -3483,12 +3483,6 @@ fn fix_expr(expr: &mut Expr, rule_filter: &RuleFilter) {
             *expr = rewritten;
         }
     }
-
-    if rule_filter.allows(issue_codes::LINT_ST_002) {
-        if let Some(rewritten) = simple_case_rewrite(expr) {
-            *expr = rewritten;
-        }
-    }
 }
 
 fn rewrite_cast_style(expr: &mut Expr, preferred_style: Cv011CastingStyle) {
@@ -3570,88 +3564,6 @@ fn fix_function_arg(arg: &mut FunctionArg, rule_filter: &RuleFilter) {
             }
         }
     }
-}
-
-fn simple_case_rewrite(expr: &Expr) -> Option<Expr> {
-    let Expr::Case {
-        case_token,
-        operand: None,
-        conditions,
-        else_result,
-        end_token,
-    } = expr
-    else {
-        return None;
-    };
-
-    if conditions.len() < 2 {
-        return None;
-    }
-
-    let mut common_operand: Option<Expr> = None;
-    let mut rewritten_conditions = Vec::with_capacity(conditions.len());
-
-    for case_when in conditions {
-        let (operand_expr, value_expr) =
-            split_case_when_equality(&case_when.condition, common_operand.as_ref())?;
-
-        if common_operand.is_none() {
-            common_operand = Some(operand_expr);
-        }
-
-        rewritten_conditions.push(CaseWhen {
-            condition: value_expr,
-            result: case_when.result.clone(),
-        });
-    }
-
-    Some(Expr::Case {
-        case_token: case_token.clone(),
-        operand: Some(Box::new(common_operand?)),
-        conditions: rewritten_conditions,
-        else_result: else_result.clone(),
-        end_token: end_token.clone(),
-    })
-}
-
-fn split_case_when_equality(
-    condition: &Expr,
-    expected_operand: Option<&Expr>,
-) -> Option<(Expr, Expr)> {
-    let Expr::BinaryOp { left, op, right } = condition else {
-        return None;
-    };
-
-    if *op != BinaryOperator::Eq {
-        return None;
-    }
-
-    if let Some(expected) = expected_operand {
-        if exprs_equivalent(left, expected) {
-            return Some((left.as_ref().clone(), right.as_ref().clone()));
-        }
-        if exprs_equivalent(right, expected) {
-            return Some((right.as_ref().clone(), left.as_ref().clone()));
-        }
-        return None;
-    }
-
-    if simple_case_operand_candidate(left) {
-        return Some((left.as_ref().clone(), right.as_ref().clone()));
-    }
-    if simple_case_operand_candidate(right) {
-        return Some((right.as_ref().clone(), left.as_ref().clone()));
-    }
-
-    None
-}
-
-fn simple_case_operand_candidate(expr: &Expr) -> bool {
-    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-}
-
-fn exprs_equivalent(left: &Expr, right: &Expr) -> bool {
-    format!("{left}") == format!("{right}")
 }
 
 fn nested_case_rewrite(expr: &Expr) -> Option<Expr> {
@@ -4537,14 +4449,14 @@ mod tests {
                 1,
                 0,
                 1,
-                Some("WHEN 'DOG' THEN 'WOOF'"),
+                Some("WHEN SPECIES = 'DOG' THEN 'WOOF'"),
             ),
             (
                 "SELECT CASE WHEN species = 'Rat' THEN 'Squeak' ELSE CASE WHEN species = 'Dog' THEN 'Woof' WHEN species = 'Mouse' THEN 'Squeak' ELSE 'Other' END END AS sound FROM mytable",
                 1,
                 0,
                 1,
-                Some("WHEN 'MOUSE' THEN 'SQUEAK' ELSE 'OTHER' END"),
+                Some("CASE SPECIES WHEN 'DOG' THEN 'WOOF' WHEN 'MOUSE' THEN 'SQUEAK' ELSE 'OTHER' END END"),
             ),
             (
                 "SELECT CASE WHEN species = 'Rat' THEN CASE WHEN colour = 'Black' THEN 'Growl' WHEN colour = 'Grey' THEN 'Squeak' END END AS sound FROM mytable",
@@ -5168,6 +5080,28 @@ mod tests {
         let planned = plan_fix_candidates(sql, candidates, &[], false);
         let applied = apply_planned_edits(sql, &planned.edits);
         assert_eq!(applied, "SELECT 2");
+    }
+
+    #[test]
+    fn st002_core_autofix_candidates_apply_cleanly_in_safe_mode() {
+        let sql = "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t\n";
+        let issues = lint_issues(sql, Dialect::Generic, &default_lint_config());
+        let candidates = build_fix_candidates_from_issue_autofixes(sql, &issues);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.rule_code.as_deref() == Some(issue_codes::LINT_ST_002)),
+            "expected ST002 core candidate from lint issues: {candidates:?}"
+        );
+
+        let protected = collect_comment_protected_ranges(sql, Dialect::Generic, true);
+        let planned = plan_fix_candidates(sql, candidates, &protected, false);
+        let applied = apply_planned_edits(sql, &planned.edits);
+        assert_eq!(
+            applied, "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t\n",
+            "unexpected ST002 planned edits with skipped={:?}",
+            planned.skipped
+        );
     }
 
     #[test]
