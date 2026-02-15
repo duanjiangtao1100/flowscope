@@ -3,11 +3,13 @@
 //! SQLFluff AM03 parity: if any ORDER BY item specifies ASC/DESC, all should.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, OrderByKind, Query, Select, SetExpr,
     Statement, TableFactor, WindowType,
 };
+use sqlparser::keywords::Keyword;
+use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::semantic_helpers::join_on_expr;
 
@@ -29,14 +31,26 @@ impl LintRule for AmbiguousOrderBy {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let mut violation_count = 0usize;
         check_statement(statement, &mut violation_count);
+        let clause_autofixes = am003_clause_autofixes(ctx.statement_sql(), ctx.dialect());
+        let clauses_align = clause_autofixes.len() == violation_count;
 
         (0..violation_count)
-            .map(|_| {
-                Issue::warning(
+            .map(|index| {
+                let mut issue = Issue::warning(
                     issue_codes::LINT_AM_003,
                     "Ambiguous ORDER BY clause. Specify ASC/DESC for all columns or none.",
                 )
-                .with_statement(ctx.statement_index)
+                .with_statement(ctx.statement_index);
+
+                if clauses_align {
+                    let clause_fix = &clause_autofixes[index];
+                    issue = issue.with_span(clause_fix.span).with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        clause_fix.edits.clone(),
+                    );
+                }
+
+                issue
             })
             .collect()
     }
@@ -270,10 +284,289 @@ fn order_by_mixes_explicit_and_implicit_direction(query: &Query) -> bool {
     has_explicit && has_implicit
 }
 
+#[derive(Clone, Debug)]
+struct Am003ClauseAutofix {
+    span: Span,
+    edits: Vec<IssuePatchEdit>,
+}
+
+#[derive(Clone, Debug)]
+struct Am003OrderItem {
+    has_direction: bool,
+    insert_offset: usize,
+}
+
+fn am003_clause_autofixes(sql: &str, dialect: Dialect) -> Vec<Am003ClauseAutofix> {
+    let Some(tokens) = tokenized(sql, dialect) else {
+        return Vec::new();
+    };
+
+    let mut fixes = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let order_index = index;
+        if !is_order_keyword(&tokens[order_index].token) {
+            index += 1;
+            continue;
+        }
+
+        let Some(by_index) = next_non_trivia_index(&tokens, order_index + 1) else {
+            break;
+        };
+        if !is_by_keyword(&tokens[by_index].token) {
+            index += 1;
+            continue;
+        }
+
+        let Some(clause_start) = next_non_trivia_index(&tokens, by_index + 1) else {
+            break;
+        };
+        let (items, clause_end, next_index) = collect_order_by_items(sql, &tokens, clause_start);
+        index = next_index;
+
+        if items.len() < 2 {
+            continue;
+        }
+
+        let has_explicit = items.iter().any(|item| item.has_direction);
+        let has_implicit = items.iter().any(|item| !item.has_direction);
+        if !has_explicit || !has_implicit {
+            continue;
+        }
+
+        let mut edits = Vec::new();
+        for item in items {
+            if !item.has_direction {
+                edits.push(IssuePatchEdit::new(
+                    Span::new(item.insert_offset, item.insert_offset),
+                    " ASC",
+                ));
+            }
+        }
+        if edits.is_empty() {
+            continue;
+        }
+
+        let Some((clause_start_offset, _)) = token_with_span_offsets(sql, &tokens[order_index])
+        else {
+            continue;
+        };
+        fixes.push(Am003ClauseAutofix {
+            span: Span::new(clause_start_offset, clause_end),
+            edits,
+        });
+    }
+
+    fixes
+}
+
+fn collect_order_by_items(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    start_index: usize,
+) -> (Vec<Am003OrderItem>, usize, usize) {
+    let mut depth = 0usize;
+    let mut cursor = start_index;
+    let mut item_start = start_index;
+    let mut items = Vec::new();
+
+    while cursor < tokens.len() {
+        let token = &tokens[cursor].token;
+        if is_trivia(token) {
+            cursor += 1;
+            continue;
+        }
+
+        match token {
+            Token::LParen => {
+                depth += 1;
+                cursor += 1;
+            }
+            Token::RParen => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                cursor += 1;
+            }
+            Token::Comma if depth == 0 => {
+                if let Some(item) = analyze_order_item(sql, tokens, item_start, cursor) {
+                    items.push(item);
+                }
+                cursor += 1;
+                item_start = cursor;
+            }
+            Token::SemiColon if depth == 0 => break,
+            Token::Word(word) if depth == 0 && order_by_clause_terminator(word.keyword) => break,
+            _ => cursor += 1,
+        }
+    }
+
+    if let Some(item) = analyze_order_item(sql, tokens, item_start, cursor) {
+        items.push(item);
+    }
+
+    let clause_end = clause_end_offset(sql, tokens, start_index, cursor);
+    (items, clause_end, cursor)
+}
+
+fn analyze_order_item(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    start_index: usize,
+    end_index: usize,
+) -> Option<Am003OrderItem> {
+    let mut depth = 0usize;
+    let mut has_direction = false;
+    let mut nulls_insert_offset = None;
+    let mut last_significant_end = None;
+
+    for token in tokens.iter().take(end_index).skip(start_index) {
+        let raw = &token.token;
+        if is_trivia(raw) {
+            continue;
+        }
+
+        match raw {
+            Token::LParen => {
+                depth += 1;
+            }
+            Token::RParen => {
+                depth = depth.saturating_sub(1);
+            }
+            Token::Word(word) if depth == 0 => {
+                if word.keyword == Keyword::ASC || word.keyword == Keyword::DESC {
+                    has_direction = true;
+                } else if word.keyword == Keyword::NULLS && nulls_insert_offset.is_none() {
+                    nulls_insert_offset = last_significant_end;
+                }
+            }
+            _ => {}
+        }
+
+        last_significant_end = token_with_span_offsets(sql, token).map(|(_, end)| end);
+    }
+
+    let fallback_insert = last_significant_end?;
+    Some(Am003OrderItem {
+        has_direction,
+        insert_offset: nulls_insert_offset.unwrap_or(fallback_insert),
+    })
+}
+
+fn clause_end_offset(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    start_index: usize,
+    end_index: usize,
+) -> usize {
+    for token in tokens.iter().take(end_index).skip(start_index).rev() {
+        if is_trivia(&token.token) {
+            continue;
+        }
+        if let Some((_, end)) = token_with_span_offsets(sql, token) {
+            return end;
+        }
+    }
+    sql.len()
+}
+
+fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
+    let dialect = dialect.to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
+    tokenizer.tokenize_with_location().ok()
+}
+
+fn is_order_keyword(token: &Token) -> bool {
+    matches!(token, Token::Word(word) if word.keyword == Keyword::ORDER)
+}
+
+fn is_by_keyword(token: &Token) -> bool {
+    matches!(token, Token::Word(word) if word.keyword == Keyword::BY)
+}
+
+fn order_by_clause_terminator(keyword: Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::LIMIT
+            | Keyword::OFFSET
+            | Keyword::FETCH
+            | Keyword::UNION
+            | Keyword::EXCEPT
+            | Keyword::INTERSECT
+            | Keyword::WINDOW
+            | Keyword::INTO
+            | Keyword::FOR
+    )
+}
+
+fn next_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
+    while index < tokens.len() {
+        if !is_trivia(&tokens[index].token) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
+    let start = line_col_to_offset(
+        sql,
+        token.span.start.line as usize,
+        token.span.start.column as usize,
+    )?;
+    let end = line_col_to_offset(
+        sql,
+        token.span.end.line as usize,
+        token.span.end.column as usize,
+    )?;
+    Some((start, end))
+}
+
+fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1usize;
+    let mut current_col = 1usize;
+    for (offset, ch) in sql.char_indices() {
+        if current_line == line && current_col == column {
+            return Some(offset);
+        }
+        if ch == '\n' {
+            current_line += 1;
+            current_col = 1;
+        } else {
+            current_col += 1;
+        }
+    }
+
+    if current_line == line && current_col == column {
+        return Some(sql.len());
+    }
+    None
+}
+
+fn is_trivia(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(
+            Whitespace::Space
+                | Whitespace::Newline
+                | Whitespace::Tab
+                | Whitespace::SingleLineComment { .. }
+                | Whitespace::MultiLineComment(_)
+        )
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -292,6 +585,18 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut edits = autofix.edits.clone();
+        edits.sort_by(|left, right| right.span.start.cmp(&left.span.start));
+
+        let mut out = sql.to_string();
+        for edit in edits {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     // --- Edge cases adopted from sqlfluff AM03 ---
@@ -337,5 +642,27 @@ mod tests {
     fn allows_consistent_order_by_with_comments() {
         let issues = run("SELECT * FROM t ORDER BY a /* Comment */ DESC, b ASC");
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn mixed_order_by_emits_safe_autofix_patch() {
+        let sql = "SELECT * FROM t ORDER BY a DESC, b";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT * FROM t ORDER BY a DESC, b ASC");
+    }
+
+    #[test]
+    fn mixed_order_by_with_nulls_clause_inserts_asc_before_nulls() {
+        let sql = "SELECT * FROM t ORDER BY a DESC, b NULLS LAST";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT * FROM t ORDER BY a DESC, b ASC NULLS LAST");
     }
 }

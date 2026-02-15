@@ -859,6 +859,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
     if code.eq_ignore_ascii_case(issue_codes::LINT_AM_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AM_002)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_AM_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_004)
@@ -3691,23 +3692,6 @@ fn fix_order_by(order_by: &mut OrderBy, rule_filter: &RuleFilter) {
     if let OrderByKind::Expressions(exprs) = &mut order_by.kind {
         for order_expr in exprs.iter_mut() {
             fix_expr(&mut order_expr.expr, rule_filter);
-        }
-
-        if rule_filter.allows(issue_codes::LINT_AM_003) {
-            let has_explicit = exprs
-                .iter()
-                .any(|order_expr| order_expr.options.asc.is_some());
-            let has_implicit = exprs
-                .iter()
-                .any(|order_expr| order_expr.options.asc.is_none());
-
-            if has_explicit && has_implicit {
-                for order_expr in exprs.iter_mut() {
-                    if order_expr.options.asc.is_none() {
-                        order_expr.options.asc = Some(true);
-                    }
-                }
-            }
         }
     }
 
