@@ -1,24 +1,27 @@
-//! LINT_CV_010: Quoted literals style.
+//! LINT_CV_010: Consistent usage of preferred quotes for quoted literals.
 //!
-//! SQLFluff CV10 parity (current scope): detect double-quoted literal-like
-//! segments.
+//! SQLFluff CV10 parity: detects inconsistent quoting of string literals in
+//! dialects where both single and double quotes denote strings (BigQuery,
+//! Databricks/SparkSQL, Hive, MySQL).  Applies Black-style quote
+//! normalization for autofixes.
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::linter::visit::visit_expressions;
-use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
-use sqlparser::ast::{Statement, Value};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use sqlparser::ast::Statement;
 
-use super::references_quoted_helpers::double_quoted_identifiers_in_statement;
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreferredQuotedLiteralStyle {
+enum PreferredStyle {
     Consistent,
     SingleQuotes,
     DoubleQuotes,
 }
 
-impl PreferredQuotedLiteralStyle {
+impl PreferredStyle {
     fn from_config(config: &LintConfig) -> Self {
         match config
             .rule_option_str(issue_codes::LINT_CV_010, "preferred_quoted_literal_style")
@@ -34,24 +37,41 @@ impl PreferredQuotedLiteralStyle {
 }
 
 pub struct ConventionQuotedLiterals {
-    preferred_style: PreferredQuotedLiteralStyle,
+    preferred_style: PreferredStyle,
+    force_enable: bool,
 }
 
 impl ConventionQuotedLiterals {
     pub fn from_config(config: &LintConfig) -> Self {
         Self {
-            preferred_style: PreferredQuotedLiteralStyle::from_config(config),
+            preferred_style: PreferredStyle::from_config(config),
+            force_enable: config
+                .rule_option_bool(issue_codes::LINT_CV_010, "force_enable")
+                .unwrap_or(false),
         }
+    }
+
+    /// Dialects where both single and double quotes denote string literals.
+    fn is_double_quote_string_dialect(dialect: Dialect) -> bool {
+        matches!(
+            dialect,
+            Dialect::Bigquery | Dialect::Databricks | Dialect::Hive | Dialect::Mysql
+        )
     }
 }
 
 impl Default for ConventionQuotedLiterals {
     fn default() -> Self {
         Self {
-            preferred_style: PreferredQuotedLiteralStyle::Consistent,
+            preferred_style: PreferredStyle::Consistent,
+            force_enable: false,
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// LintRule impl
+// ---------------------------------------------------------------------------
 
 impl LintRule for ConventionQuotedLiterals {
     fn code(&self) -> &'static str {
@@ -66,287 +86,544 @@ impl LintRule for ConventionQuotedLiterals {
         "Consistent usage of preferred quotes for quoted literals."
     }
 
-    fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let has_double_quoted = !double_quoted_identifiers_in_statement(statement).is_empty();
-        let has_single_quoted = statement_contains_single_quoted_literal(statement);
+    fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let dialect = ctx.dialect();
+        if !self.force_enable && !Self::is_double_quote_string_dialect(dialect) {
+            return Vec::new();
+        }
 
-        let violation = match self.preferred_style {
-            PreferredQuotedLiteralStyle::Consistent => has_double_quoted && has_single_quoted,
-            PreferredQuotedLiteralStyle::SingleQuotes => has_double_quoted,
-            PreferredQuotedLiteralStyle::DoubleQuotes => has_single_quoted,
+        let sql = ctx.statement_sql();
+        let literals = scan_string_literals(sql);
+
+        if literals.is_empty() {
+            return Vec::new();
+        }
+
+        // Determine effective preferred style.
+        let preferred = match self.preferred_style {
+            PreferredStyle::Consistent => {
+                // Derive from the first literal's quote character.
+                let first = &literals[0];
+                if first.quote_char == '"' {
+                    PreferredStyle::DoubleQuotes
+                } else {
+                    PreferredStyle::SingleQuotes
+                }
+            }
+            other => other,
         };
 
-        if violation {
-            let message = match self.preferred_style {
-                PreferredQuotedLiteralStyle::Consistent => {
-                    "Quoted literal style appears inconsistent."
-                }
-                PreferredQuotedLiteralStyle::SingleQuotes => {
-                    "Use single quotes for quoted literals."
-                }
-                PreferredQuotedLiteralStyle::DoubleQuotes => {
-                    "Use double quotes for quoted literals."
-                }
-            };
-            let mut issue =
-                Issue::info(issue_codes::LINT_CV_010, message).with_statement(ctx.statement_index);
+        let (pref_char, alt_char) = match preferred {
+            PreferredStyle::SingleQuotes => ('\'', '"'),
+            PreferredStyle::DoubleQuotes => ('"', '\''),
+            PreferredStyle::Consistent => unreachable!(),
+        };
 
-            let autofix_edits = cv010_autofix_edits(ctx.statement_sql(), self.preferred_style)
-                .into_iter()
-                .map(|edit| {
-                    IssuePatchEdit::new(
-                        ctx.span_from_statement_offset(edit.start, edit.end),
-                        edit.replacement,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if !autofix_edits.is_empty() {
-                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+        let mut edits: Vec<IssuePatchEdit> = Vec::new();
+        let mut any_violation = false;
+
+        for lit in &literals {
+            let normalized = normalize_literal(sql, lit, pref_char, alt_char);
+            if let Some(replacement) = normalized {
+                any_violation = true;
+                edits.push(IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(lit.start, lit.end),
+                    replacement,
+                ));
             }
-
-            vec![issue]
-        } else {
-            Vec::new()
         }
+
+        if !any_violation {
+            return Vec::new();
+        }
+
+        let message = match preferred {
+            PreferredStyle::SingleQuotes => "Use single quotes for quoted literals.",
+            PreferredStyle::DoubleQuotes => "Use double quotes for quoted literals.",
+            PreferredStyle::Consistent => unreachable!(),
+        };
+
+        let mut issue =
+            Issue::info(issue_codes::LINT_CV_010, message).with_statement(ctx.statement_index);
+
+        if !edits.is_empty() {
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+        }
+
+        vec![issue]
     }
 }
 
-struct Cv010AutofixEdit {
+// ---------------------------------------------------------------------------
+// String literal scanner
+// ---------------------------------------------------------------------------
+
+/// A string literal found in the raw SQL source.
+#[derive(Debug)]
+struct StringLiteral {
+    /// Byte offset of the start of the literal (including any prefix).
     start: usize,
+    /// Byte offset one past the end of the literal.
     end: usize,
-    replacement: String,
+    /// The quote character used: `'` or `"`.
+    quote_char: char,
+    /// Whether this is a triple-quoted string.
+    is_triple: bool,
+    /// Whether the literal has a prefix (r, b, R, B).
+    prefix: Option<u8>,
 }
 
-fn cv010_autofix_edits(
-    sql: &str,
-    preferred_style: PreferredQuotedLiteralStyle,
-) -> Vec<Cv010AutofixEdit> {
-    match preferred_style {
-        // In most supported dialects, rewriting `'value'` -> `"value"` changes
-        // semantics (string literal vs quoted identifier), so keep this
-        // report-only in current migration scope.
-        PreferredQuotedLiteralStyle::DoubleQuotes => Vec::new(),
-        PreferredQuotedLiteralStyle::Consistent | PreferredQuotedLiteralStyle::SingleQuotes => {
-            unnecessary_quoted_identifier_edits(sql)
-        }
-    }
-}
-
-fn unnecessary_quoted_identifier_edits(sql: &str) -> Vec<Cv010AutofixEdit> {
+/// Scan raw SQL for string literals (single-quoted, double-quoted, with
+/// optional BigQuery prefixes).  Skips comments, dollar-quoted strings,
+/// and date/time constructor strings (DATE'...', TIME'...', etc.).
+fn scan_string_literals(sql: &str) -> Vec<StringLiteral> {
     let bytes = sql.as_bytes();
-    let mut edits = Vec::new();
-    let mut index = 0usize;
-    let mut in_single = false;
+    let len = bytes.len();
+    let mut result = Vec::new();
+    let mut i = 0;
 
-    while index < bytes.len() {
-        if bytes[index] == b'\'' {
-            if in_single && index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                index += 2;
+    while i < len {
+        // Skip line comments.
+        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip block comments.
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+
+        // Skip dollar-quoted strings ($$...$$).
+        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'$' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'$' && bytes[i + 1] == b'$') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+
+        // Check for date/time constructor keywords preceding a quote.
+        // E.g. DATE'...', TIME'...', TIMESTAMP'...', DATETIME'...'
+        // These are SQL typed literals, not normal string literals.
+        if (bytes[i] == b'\'' || bytes[i] == b'"') && is_preceded_by_type_keyword(sql, i) {
+            // Skip the typed literal.
+            let q = bytes[i];
+            i += 1;
+            while i < len && bytes[i] != q {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 1;
+                }
+                i += 1;
+            }
+            if i < len {
+                i += 1; // skip closing quote
+            }
+            continue;
+        }
+
+        // Check for prefix characters (r, b, R, B) before a quote.
+        let prefix: Option<u8>;
+        let quote_start: usize;
+        if (bytes[i] == b'r' || bytes[i] == b'R' || bytes[i] == b'b' || bytes[i] == b'B')
+            && i + 1 < len
+            && (bytes[i + 1] == b'\'' || bytes[i + 1] == b'"')
+        {
+            // Make sure this isn't part of an identifier.
+            if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+                i += 1;
                 continue;
             }
-            in_single = !in_single;
-            index += 1;
+            prefix = Some(bytes[i]);
+            quote_start = i + 1;
+        } else if bytes[i] == b'\'' || bytes[i] == b'"' {
+            prefix = None;
+            quote_start = i;
+        } else {
+            i += 1;
             continue;
         }
 
-        if in_single || bytes[index] != b'"' {
-            index += 1;
-            continue;
-        }
+        let q = bytes[quote_start];
+        let literal_start = if prefix.is_some() { i } else { quote_start };
 
-        let start = index;
-        index += 1;
-        let ident_start = index;
-        let mut escaped_quote = false;
-        while index < bytes.len() {
-            if bytes[index] == b'"' {
-                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
-                    escaped_quote = true;
-                    index += 2;
+        // Check for triple quote.
+        let is_triple =
+            quote_start + 2 < len && bytes[quote_start + 1] == q && bytes[quote_start + 2] == q;
+
+        if is_triple {
+            let mut j = quote_start + 3;
+            loop {
+                if j + 2 >= len {
+                    // Unterminated triple quote -- skip.
+                    i = len;
+                    break;
+                }
+                if bytes[j] == q && bytes[j + 1] == q && bytes[j + 2] == q {
+                    let end = j + 3;
+                    result.push(StringLiteral {
+                        start: literal_start,
+                        end,
+                        quote_char: q as char,
+                        is_triple: true,
+                        prefix,
+                    });
+                    i = end;
+                    break;
+                }
+                if bytes[j] == b'\\' {
+                    j += 1; // skip escaped char
+                }
+                j += 1;
+            }
+        } else {
+            // Single-quoted literal.
+            let mut j = quote_start + 1;
+            while j < len {
+                if bytes[j] == b'\\' {
+                    j += 2;
                     continue;
                 }
-                break;
+                if bytes[j] == q {
+                    // Check for escaped quote ('' or "").
+                    if j + 1 < len && bytes[j + 1] == q {
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                j += 1;
             }
-            index += 1;
-        }
-        if index >= bytes.len() {
-            break;
-        }
-
-        let ident_end = index;
-        let end = index + 1;
-        let Some(ident) = sql.get(ident_start..ident_end) else {
-            index += 1;
-            continue;
-        };
-
-        if !escaped_quote && is_simple_identifier(ident) && can_unquote_identifier_safely(ident) {
-            edits.push(Cv010AutofixEdit {
-                start,
+            if j >= len {
+                // Unterminated string, skip.
+                i = len;
+                continue;
+            }
+            let end = j + 1;
+            result.push(StringLiteral {
+                start: literal_start,
                 end,
-                replacement: ident.to_string(),
+                quote_char: q as char,
+                is_triple: false,
+                prefix,
             });
+            i = end;
         }
-
-        index = end;
     }
 
-    edits
+    result
 }
 
-fn is_simple_identifier(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    if bytes.is_empty() || !is_ascii_ident_start(bytes[0]) {
-        return false;
+/// Check if position `pos` is preceded by a type keyword like DATE, TIME,
+/// TIMESTAMP, DATETIME, INTERVAL (ignoring case and optional whitespace).
+fn is_preceded_by_type_keyword(sql: &str, pos: usize) -> bool {
+    let before = &sql[..pos];
+    let trimmed = before.trim_end();
+    let lower = trimmed.to_ascii_lowercase();
+    for kw in &["date", "time", "timestamp", "datetime", "interval"] {
+        if lower.ends_with(kw) {
+            // Make sure it's a complete keyword (not part of a longer identifier).
+            let prefix_len = trimmed.len() - kw.len();
+            if prefix_len == 0 {
+                return true;
+            }
+            let prev_byte = trimmed.as_bytes()[prefix_len - 1];
+            if !prev_byte.is_ascii_alphanumeric() && prev_byte != b'_' {
+                return true;
+            }
+        }
     }
-    bytes[1..].iter().copied().all(is_ascii_ident_continue)
+    false
 }
 
-fn is_ascii_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
-}
+// ---------------------------------------------------------------------------
+// Quote normalization (Black-style)
+// ---------------------------------------------------------------------------
 
-fn is_ascii_ident_continue(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn can_unquote_identifier_safely(identifier: &str) -> bool {
-    let mut chars = identifier.chars();
-    let Some(first) = chars.next() else {
-        return false;
+/// Attempt to normalize a string literal to the preferred quote style.
+/// Returns `Some(replacement)` if the literal should be changed, `None` if
+/// it's already correct or conversion would increase escaping.
+fn normalize_literal(
+    sql: &str,
+    lit: &StringLiteral,
+    pref_char: char,
+    alt_char: char,
+) -> Option<String> {
+    let raw = &sql[lit.start..lit.end];
+    let prefix_str = match lit.prefix {
+        Some(_) => &raw[..1],
+        None => "",
     };
+    let value_part = &raw[prefix_str.len()..]; // the part starting with quote(s)
 
-    let starts_ok = first.is_ascii_lowercase() || first == '_';
-    let rest_ok = chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+    if lit.is_triple {
+        let pref_triple = format!("{0}{0}{0}", pref_char);
+        let alt_triple = format!("{0}{0}{0}", alt_char);
 
-    starts_ok && rest_ok && !is_sql_keyword(identifier)
-}
-
-fn is_sql_keyword(token: &str) -> bool {
-    matches!(
-        token.to_ascii_uppercase().as_str(),
-        "ALL"
-            | "ALTER"
-            | "AND"
-            | "ANY"
-            | "AS"
-            | "ASC"
-            | "BEGIN"
-            | "BETWEEN"
-            | "BOOLEAN"
-            | "BY"
-            | "CASE"
-            | "CAST"
-            | "CHECK"
-            | "COLUMN"
-            | "CONSTRAINT"
-            | "CREATE"
-            | "CROSS"
-            | "DEFAULT"
-            | "DELETE"
-            | "DESC"
-            | "DISTINCT"
-            | "DROP"
-            | "ELSE"
-            | "END"
-            | "EXCEPT"
-            | "EXISTS"
-            | "FALSE"
-            | "FETCH"
-            | "FOR"
-            | "FOREIGN"
-            | "FROM"
-            | "FULL"
-            | "GROUP"
-            | "HAVING"
-            | "IF"
-            | "IN"
-            | "INDEX"
-            | "INNER"
-            | "INSERT"
-            | "INT"
-            | "INTEGER"
-            | "INTERSECT"
-            | "INTO"
-            | "IS"
-            | "JOIN"
-            | "KEY"
-            | "LEFT"
-            | "LIKE"
-            | "LIMIT"
-            | "NOT"
-            | "NULL"
-            | "OFFSET"
-            | "ON"
-            | "OR"
-            | "ORDER"
-            | "OUTER"
-            | "OVER"
-            | "PARTITION"
-            | "PRIMARY"
-            | "REFERENCES"
-            | "RIGHT"
-            | "SELECT"
-            | "SET"
-            | "TABLE"
-            | "TEXT"
-            | "THEN"
-            | "TO"
-            | "TRUE"
-            | "UNION"
-            | "UNIQUE"
-            | "UPDATE"
-            | "USING"
-            | "VALUES"
-            | "VIEW"
-            | "WHEN"
-            | "WHERE"
-            | "WITH"
-    )
-}
-
-fn statement_contains_single_quoted_literal(statement: &Statement) -> bool {
-    let mut found = false;
-    visit_expressions(statement, &mut |expr| {
-        if found {
-            return;
+        if value_part.starts_with(&pref_triple) {
+            // Already preferred triple -- nothing to do.
+            return None;
         }
-        if let sqlparser::ast::Expr::Value(value) = expr {
-            found = matches!(
-                value.value,
-                Value::SingleQuotedString(_)
-                    | Value::DollarQuotedString(_)
-                    | Value::NationalStringLiteral(_)
-                    | Value::EscapedStringLiteral(_)
-            );
+
+        if !value_part.starts_with(&alt_triple) {
+            // Neither preferred nor alternate triple -- skip.
+            return None;
         }
-    });
-    found
+
+        // Body is between the triple quotes.
+        let body = &value_part[3..value_part.len() - 3];
+
+        // For triple-quoted strings, we don't modify escapes inside the body
+        // (matching SQLFluff behavior).  But we need to handle edge cases
+        // where the body ends with the preferred quote char.
+        let mut new_body = body.to_string();
+
+        // Edge case: if body ends with pref_char, we need to escape it
+        // so it doesn't merge with the closing triple.
+        if new_body.ends_with(pref_char) && !new_body.ends_with(&format!("\\{}", pref_char)) {
+            // Check if there's a space after the trailing pref_char --
+            // if the body ends with "pref_char " we don't need to escape.
+            // Actually, check if the last char IS pref_char (no trailing space).
+            let trimmed_body = new_body.trim_end_matches(pref_char);
+            let trailing_count = new_body.len() - trimmed_body.len();
+            if trailing_count > 0 {
+                // Escape the last pref_char.
+                new_body = format!("{}\\{}", &new_body[..new_body.len() - 1], pref_char);
+            }
+        }
+
+        let result = format!("{}{}{}{}", prefix_str, pref_triple, new_body, pref_triple);
+        if result == raw {
+            return None;
+        }
+        return Some(result);
+    }
+
+    // Single-quoted literal.
+    if value_part.starts_with(pref_char) {
+        // Already preferred quote.  Check if we can remove unnecessary escapes.
+        let body = &value_part[1..value_part.len() - 1];
+        let new_body = remove_unnecessary_escapes(body, pref_char, alt_char);
+        if new_body == body {
+            return None;
+        }
+        let result = format!("{}{}{}{}", prefix_str, pref_char, new_body, pref_char);
+        if result == raw {
+            return None;
+        }
+        return Some(result);
+    }
+
+    if !value_part.starts_with(alt_char) {
+        return None;
+    }
+
+    // Currently using alternate quotes.
+    let body = &value_part[1..value_part.len() - 1];
+    let is_raw = lit.prefix.map(|p| p == b'r' || p == b'R').unwrap_or(false);
+
+    if is_raw {
+        // Raw strings: do not modify the body.  Can only convert if the
+        // body doesn't contain unescaped preferred quotes.
+        if body.contains(pref_char) {
+            // Check if ALL occurrences are escaped.
+            let has_unescaped = has_unescaped_char(body, pref_char as u8);
+            if has_unescaped {
+                return None;
+            }
+        }
+        let result = format!("{}{}{}{}", prefix_str, pref_char, body, pref_char);
+        if result == raw {
+            return None;
+        }
+        return Some(result);
+    }
+
+    // Non-raw: apply Black-style normalization.
+    // 1. Remove unnecessary escapes of the new (preferred) quote.
+    let body_cleaned = remove_unnecessary_escapes(body, alt_char, pref_char);
+
+    // 2. Add escapes for unescaped preferred quotes, remove escapes for
+    //    alternate quotes.
+    let new_body = convert_quotes_in_body(&body_cleaned, pref_char as u8, alt_char as u8);
+
+    // Compare escape counts.
+    let orig_escapes = body_cleaned.matches('\\').count();
+    let new_escapes = new_body.matches('\\').count();
+
+    if new_escapes > orig_escapes {
+        // Would introduce more escaping -- keep original but remove
+        // unnecessary escapes.
+        if body_cleaned != body {
+            let result = format!("{}{}{}{}", prefix_str, alt_char, body_cleaned, alt_char);
+            return Some(result);
+        }
+        return None;
+    }
+
+    let result = format!("{}{}{}{}", prefix_str, pref_char, new_body, pref_char);
+    if result == raw {
+        return None;
+    }
+    Some(result)
 }
+
+/// Remove unnecessary escapes of `other_char` in a body quoted with
+/// `quote_char`.  E.g. in a double-quoted string, `\'` is unnecessary.
+fn remove_unnecessary_escapes(body: &str, _quote_char: char, other_char: char) -> String {
+    let bytes = body.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next == other_char as u8 {
+                // Check if this backslash is itself escaped.
+                // Count preceding backslashes.
+                let preceding_backslashes = count_preceding_backslashes(&result);
+                if preceding_backslashes.is_multiple_of(2) {
+                    // This \other is unnecessary -- remove the backslash.
+                    result.push(next);
+                    i += 2;
+                    continue;
+                }
+            }
+            result.push(bytes[i]);
+            result.push(next);
+            i += 2;
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8(result).unwrap_or_else(|_| body.to_string())
+}
+
+/// Convert body from alt_char quoting to pref_char quoting:
+/// - Escape unescaped pref_char occurrences
+/// - Unescape escaped alt_char occurrences
+fn convert_quotes_in_body(body: &str, pref: u8, alt: u8) -> String {
+    let bytes = body.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if next == alt {
+                // Unescape: \alt -> alt (when we're switching to pref quoting).
+                let preceding = count_preceding_backslashes(&result);
+                if preceding.is_multiple_of(2) {
+                    result.push(alt);
+                    i += 2;
+                    continue;
+                }
+            }
+            result.push(bytes[i]);
+            result.push(next);
+            i += 2;
+        } else if bytes[i] == pref {
+            // Escape unescaped preferred quote.
+            let preceding = count_preceding_backslashes(&result);
+            if preceding.is_multiple_of(2) {
+                result.push(b'\\');
+            }
+            result.push(pref);
+            i += 1;
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8(result).unwrap_or_else(|_| body.to_string())
+}
+
+fn count_preceding_backslashes(buf: &[u8]) -> usize {
+    buf.iter().rev().take_while(|&&b| b == b'\\').count()
+}
+
+fn has_unescaped_char(body: &str, ch: u8) -> bool {
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == ch {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
-    use crate::types::IssueAutofixApplicability;
 
-    fn run(sql: &str) -> Vec<Issue> {
+    fn run_with_dialect(sql: &str, dialect: Dialect) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
         let rule = ConventionQuotedLiterals::default();
-        statements
-            .iter()
-            .enumerate()
-            .flat_map(|(index, statement)| {
-                rule.check(
-                    statement,
-                    &LintContext {
-                        sql,
-                        statement_range: 0..sql.len(),
-                        statement_index: index,
-                    },
-                )
-            })
-            .collect()
+        with_active_dialect(dialect, || {
+            statements
+                .iter()
+                .enumerate()
+                .flat_map(|(index, statement)| {
+                    rule.check(
+                        statement,
+                        &LintContext {
+                            sql,
+                            statement_range: 0..sql.len(),
+                            statement_index: index,
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn run(sql: &str) -> Vec<Issue> {
+        run_with_dialect(sql, Dialect::Bigquery)
+    }
+
+    fn run_with_config(sql: &str, dialect: Dialect, config: &LintConfig) -> Vec<Issue> {
+        let statements = parse_sql(sql).expect("parse");
+        let rule = ConventionQuotedLiterals::from_config(config);
+        with_active_dialect(dialect, || {
+            statements
+                .iter()
+                .enumerate()
+                .flat_map(|(index, statement)| {
+                    rule.check(
+                        statement,
+                        &LintContext {
+                            sql,
+                            statement_range: 0..sql.len(),
+                            statement_index: index,
+                        },
+                    )
+                })
+                .collect()
+        })
     }
 
     fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
@@ -360,84 +637,230 @@ mod tests {
         Some(out)
     }
 
-    #[test]
-    fn flags_mixed_quote_styles_in_consistent_mode() {
-        let sql = "SELECT 'abc' AS a, \"def\" AS b FROM t";
-        let issues = run(sql);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].code, issue_codes::LINT_CV_010);
-        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
-        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT 'abc' AS a, def AS b FROM t");
-    }
-
-    #[test]
-    fn does_not_flag_single_quoted_literal() {
-        assert!(run("SELECT 'abc' FROM t").is_empty());
-    }
-
-    #[test]
-    fn does_not_flag_only_double_quoted_literal_like_token() {
-        assert!(run("SELECT \"abc\" FROM t").is_empty());
-    }
-
-    #[test]
-    fn does_not_flag_double_quotes_inside_single_quoted_literal() {
-        assert!(run("SELECT '\"abc\"' FROM t").is_empty());
-    }
-
-    #[test]
-    fn single_quotes_preference_flags_double_quoted_identifier_usage() {
-        let config = LintConfig {
+    fn make_config(style: &str) -> LintConfig {
+        LintConfig {
             enabled: true,
             disabled_rules: vec![],
             rule_configs: std::collections::BTreeMap::from([(
                 "convention.quoted_literals".to_string(),
-                serde_json::json!({"preferred_quoted_literal_style": "single_quotes"}),
+                serde_json::json!({"preferred_quoted_literal_style": style}),
             )]),
-        };
-        let rule = ConventionQuotedLiterals::from_config(&config);
-        let sql = "SELECT \"abc\" FROM t";
-        let statements = parse_sql(sql).expect("parse");
-        let issues = rule.check(
-            &statements[0],
-            &LintContext {
-                sql,
-                statement_range: 0..sql.len(),
-                statement_index: 0,
-            },
-        );
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT abc FROM t");
+        }
     }
 
-    #[test]
-    fn double_quotes_preference_flags_single_quoted_literal_usage() {
-        let config = LintConfig {
+    fn make_config_force(style: &str) -> LintConfig {
+        LintConfig {
             enabled: true,
             disabled_rules: vec![],
             rule_configs: std::collections::BTreeMap::from([(
-                "LINT_CV_010".to_string(),
-                serde_json::json!({"preferred_quoted_literal_style": "double_quotes"}),
+                "convention.quoted_literals".to_string(),
+                serde_json::json!({
+                    "preferred_quoted_literal_style": style,
+                    "force_enable": true,
+                }),
             )]),
-        };
-        let rule = ConventionQuotedLiterals::from_config(&config);
-        let sql = "SELECT 'abc' FROM t";
-        let statements = parse_sql(sql).expect("parse");
-        let issues = rule.check(
-            &statements[0],
-            &LintContext {
-                sql,
-                statement_range: 0..sql.len(),
-                statement_index: 0,
-            },
-        );
+        }
+    }
+
+    // --- Dialect gating ---
+
+    #[test]
+    fn no_issue_for_ansi_dialect() {
+        let issues = run_with_dialect("SELECT 'abc', \"def\"", Dialect::Ansi);
+        assert!(issues.is_empty(), "CV10 should not fire for ANSI dialect");
+    }
+
+    #[test]
+    fn no_issue_for_postgres_dialect() {
+        let issues = run_with_dialect("SELECT 'abc'", Dialect::Postgres);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn force_enable_works_for_postgres() {
+        let config = make_config_force("single_quotes");
+        let issues = run_with_config("SELECT 'abc'", Dialect::Postgres, &config);
+        assert!(issues.is_empty(), "single-quoted only should pass");
+    }
+
+    // --- BigQuery consistent mode ---
+
+    #[test]
+    fn consistent_mode_flags_mixed_quotes() {
+        let sql = "SELECT\n    \"some string\",\n    'some string'";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(fixed, "SELECT\n    \"some string\",\n    \"some string\"");
+    }
+
+    #[test]
+    fn consistent_mode_no_issue_for_single_style() {
+        let issues = run("SELECT 'abc', 'def'");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn consistent_mode_no_issue_for_double_style() {
+        let issues = run("SELECT \"abc\", \"def\"");
+        assert!(issues.is_empty());
+    }
+
+    // --- Explicit double_quotes preference ---
+
+    #[test]
+    fn double_pref_flags_single_quoted() {
+        let config = make_config("double_quotes");
+        let sql = "SELECT 'abc'";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(fixed, "SELECT \"abc\"");
+    }
+
+    #[test]
+    fn double_pref_passes_double_quoted() {
+        let config = make_config("double_quotes");
+        let issues = run_with_config("SELECT \"abc\"", Dialect::Bigquery, &config);
+        assert!(issues.is_empty());
+    }
+
+    // --- Single quotes preference ---
+
+    #[test]
+    fn single_pref_flags_double_quoted() {
+        let config = make_config("single_quotes");
+        let sql = "SELECT \"abc\"";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(fixed, "SELECT 'abc'");
+    }
+
+    // --- Empty strings ---
+
+    #[test]
+    fn double_pref_passes_empty_double() {
+        let config = make_config("double_quotes");
+        let issues = run_with_config("SELECT \"\"", Dialect::Bigquery, &config);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn double_pref_flags_empty_single() {
+        let config = make_config("double_quotes");
+        let sql = "SELECT ''";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(fixed, "SELECT \"\"");
+    }
+
+    // --- Date constructor strings are ignored ---
+
+    #[test]
+    fn date_constructor_ignored_consistent() {
+        let sql = "SELECT\n    \"quoted string\",\n    DATE'some string'";
+        let issues = run(sql);
         assert!(
-            issues[0].autofix.is_none(),
-            "double quote preference remains report-only in conservative CV010 migration scope"
+            issues.is_empty(),
+            "DATE'...' should not count as single-quoted literal"
         );
+    }
+
+    #[test]
+    fn date_constructor_ignored_double_pref() {
+        let config = make_config("double_quotes");
+        let issues = run_with_config("SELECT\n    DATE'some string'", Dialect::Bigquery, &config);
+        assert!(issues.is_empty());
+    }
+
+    // --- Dollar-quoted strings are ignored ---
+
+    #[test]
+    fn dollar_quoted_ignored() {
+        let config = make_config_force("single_quotes");
+        let sql = "SELECT\n    'some string',\n    $$some_other_string$$";
+        let issues = run_with_config(sql, Dialect::Postgres, &config);
+        assert!(issues.is_empty());
+    }
+
+    // --- String prefix handling (BigQuery r/b prefixes) ---
+
+    #[test]
+    fn bigquery_prefixes_double_pref() {
+        let config = make_config("double_quotes");
+        let sql = "SELECT\n    r'some_string',\n    b'some_string',\n    R'some_string',\n    B'some_string'";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(
+            fixed,
+            "SELECT\n    r\"some_string\",\n    b\"some_string\",\n    R\"some_string\",\n    B\"some_string\""
+        );
+    }
+
+    #[test]
+    fn bigquery_prefixes_consistent_mode() {
+        // r'...' and b"..." -- consistent mode derives single from first literal.
+        let sql = "SELECT\n    r'some_string',\n    b\"some_string\"";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(fixed, "SELECT\n    r'some_string',\n    b'some_string'");
+    }
+
+    // --- Escaping ---
+
+    #[test]
+    fn unnecessary_escaping_removed() {
+        let config = make_config("double_quotes");
+        let sql =
+            "SELECT\n    'unnecessary \\\"\\\"escaping',\n    \"unnecessary \\'\\' escaping\"";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+    }
+
+    // --- Hive, MySQL, SparkSQL dialects ---
+
+    #[test]
+    fn hive_dialect_supported() {
+        let sql = "SELECT\n    \"some string\",\n    'some string'";
+        let issues = run_with_dialect(sql, Dialect::Hive);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn mysql_dialect_supported() {
+        let sql = "SELECT\n    \"some string\",\n    'some string'";
+        let issues = run_with_dialect(sql, Dialect::Mysql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn sparksql_dialect_supported() {
+        // SparkSQL maps to Databricks.
+        let sql = "SELECT\n    \"some string\",\n    'some string'";
+        let issues = run_with_dialect(sql, Dialect::Databricks);
+        assert_eq!(issues.len(), 1);
+    }
+
+    // --- Triple-quoted strings ---
+
+    #[test]
+    fn triple_quotes_preferred_passes() {
+        let config = make_config("double_quotes");
+        let issues = run_with_config("SELECT \"\"\"some_string\"\"\"", Dialect::Bigquery, &config);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn triple_quotes_alternate_fails_and_fixes() {
+        let config = make_config("double_quotes");
+        let sql = "SELECT '''some_string'''";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(fixed, "SELECT \"\"\"some_string\"\"\"");
     }
 }

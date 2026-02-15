@@ -415,8 +415,9 @@ fn lint_rule_config_blocked_words_custom_list() {
 
 #[test]
 fn lint_rule_config_quoted_literals_double_quotes_preference() {
-    let issues = run_lint_with_config(
+    let issues = run_lint_with_config_in_dialect(
         "SELECT 'abc' FROM t",
+        Dialect::Bigquery,
         LintConfig {
             enabled: true,
             disabled_rules: vec![],
@@ -2982,7 +2983,6 @@ fn lint_sqlfluff_parity_rule_smoke_cases() {
         ("LINT_CV_006", "SELECT 1 ;"),
         ("LINT_CV_007", "(SELECT 1)"),
         ("LINT_CV_009", "SELECT foo FROM t"),
-        ("LINT_CV_010", "SELECT 'abc' AS a, \"def\" AS b FROM t"),
         ("LINT_CV_011", "SELECT CAST(a AS INT)::TEXT FROM t"),
         ("LINT_CV_012", "SELECT foo.a, bar.b FROM foo JOIN bar WHERE foo.x = bar.y"),
         ("LINT_JJ_001", "SELECT '{{foo}}' AS templated"),
@@ -3035,6 +3035,20 @@ fn lint_sqlfluff_parity_rule_smoke_cases() {
             "expected {code} for SQL: {sql}; got: {issues:?}"
         );
     }
+
+    // CV10 requires a dialect where both single/double quotes denote strings.
+    let cv10_issues = run_lint_with_config_in_dialect(
+        "SELECT 'abc', \"def\"",
+        Dialect::Bigquery,
+        LintConfig::default(),
+    );
+    assert!(
+        cv10_issues
+            .iter()
+            .any(|(code, _)| code == issue_codes::LINT_CV_010),
+        "expected {} in BigQuery dialect smoke case: {cv10_issues:?}",
+        issue_codes::LINT_CV_010,
+    );
 
     let al07_issues = run_lint_with_config(
         "SELECT * FROM users u",

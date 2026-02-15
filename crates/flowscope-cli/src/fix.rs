@@ -3510,7 +3510,9 @@ fn case_operands_match(outer: Option<&Expr>, inner: Option<&Expr>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flowscope_core::{analyze, issue_codes, AnalysisOptions, AnalyzeRequest, LintConfig};
+    use flowscope_core::{
+        analyze, issue_codes, AnalysisOptions, AnalyzeRequest, Dialect, LintConfig,
+    };
 
     fn default_lint_config() -> LintConfig {
         LintConfig {
@@ -3525,6 +3527,33 @@ mod tests {
             sql: sql.to_string(),
             files: None,
             dialect: Dialect::Generic,
+            source_name: None,
+            options: Some(AnalysisOptions {
+                lint: Some(lint_config.clone()),
+                ..Default::default()
+            }),
+            schema: None,
+            #[cfg(feature = "templating")]
+            template_config: None,
+        };
+
+        analyze(&request)
+            .issues
+            .iter()
+            .filter(|issue| issue.code == code)
+            .count()
+    }
+
+    fn lint_rule_count_with_config_in_dialect(
+        sql: &str,
+        code: &str,
+        dialect: Dialect,
+        lint_config: &LintConfig,
+    ) -> usize {
+        let request = AnalyzeRequest {
+            sql: sql.to_string(),
+            files: None,
+            dialect,
             source_name: None,
             options: Some(AnalysisOptions {
                 lint: Some(lint_config.clone()),
@@ -4543,27 +4572,33 @@ mod tests {
     }
 
     #[test]
-    fn cv010_fix_respects_single_quote_preference_without_rf006() {
+    fn cv010_fix_converts_double_to_single_in_bigquery() {
         let lint_config = LintConfig {
             enabled: true,
-            disabled_rules: vec![issue_codes::LINT_RF_006.to_string()],
+            disabled_rules: vec![],
             rule_configs: std::collections::BTreeMap::from([(
                 "convention.quoted_literals".to_string(),
                 serde_json::json!({"preferred_quoted_literal_style": "single_quotes"}),
             )]),
         };
-        let sql = "SELECT 'abc' AS a, \"good_name\" AS b FROM t";
-        assert_rule_case_with_config(sql, issue_codes::LINT_CV_010, 1, 0, 1, &lint_config);
-
-        let out = apply_fix_with_config(sql, &lint_config);
-        assert!(
-            out.sql.contains("good_name"),
-            "expected safe identifier unquoting for CV_010 fix: {}",
-            out.sql
+        // In BigQuery, both "abc" and 'abc' are string literals.
+        let sql = "SELECT \"abc\"";
+        let before = lint_rule_count_with_config_in_dialect(
+            sql,
+            issue_codes::LINT_CV_010,
+            Dialect::Bigquery,
+            &lint_config,
         );
+        assert_eq!(
+            before, 1,
+            "CV10 should flag double-quoted string in BigQuery with single_quotes preference"
+        );
+
+        let out = apply_lint_fixes_with_lint_config(sql, Dialect::Bigquery, &lint_config)
+            .expect("fix result");
         assert!(
-            !out.sql.contains("\"good_name\""),
-            "expected double-quoted identifier to be rewritten: {}",
+            out.sql.contains("'abc'"),
+            "expected double-quoted string to be converted to single-quoted: {}",
             out.sql
         );
     }

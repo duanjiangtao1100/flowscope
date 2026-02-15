@@ -1056,6 +1056,7 @@ async fn lint_fix_applies_cp005_core_autofix_in_patch_mode() {
 
 #[tokio::test]
 async fn lint_fix_applies_cv010_core_autofix_in_patch_mode() {
+    // CV10 only fires in dialects where both single/double quotes are strings.
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
 
@@ -1063,18 +1064,19 @@ async fn lint_fix_applies_cv010_core_autofix_in_patch_mode() {
         &app,
         "/api/lint-fix",
         json!({
-            "sql": "select 'abc' as a, \"good_name\" as b from t\n",
-            "disabled_rules": ["LINT_RF_006"]
+            "sql": "SELECT 'abc', \"def\"\n",
+            "dialect": "Bigquery",
+            "unsafe_fixes": true
         }),
     )
     .await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["changed"], true);
-    assert_eq!(
-        json["sql"].as_str().unwrap(),
-        "select 'abc' as a, good_name as b from t\n",
-        "expected CV010 core autofix to unquote safe double-quoted identifiers"
+    let fixed = json["sql"].as_str().unwrap();
+    assert!(
+        !fixed.contains("\"def\""),
+        "expected CV010 core autofix to convert double-quoted string to single-quoted: {fixed}"
     );
 }
 
