@@ -1,14 +1,16 @@
 //! LINT_LT_002: Layout indent.
 //!
-//! SQLFluff LT02 parity (current scope): flag odd indentation widths on
-//! subsequent lines.
+//! SQLFluff LT02 parity: flag structural indentation violations (clause
+//! contents not indented under their parent keyword), odd indentation widths,
+//! mixed tab/space indentation, and wrong indent style.
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
+use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub struct LayoutIndent {
     indent_unit: usize,
@@ -27,12 +29,14 @@ impl LayoutIndent {
         let tab_space_size = config
             .rule_option_usize(issue_codes::LINT_LT_002, "tab_space_size")
             .or_else(|| config.section_option_usize("indentation", "tab_space_size"))
+            .or_else(|| config.section_option_usize("rules", "tab_space_size"))
             .unwrap_or(4)
             .max(1);
 
         let indent_style = match config
             .rule_option_str(issue_codes::LINT_LT_002, "indent_unit")
             .or_else(|| config.section_option_str("indentation", "indent_unit"))
+            .or_else(|| config.section_option_str("rules", "indent_unit"))
         {
             Some(value) if value.eq_ignore_ascii_case("tab") => IndentStyle::Tabs,
             _ => IndentStyle::Spaces,
@@ -40,7 +44,8 @@ impl LayoutIndent {
 
         let indent_unit_numeric = config
             .rule_option_usize(issue_codes::LINT_LT_002, "indent_unit")
-            .or_else(|| config.section_option_usize("indentation", "indent_unit"));
+            .or_else(|| config.section_option_usize("indentation", "indent_unit"))
+            .or_else(|| config.section_option_usize("rules", "indent_unit"));
         let indent_unit = match indent_style {
             IndentStyle::Spaces => indent_unit_numeric.unwrap_or(4).max(1),
             IndentStyle::Tabs => indent_unit_numeric.unwrap_or(tab_space_size).max(1),
@@ -79,11 +84,11 @@ impl LintRule for LayoutIndent {
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let snapshots = line_indent_snapshots(ctx, self.tab_space_size);
         let mut has_violation = first_line_is_indented(ctx);
+
+        // Syntactic checks: odd width, mixed chars, wrong style.
         for snapshot in &snapshots {
             let indent = snapshot.indent;
 
-            // Rule-level tests and fallback contexts may not expose raw leading
-            // whitespace via `statement_range`; keep direct first-line check.
             if snapshot.line_index == 0 && indent.width > 0 {
                 has_violation = true;
                 break;
@@ -110,6 +115,24 @@ impl LintRule for LayoutIndent {
             }
         }
 
+        // Structural check: clause contents must be indented under their
+        // parent keyword (e.g., table name under UPDATE, column list under
+        // SELECT, condition under WHERE, etc.).
+        let structural_edits = if !has_violation {
+            let edits = structural_indent_edits(
+                ctx,
+                self.indent_unit,
+                self.tab_space_size,
+                self.indent_style,
+            );
+            if !edits.is_empty() {
+                has_violation = true;
+            }
+            edits
+        } else {
+            Vec::new()
+        };
+
         if !has_violation {
             return Vec::new();
         }
@@ -120,21 +143,35 @@ impl LintRule for LayoutIndent {
         )
         .with_statement(ctx.statement_index);
 
-        let autofix_edits = indentation_autofix_edits(
+        let mut autofix_edits = indentation_autofix_edits(
             ctx.statement_sql(),
             &snapshots,
             self.indent_unit,
             self.tab_space_size,
             self.indent_style,
-        )
-        .into_iter()
-        .map(|edit| {
-            IssuePatchEdit::new(
-                ctx.span_from_statement_offset(edit.start, edit.end),
-                edit.replacement,
-            )
-        })
-        .collect::<Vec<_>>();
+        );
+
+        // Merge structural edits (e.g., adding indentation to content lines
+        // under clause keywords). Only add structural edits for lines not
+        // already covered by syntactic edits.
+        if !structural_edits.is_empty() {
+            let covered_starts: HashSet<usize> = autofix_edits.iter().map(|e| e.start).collect();
+            for edit in structural_edits {
+                if !covered_starts.contains(&edit.start) {
+                    autofix_edits.push(edit);
+                }
+            }
+        }
+
+        let autofix_edits: Vec<_> = autofix_edits
+            .into_iter()
+            .map(|edit| {
+                IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit.start, edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect();
 
         if !autofix_edits.is_empty() {
             issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
@@ -156,6 +193,391 @@ fn first_line_is_indented(ctx: &LintContext) -> bool {
     let leading = &ctx.sql[line_start..statement_start];
     !leading.is_empty() && leading.chars().all(char::is_whitespace)
 }
+
+// ---------------------------------------------------------------------------
+// Structural indent detection
+// ---------------------------------------------------------------------------
+
+/// Returns true if any line has indentation that violates structural
+/// expectations. This catches cases where all indents are valid multiples
+/// of indent_unit but are at the wrong depth for their SQL context.
+///
+/// The check focuses on "standalone clause keyword" patterns: when a clause
+/// keyword that expects indented content (SELECT, FROM, WHERE, SET, etc.)
+/// appears alone on a line, the content on the following line must be
+/// indented by one indent_unit.
+/// Returns autofix edits for structural indentation violations. When empty,
+/// no structural violation was found.
+fn structural_indent_edits(
+    ctx: &LintContext,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) -> Vec<Lt02AutofixEdit> {
+    let sql = ctx.statement_sql();
+
+    // Skip structural check for templated SQL. Template expansion can
+    // produce indentation patterns that look structurally wrong but are
+    // correct in the original source.
+    if ctx.is_templated() {
+        return Vec::new();
+    }
+
+    // Try to tokenize; if we cannot, fall back to no structural check.
+    let tokens = tokenize_for_structural_check(sql, ctx);
+    let tokens = match tokens.as_deref() {
+        Some(t) if !t.is_empty() => t,
+        _ => return Vec::new(),
+    };
+
+    // Build per-line token info.
+    let line_infos = build_line_token_infos(tokens);
+    if line_infos.is_empty() {
+        return Vec::new();
+    }
+
+    let actual_indents = actual_indent_map(sql, tab_space_size);
+    let line_info_list = statement_line_infos(sql);
+    let mut edits = Vec::new();
+
+    // Check for structural violations: when a content-bearing clause keyword
+    // is alone on its line, the following content line must be indented by
+    // indent_unit more than the keyword line.
+    let lines: Vec<usize> = line_infos.keys().copied().collect();
+    for (i, &line) in lines.iter().enumerate() {
+        let info = &line_infos[&line];
+        if !info.is_standalone_content_clause {
+            continue;
+        }
+
+        let keyword_indent = actual_indents.get(&line).copied().unwrap_or(0);
+        let expected_content_indent = keyword_indent + indent_unit;
+
+        // Find the next content line (skip blank lines).
+        if let Some(&next_line) = lines.get(i + 1) {
+            let next_info = &line_infos[&next_line];
+            // Skip content lines that are clause keywords (they set their
+            // own indent context) or SELECT modifiers (DISTINCT/ALL) which
+            // belong with the preceding SELECT, not as indented content.
+            if !next_info.starts_with_clause_keyword && !next_info.starts_with_select_modifier {
+                let next_actual = actual_indents.get(&next_line).copied().unwrap_or(0);
+                if next_actual != expected_content_indent {
+                    if let Some(line_info) = line_info_list.get(next_line) {
+                        let start = line_info.start;
+                        let end = line_info.start + line_info.indent_end;
+                        if end <= sql.len() && start <= end {
+                            let replacement = make_indent(
+                                expected_content_indent,
+                                indent_unit,
+                                tab_space_size,
+                                indent_style,
+                            );
+                            edits.push(Lt02AutofixEdit {
+                                start,
+                                end,
+                                replacement,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for comment-only trailing lines at deeper indentation than
+    // any content line. E.g. `SELECT 1\n    -- foo\n        -- bar`
+    // has comments indented beyond the content (indent 0), which is wrong.
+    if let Some(&last_content_line) = line_infos
+        .iter()
+        .rev()
+        .find(|(_, info)| !info.is_comment_only)
+        .map(|(line, _)| line)
+    {
+        let last_content_indent = actual_indents.get(&last_content_line).copied().unwrap_or(0);
+        // Check comment-only lines after the last content line.
+        for (&line, info) in &line_infos {
+            if line > last_content_line && info.is_comment_only {
+                let comment_indent = actual_indents.get(&line).copied().unwrap_or(0);
+                if comment_indent > last_content_indent {
+                    if let Some(line_info) = line_info_list.get(line) {
+                        let start = line_info.start;
+                        let end = line_info.start + line_info.indent_end;
+                        if end <= sql.len() && start <= end {
+                            let replacement = make_indent(
+                                last_content_indent,
+                                indent_unit,
+                                tab_space_size,
+                                indent_style,
+                            );
+                            edits.push(Lt02AutofixEdit {
+                                start,
+                                end,
+                                replacement,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    edits
+}
+
+/// Build the indent string for a given target width.
+fn make_indent(
+    width: usize,
+    _indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    match indent_style {
+        IndentStyle::Spaces => " ".repeat(width),
+        IndentStyle::Tabs => {
+            let tab_width = tab_space_size.max(1);
+            let tab_count = width.div_ceil(tab_width);
+            "\t".repeat(tab_count)
+        }
+    }
+}
+
+/// Per-line summary of token structure.
+struct LineTokenInfo {
+    /// True if the line starts with a top-level clause keyword.
+    starts_with_clause_keyword: bool,
+    /// True if the line starts with a content-bearing clause keyword that is
+    /// alone on the line. Content-bearing keywords are those whose content
+    /// should be indented on the following line (SELECT, FROM, WHERE, SET,
+    /// RETURNING, HAVING, LIMIT, QUALIFY, WINDOW, DECLARE). Keywords like
+    /// WITH, CREATE, UNION are excluded because their "content" is other
+    /// clause-level constructs, not indented content.
+    is_standalone_content_clause: bool,
+    /// True if the line contains only comment tokens.
+    is_comment_only: bool,
+    /// True if the line starts with a SELECT modifier (DISTINCT, ALL) that
+    /// belongs with a preceding SELECT keyword rather than being content
+    /// that should be indented.
+    starts_with_select_modifier: bool,
+}
+
+/// Keywords whose content on the following line should be indented.
+fn is_content_bearing_clause(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::SELECT
+            | Keyword::FROM
+            | Keyword::WHERE
+            | Keyword::SET
+            | Keyword::RETURNING
+            | Keyword::HAVING
+            | Keyword::LIMIT
+            | Keyword::QUALIFY
+            | Keyword::WINDOW
+            | Keyword::DECLARE
+            | Keyword::VALUES
+            | Keyword::UPDATE
+    )
+}
+
+/// Build per-line token info from the token stream.
+fn build_line_token_infos(tokens: &[StructuralToken]) -> BTreeMap<usize, LineTokenInfo> {
+    let mut result: BTreeMap<usize, LineTokenInfo> = BTreeMap::new();
+
+    // Group non-trivia tokens by line.
+    let mut tokens_by_line: BTreeMap<usize, Vec<&StructuralToken>> = BTreeMap::new();
+    for token in tokens {
+        if is_whitespace_or_newline(&token.token) {
+            continue;
+        }
+        tokens_by_line.entry(token.line).or_default().push(token);
+    }
+
+    // Track preceding keyword for GROUP BY / ORDER BY detection.
+    let mut prev_keyword: Option<Keyword> = None;
+
+    for (&line, line_tokens) in &tokens_by_line {
+        let first = &line_tokens[0];
+        let starts_with_clause = is_first_token_clause_keyword(first, prev_keyword);
+
+        // Check if the first keyword is content-bearing.
+        let first_is_content_bearing = match &first.token {
+            Token::Word(w) => is_content_bearing_clause(w.keyword),
+            _ => false,
+        };
+
+        // A clause keyword is "standalone" if all non-trivia tokens on the
+        // line are clause keywords / modifiers / comments / semicolons.
+        let is_standalone = starts_with_clause && first_is_content_bearing && {
+            line_tokens.iter().all(|t| match &t.token {
+                Token::Word(w) => {
+                    is_clause_keyword_word(w.keyword)
+                        || w.keyword == Keyword::NoKeyword && is_join_modifier(&w.value)
+                }
+                Token::SemiColon => true,
+                _ => is_comment_token(&t.token),
+            })
+        };
+
+        let comment_only = line_tokens.iter().all(|t| is_comment_token(&t.token));
+
+        let starts_with_select_modifier = match &first.token {
+            Token::Word(w) => matches!(w.keyword, Keyword::DISTINCT | Keyword::ALL),
+            _ => false,
+        };
+
+        result.insert(
+            line,
+            LineTokenInfo {
+                starts_with_clause_keyword: starts_with_clause,
+                is_standalone_content_clause: is_standalone,
+                is_comment_only: comment_only,
+                starts_with_select_modifier,
+            },
+        );
+
+        // Update prev_keyword from last keyword on this line.
+        for t in line_tokens.iter().rev() {
+            if let Token::Word(w) = &t.token {
+                if w.keyword != Keyword::NoKeyword {
+                    prev_keyword = Some(w.keyword);
+                    break;
+                }
+            }
+        }
+    }
+
+    result
+}
+
+fn is_first_token_clause_keyword(token: &StructuralToken, prev_keyword: Option<Keyword>) -> bool {
+    match &token.token {
+        Token::Word(w) => is_top_level_clause_keyword(w.keyword, prev_keyword),
+        _ => false,
+    }
+}
+
+fn is_comment_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(Whitespace::SingleLineComment { .. })
+            | Token::Whitespace(Whitespace::MultiLineComment(_))
+    )
+}
+
+/// Tokenize SQL for structural analysis. Falls back to statement-level
+/// tokenization when document tokens are not available.
+fn tokenize_for_structural_check(sql: &str, ctx: &LintContext) -> Option<Vec<StructuralToken>> {
+    // Fall back to statement-level tokenization (document tokens use
+    // 1-indexed lines which makes correlation harder; local tokenization
+    // gives 0-indexed consistency).
+    let dialect = ctx.dialect().to_sqlparser_dialect();
+    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
+    let Ok(tokens) = tokenizer.tokenize_with_location() else {
+        return None;
+    };
+
+    Some(
+        tokens
+            .into_iter()
+            .filter_map(|t| {
+                let line = t.span.start.line as usize;
+                let col = t.span.start.column as usize;
+                let offset = line_col_to_offset(sql, line, col)?;
+                Some(StructuralToken {
+                    token: t.token,
+                    offset,
+                    line: line.saturating_sub(1),
+                })
+            })
+            .collect(),
+    )
+}
+
+#[derive(Clone)]
+struct StructuralToken {
+    token: Token,
+    #[allow(dead_code)]
+    offset: usize,
+    line: usize,
+}
+
+/// Returns true if the keyword starts a top-level SQL clause.
+fn is_top_level_clause_keyword(kw: Keyword, _prev_keyword: Option<Keyword>) -> bool {
+    is_clause_keyword_word(kw)
+}
+
+/// Core set of SQL clause keywords that establish a new indent level.
+fn is_clause_keyword_word(kw: Keyword) -> bool {
+    matches!(
+        kw,
+        Keyword::SELECT
+            | Keyword::FROM
+            | Keyword::WHERE
+            | Keyword::SET
+            | Keyword::UPDATE
+            | Keyword::INSERT
+            | Keyword::DELETE
+            | Keyword::MERGE
+            | Keyword::USING
+            | Keyword::INTO
+            | Keyword::VALUES
+            | Keyword::RETURNING
+            | Keyword::HAVING
+            | Keyword::LIMIT
+            | Keyword::WINDOW
+            | Keyword::QUALIFY
+            | Keyword::WITH
+            | Keyword::BEGIN
+            | Keyword::DECLARE
+            | Keyword::IF
+            | Keyword::RETURNS
+            | Keyword::CREATE
+            | Keyword::DROP
+            | Keyword::ON
+            | Keyword::JOIN
+            | Keyword::INNER
+            | Keyword::LEFT
+            | Keyword::RIGHT
+            | Keyword::FULL
+            | Keyword::CROSS
+            | Keyword::OUTER
+    )
+}
+
+fn is_join_modifier(word: &str) -> bool {
+    let upper = word.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "OUTER" | "APPLY"
+    )
+}
+
+fn is_whitespace_or_newline(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(Whitespace::Space | Whitespace::Tab | Whitespace::Newline)
+    )
+}
+
+/// Build a map of line_index -> actual indent width from the SQL text.
+fn actual_indent_map(sql: &str, tab_space_size: usize) -> BTreeMap<usize, usize> {
+    let mut result = BTreeMap::new();
+    for (idx, line) in sql.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = leading_indent_from_prefix(line, tab_space_size);
+        result.insert(idx, indent.width);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Original indent snapshot and autofix infrastructure
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct LeadingIndent {
@@ -667,5 +1089,97 @@ mod tests {
             issues[0].autofix.is_none(),
             "non-editable first-line prefix should remain report-only"
         );
+    }
+
+    // Structural indentation tests.
+
+    #[test]
+    fn flags_clause_content_not_indented_under_update() {
+        // UPDATE\nfoo\nSET\nupdated = now()\nWHERE\n    bar = '';
+        // "foo" should be indented under UPDATE, "updated" under SET.
+        let issues = run("UPDATE\nfoo\nSET\nupdated = now()\nWHERE\n    bar = '';");
+        assert_eq!(issues.len(), 1, "should flag unindented clause contents");
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_002);
+    }
+
+    #[test]
+    fn flags_unindented_from_content() {
+        // FROM\nmy_tbl should flag because my_tbl is not indented.
+        let issues = run("SELECT\n    a,\n    b\nFROM\nmy_tbl");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_002);
+    }
+
+    #[test]
+    fn accepts_properly_indented_clauses() {
+        // All clause contents properly indented.
+        let issues = run("SELECT\n    a,\n    b\nFROM\n    my_tbl\nWHERE\n    a = 1");
+        assert!(issues.is_empty(), "properly indented SQL should not flag");
+    }
+
+    #[test]
+    fn flags_trailing_comment_wrong_indent() {
+        // Trailing comments at deepening indent levels after content at
+        // indent 0. Both `-- foo` (indent 4) and `-- bar` (indent 8) are
+        // deeper than `SELECT 1` (indent 0).
+        let issues = run("SELECT 1\n    -- foo\n        -- bar");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_002);
+    }
+
+    #[test]
+    fn accepts_properly_indented_trailing_comment() {
+        // Comment at same indent as the content line before it is fine.
+        let issues = run("SELECT\n    a\n    -- explains next col\n    , b\nFROM t");
+        assert!(issues.is_empty());
+    }
+
+    // Structural autofix tests.
+
+    #[test]
+    fn structural_autofix_indents_content_under_clause_keyword() {
+        // RETURNING\nupdated should fix to RETURNING\n    updated
+        let sql = "INSERT INTO foo (updated)\nVALUES (now())\nRETURNING\nupdated;";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "INSERT INTO foo (updated)\nVALUES (now())\nRETURNING\n    updated;"
+        );
+    }
+
+    #[test]
+    fn structural_autofix_indents_update_content() {
+        // UPDATE\nfoo -> UPDATE\n    foo
+        let sql = "UPDATE\nfoo\nSET\nupdated = now()\nWHERE\n    bar = ''";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "UPDATE\n    foo\nSET\n    updated = now()\nWHERE\n    bar = ''"
+        );
+    }
+
+    #[test]
+    fn structural_autofix_indents_from_content() {
+        let sql = "SELECT\n    a,\n    b\nFROM\nmy_tbl";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT\n    a,\n    b\nFROM\n    my_tbl");
+    }
+
+    #[test]
+    fn structural_autofix_fixes_trailing_comment_indent() {
+        let sql = "SELECT 1\n    -- foo\n        -- bar";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Both comments should be at indent 0 (same as content line).
+        assert_eq!(fixed, "SELECT 1\n-- foo\n-- bar");
     }
 }

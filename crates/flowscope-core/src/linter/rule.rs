@@ -10,6 +10,7 @@ use std::ops::Range;
 thread_local! {
     static ACTIVE_DIALECT: Cell<Dialect> = const { Cell::new(Dialect::Generic) };
     static ACTIVE_DOCUMENT_TOKENS: RefCell<Vec<TokenWithSpan>> = const { RefCell::new(Vec::new()) };
+    static DOCUMENT_IS_TEMPLATED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Context provided to lint rules during analysis.
@@ -51,6 +52,12 @@ impl<'a> LintContext<'a> {
             f(&borrowed)
         })
     }
+
+    /// Returns true if the document was processed through a templater
+    /// (Jinja, dbt, etc.) before linting.
+    pub fn is_templated(&self) -> bool {
+        DOCUMENT_IS_TEMPLATED.with(Cell::get)
+    }
 }
 
 pub(crate) fn with_active_dialect<T>(dialect: Dialect, f: impl FnOnce() -> T) -> T {
@@ -72,6 +79,15 @@ pub(crate) fn with_active_dialect<T>(dialect: Dialect, f: impl FnOnce() -> T) ->
         };
         let result = f();
         drop(reset);
+        result
+    })
+}
+
+pub(crate) fn with_active_is_templated<T>(is_templated: bool, f: impl FnOnce() -> T) -> T {
+    DOCUMENT_IS_TEMPLATED.with(|active| {
+        let previous = active.replace(is_templated);
+        let result = f();
+        active.set(previous);
         result
     })
 }
