@@ -20,6 +20,10 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
+/// Representative query used to validate safe-vs-unsafe fix behavior.
+const SQL_UNSAFE_FIX_REPRESENTATIVE: &str =
+    "SELECT t.id\nFROM t\nINNER JOIN (\n    SELECT id\n    FROM u\n) AS u2 ON t.id = u2.id\n";
+
 /// Create a test AppState without loading files from disk.
 fn test_state(config: ServerConfig, files: Vec<FileSource>) -> Arc<AppState> {
     Arc::new(AppState {
@@ -479,6 +483,53 @@ async fn lint_fix_applies_al005_core_autofix_in_patch_mode() {
         json["sql"].as_str().unwrap(),
         "SELECT users.name FROM users JOIN orders ON users.id = orders.user_id\n",
         "expected AL005 core autofix to remove unused table aliases"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_applies_am002_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT 1 UNION SELECT 2\n",
+            "disabled_rules": ["LINT_LT_011"]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT 1 UNION DISTINCT SELECT 2\n",
+        "expected AM002 core autofix to expand bare UNION to explicit UNION DISTINCT"
+    );
+}
+
+#[tokio::test]
+async fn lint_fix_applies_st008_core_autofix_in_patch_mode() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": "SELECT DISTINCT(a) FROM t\n"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changed"], true);
+    assert_eq!(
+        json["sql"].as_str().unwrap(),
+        "SELECT DISTINCT a FROM t\n",
+        "expected ST008 core autofix to remove DISTINCT parentheses"
     );
 }
 
@@ -1040,7 +1091,8 @@ async fn lint_fix_applies_lt011_core_autofix_in_patch_mode() {
         &app,
         "/api/lint-fix",
         json!({
-            "sql": "SELECT 1 UNION SELECT 2\nUNION SELECT 3"
+            "sql": "SELECT 1 UNION SELECT 2\nUNION SELECT 3",
+            "disabled_rules": ["LINT_AM_002"]
         }),
     )
     .await;
@@ -1072,7 +1124,7 @@ async fn lint_fix_applies_lt007_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "WITH cte AS (\n  SELECT 1\n)\nSELECT * FROM cte\n",
+        "WITH cte AS (\n    SELECT 1\n)\nSELECT * FROM cte\n",
         "expected LT007 core autofix to place CTE close bracket on its own line"
     );
 }
@@ -1096,7 +1148,7 @@ async fn lint_fix_applies_lt009_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "select\n  a,\n  b,\n  c\nfrom x\n",
+        "select\n    a,\n    b,\n    c\nfrom x\n",
         "expected LT009 core autofix to place FROM on a new line after final target"
     );
 }
@@ -1190,7 +1242,7 @@ async fn lint_fix_applies_jj001_core_autofix_only_in_unsafe_mode() {
 async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
-    let sql = "SELECT * FROM (SELECT 1) sub";
+    let sql = SQL_UNSAFE_FIX_REPRESENTATIVE;
 
     let (safe_status, safe_json) = post_json(
         &app,
@@ -1220,11 +1272,11 @@ async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
     let unsafe_sql = unsafe_json["sql"].as_str().unwrap().to_ascii_uppercase();
 
     assert!(
-        !safe_sql.contains("WITH SUB AS"),
+        !safe_sql.starts_with("WITH "),
         "safe mode should not apply ST_005 rewrite: {safe_sql}"
     );
     assert!(
-        unsafe_sql.contains("WITH SUB AS"),
+        unsafe_sql.starts_with("WITH "),
         "unsafe mode with legacy AST rewrites should apply ST_005 rewrite: {unsafe_sql}"
     );
     assert!(
@@ -1240,7 +1292,7 @@ async fn lint_fix_safe_vs_unsafe_mode_shows_expected_delta() {
 async fn lint_fix_unsafe_without_legacy_ast_rewrites_keeps_st05_shape() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
-    let sql = "SELECT * FROM (SELECT 1) sub";
+    let sql = SQL_UNSAFE_FIX_REPRESENTATIVE;
 
     let (status, json) = post_json(
         &app,
@@ -1298,7 +1350,7 @@ async fn lint_fix_respects_disabled_rules() {
         &app,
         "/api/lint-fix",
         json!({
-            "sql": "SELECT * FROM (SELECT 1) sub",
+            "sql": SQL_UNSAFE_FIX_REPRESENTATIVE,
             "unsafe_fixes": true,
             "legacy_ast_fixes": true,
             "disabled_rules": ["LINT_ST_005"]

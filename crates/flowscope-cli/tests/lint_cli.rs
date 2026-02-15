@@ -773,6 +773,62 @@ fn test_lint_fix_applies_al005_core_autofix_in_patch_mode() {
 }
 
 #[test]
+fn test_lint_fix_applies_am002_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("bare_union_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT 1 UNION SELECT 2\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--exclude-rules",
+            "LINT_LT_011",
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT 1 UNION DISTINCT SELECT 2\n",
+        "Expected AM002 core autofix to expand bare UNION to explicit UNION DISTINCT: {after:?}"
+    );
+}
+
+#[test]
+fn test_lint_fix_applies_st008_core_autofix_in_patch_mode() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("distinct_parenthesized_patch_fix.sql");
+    std::fs::write(&sql_path, "SELECT DISTINCT(a) FROM t\n").expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .output()
+        .expect("run CLI with fix");
+
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "Expected CLI invocation to succeed: {}",
+        combined_output(&output)
+    );
+
+    let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
+    assert_eq!(
+        after, "SELECT DISTINCT a FROM t\n",
+        "Expected ST008 core autofix to remove DISTINCT parentheses: {after:?}"
+    );
+}
+
+#[test]
 fn test_lint_fix_applies_lt004_core_autofix_in_patch_mode() {
     let dir = tempdir().expect("temp dir");
     let sql_path = dir.path().join("comma_spacing_patch_fix.sql");
@@ -1391,7 +1447,13 @@ fn test_lint_fix_applies_lt011_core_autofix_in_patch_mode() {
     std::fs::write(&sql_path, "SELECT 1 UNION SELECT 2\nUNION SELECT 3").expect("write sql");
 
     let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
-        .args(["--lint", "--fix", sql_path.to_str().expect("sql path")])
+        .args([
+            "--lint",
+            "--fix",
+            "--exclude-rules",
+            "LINT_AM_002",
+            sql_path.to_str().expect("sql path"),
+        ])
         .output()
         .expect("run CLI with fix");
 
@@ -1429,7 +1491,7 @@ fn test_lint_fix_applies_lt007_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "WITH cte AS (\n  SELECT 1\n)\nSELECT * FROM cte\n",
+        after, "WITH cte AS (\n    SELECT 1\n)\nSELECT * FROM cte\n",
         "Expected LT007 core autofix to place CTE close bracket on its own line: {after:?}"
     );
 }
@@ -1460,7 +1522,7 @@ fn test_lint_fix_applies_lt009_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "select\n  a,\n  b,\n  c\nfrom x\n",
+        after, "select\n    a,\n    b,\n    c\nfrom x\n",
         "Expected LT009 core autofix to place FROM on a new line after final target: {after:?}"
     );
 }

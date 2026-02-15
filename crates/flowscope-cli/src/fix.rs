@@ -857,6 +857,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
     };
 
     if code.eq_ignore_ascii_case(issue_codes::LINT_CV_001)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_AM_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_004)
@@ -885,6 +886,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_005)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_008)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_TQ_003)
@@ -2116,25 +2118,9 @@ fn fix_set_expr(body: &mut SetExpr, rule_filter: &RuleFilter) {
     match body {
         SetExpr::Select(select) => fix_select(select, rule_filter),
         SetExpr::Query(query) => fix_query(query, rule_filter),
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => {
+        SetExpr::SetOperation { left, right, .. } => {
             fix_set_expr(left, rule_filter);
             fix_set_expr(right, rule_filter);
-
-            if rule_filter.allows(issue_codes::LINT_AM_002)
-                && matches!(op, SetOperator::Union)
-                && matches!(set_quantifier, SetQuantifier::None | SetQuantifier::ByName)
-            {
-                *set_quantifier = if matches!(set_quantifier, SetQuantifier::ByName) {
-                    SetQuantifier::DistinctByName
-                } else {
-                    SetQuantifier::Distinct
-                };
-            }
         }
         SetExpr::Values(values) => {
             for row in &mut values.rows {
@@ -2154,10 +2140,6 @@ fn fix_set_expr(body: &mut SetExpr, rule_filter: &RuleFilter) {
 fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
     if rule_filter.allows(issue_codes::LINT_AM_001) && has_distinct_and_group_by(select) {
         select.distinct = None;
-    }
-
-    if rule_filter.allows(issue_codes::LINT_ST_008) {
-        rewrite_distinct_parenthesized_projection(select);
     }
 
     if rule_filter.allows(issue_codes::LINT_AL_007) && rule_filter.al007_force_enable {
@@ -2802,22 +2784,6 @@ fn normalize_name_for_mode(name_ref: NameRef<'_>, mode: Al009AliasCaseCheck) -> 
             }
         }
         _ => name_ref.name.to_string(),
-    }
-}
-
-fn rewrite_distinct_parenthesized_projection(select: &mut Select) {
-    if !matches!(select.distinct, Some(Distinct::Distinct)) {
-        return;
-    }
-
-    if select.projection.len() != 1 {
-        return;
-    }
-
-    if let SelectItem::UnnamedExpr(expr) = &mut select.projection[0] {
-        if let Expr::Nested(inner) = expr {
-            *expr = inner.as_ref().clone();
-        }
     }
 }
 
@@ -4379,6 +4345,11 @@ mod tests {
 
     #[test]
     fn sqlfluff_am001_cases_are_fixed_or_unchanged() {
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_LT_011.to_string()],
+            rule_configs: std::collections::BTreeMap::new(),
+        };
         let cases = [
             (
                 "SELECT a, b FROM tbl UNION SELECT c, d FROM tbl1",
@@ -4411,10 +4382,17 @@ mod tests {
         ];
 
         for (sql, before, after, fix_count, expected_text) in cases {
-            assert_rule_case(sql, issue_codes::LINT_AM_002, before, after, fix_count);
+            assert_rule_case_with_config(
+                sql,
+                issue_codes::LINT_AM_002,
+                before,
+                after,
+                fix_count,
+                &lint_config,
+            );
 
             if let Some(expected) = expected_text {
-                let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+                let out = apply_fix_with_config(sql, &lint_config);
                 assert!(
                     out.sql.to_ascii_uppercase().contains(expected),
                     "expected {expected:?} in fixed SQL, got: {}",
@@ -6198,7 +6176,12 @@ mod tests {
     #[test]
     fn references_quoting_fix_keeps_case_sensitive_identifier_quotes() {
         let sql = "SELECT \"CamelCase\" FROM t UNION SELECT 2";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let out = apply_lint_fixes(
+            sql,
+            Dialect::Generic,
+            &[issue_codes::LINT_LT_011.to_string()],
+        )
+        .expect("fix result");
         assert!(
             out.sql.contains("\"CamelCase\""),
             "case-sensitive identifier must remain quoted: {}",
@@ -6391,8 +6374,9 @@ mod tests {
     #[test]
     fn cv012_idempotent() {
         let sql = "SELECT a.x, b.y FROM a JOIN b WHERE a.id = b.id";
-        let out1 = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix");
-        let out2 = apply_lint_fixes(&out1.sql, Dialect::Generic, &[]).expect("fix2");
+        let disabled = vec![issue_codes::LINT_LT_014.to_string()];
+        let out1 = apply_lint_fixes(sql, Dialect::Generic, &disabled).expect("fix");
+        let out2 = apply_lint_fixes(&out1.sql, Dialect::Generic, &disabled).expect("fix2");
         assert_eq!(
             out1.sql.trim_end_matches('\n'),
             out2.sql.trim_end_matches('\n'),

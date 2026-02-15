@@ -3,7 +3,7 @@
 //! `UNION` should be explicit (`UNION DISTINCT` or `UNION ALL`) to avoid ambiguous implicit behavior.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::*;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer};
@@ -89,8 +89,15 @@ fn check_query_body(
                 )
                 .with_statement(ctx.statement_index);
                 if let Some((start, end)) = union_span {
-                    let s = ctx.span_from_statement_offset(start, end);
-                    issue = issue.with_span(s);
+                    let span = ctx.span_from_statement_offset(start, end);
+                    let union_keyword = &ctx.statement_sql()[start..end];
+                    issue = issue.with_span(span).with_autofix_edits(
+                        IssueAutofixApplicability::Safe,
+                        vec![IssuePatchEdit::new(
+                            span,
+                            format!("{union_keyword} DISTINCT"),
+                        )],
+                    );
                 }
                 issues.push(issue);
             }
@@ -320,6 +327,7 @@ fn relative_location(
 mod tests {
     use super::*;
     use crate::parser::parse_sql;
+    use crate::types::IssueAutofixApplicability;
 
     fn check_sql(sql: &str) -> Vec<Issue> {
         let stmts = parse_sql(sql).unwrap();
@@ -334,6 +342,18 @@ mod tests {
             issues.extend(rule.check(stmt, &ctx));
         }
         issues
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut edits = autofix.edits.clone();
+        edits.sort_by(|left, right| right.span.start.cmp(&left.span.start));
+
+        let mut out = sql.to_string();
+        for edit in edits {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -434,5 +454,19 @@ mod tests {
         let span = issues[0].span.expect("UNION issue should include a span");
         let union_pos = sql.find("UNION").expect("query should contain UNION");
         assert_eq!(span.start, union_pos);
+    }
+
+    #[test]
+    fn test_bare_union_emits_safe_autofix_patch() {
+        let sql = "SELECT 1 UNION SELECT 2";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert_eq!(autofix.edits.len(), 1);
+
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT 1 UNION DISTINCT SELECT 2");
     }
 }
