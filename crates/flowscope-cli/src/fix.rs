@@ -95,7 +95,6 @@ impl Default for FixOptions {
 struct RuleFilter {
     disabled: HashSet<String>,
     al007_force_enable: bool,
-    al009_case_check: Al009AliasCaseCheck,
     al001_mode: Al001FixMode,
     cv011_style: Cv011CastingStyle,
     st005_forbid_subquery_in: St005ForbidSubqueryIn,
@@ -107,16 +106,6 @@ enum Al001FixMode {
     Explicit,
     Implicit,
     PreserveOriginal,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-enum Al009AliasCaseCheck {
-    #[default]
-    Dialect,
-    CaseInsensitive,
-    QuotedCsNakedUpper,
-    QuotedCsNakedLower,
-    CaseSensitive,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -164,18 +153,6 @@ impl RuleFilter {
         let al007_force_enable = lint_config
             .rule_option_bool(issue_codes::LINT_AL_007, "force_enable")
             .unwrap_or(false);
-        let al009_case_check = match lint_config
-            .rule_option_str(issue_codes::LINT_AL_009, "alias_case_check")
-            .unwrap_or("dialect")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "case_insensitive" => Al009AliasCaseCheck::CaseInsensitive,
-            "quoted_cs_naked_upper" => Al009AliasCaseCheck::QuotedCsNakedUpper,
-            "quoted_cs_naked_lower" => Al009AliasCaseCheck::QuotedCsNakedLower,
-            "case_sensitive" => Al009AliasCaseCheck::CaseSensitive,
-            _ => Al009AliasCaseCheck::Dialect,
-        };
         let al001_mode = if disabled.contains(issue_codes::LINT_AL_001) {
             Al001FixMode::PreserveOriginal
         } else {
@@ -213,7 +190,6 @@ impl RuleFilter {
         Self {
             disabled,
             al007_force_enable,
-            al009_case_check,
             al001_mode,
             cv011_style,
             st005_forbid_subquery_in,
@@ -837,6 +813,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_004)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_AL_005)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_AL_009)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_003)
@@ -2057,13 +2034,8 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
             SelectItem::UnnamedExpr(expr) => {
                 fix_expr(expr, rule_filter);
             }
-            SelectItem::ExprWithAlias { expr, alias } => {
+            SelectItem::ExprWithAlias { expr, .. } => {
                 fix_expr(expr, rule_filter);
-                let remove_self_alias = rule_filter.allows(issue_codes::LINT_AL_009)
-                    && expression_aliases_to_itself(expr, alias, rule_filter.al009_case_check);
-                if remove_self_alias {
-                    *item = SelectItem::UnnamedExpr(expr.clone());
-                }
             }
             SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::Expr(expr), _) => {
                 fix_expr(expr, rule_filter);
@@ -2180,12 +2152,6 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
 struct TableAliasRewrite {
     alias: String,
     replacement_prefix: Vec<Ident>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NameRef<'a> {
-    name: &'a str,
-    quoted: bool,
 }
 
 fn single_table_alias_rewrite_plan(select: &Select) -> Option<TableAliasRewrite> {
@@ -2628,69 +2594,6 @@ fn rewrite_object_name_alias_qualifier(object_name: &mut ObjectName, rewrite: &T
 
 fn ident_matches_alias(ident: &Ident, alias: &str) -> bool {
     ident.value.eq_ignore_ascii_case(alias)
-}
-
-fn expression_aliases_to_itself(expr: &Expr, alias: &Ident, mode: Al009AliasCaseCheck) -> bool {
-    let Some(source_name) = expression_name(expr) else {
-        return false;
-    };
-    let alias_name = NameRef {
-        name: alias.value.as_str(),
-        quoted: alias.quote_style.is_some(),
-    };
-    names_match(source_name, alias_name, mode)
-}
-
-fn expression_name(expr: &Expr) -> Option<NameRef<'_>> {
-    match expr {
-        Expr::Identifier(identifier) => Some(NameRef {
-            name: identifier.value.as_str(),
-            quoted: identifier.quote_style.is_some(),
-        }),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|part| NameRef {
-            name: part.value.as_str(),
-            quoted: part.quote_style.is_some(),
-        }),
-        Expr::Nested(inner) => expression_name(inner),
-        _ => None,
-    }
-}
-
-fn names_match(left: NameRef<'_>, right: NameRef<'_>, mode: Al009AliasCaseCheck) -> bool {
-    match mode {
-        Al009AliasCaseCheck::CaseInsensitive => left.name.eq_ignore_ascii_case(right.name),
-        Al009AliasCaseCheck::CaseSensitive => left.name == right.name,
-        Al009AliasCaseCheck::Dialect => {
-            if left.quoted || right.quoted {
-                left.name == right.name
-            } else {
-                left.name.eq_ignore_ascii_case(right.name)
-            }
-        }
-        Al009AliasCaseCheck::QuotedCsNakedUpper | Al009AliasCaseCheck::QuotedCsNakedLower => {
-            normalize_name_for_mode(left, mode) == normalize_name_for_mode(right, mode)
-        }
-    }
-}
-
-fn normalize_name_for_mode(name_ref: NameRef<'_>, mode: Al009AliasCaseCheck) -> String {
-    match mode {
-        Al009AliasCaseCheck::QuotedCsNakedUpper => {
-            if name_ref.quoted {
-                name_ref.name.to_string()
-            } else {
-                name_ref.name.to_ascii_uppercase()
-            }
-        }
-        Al009AliasCaseCheck::QuotedCsNakedLower => {
-            if name_ref.quoted {
-                name_ref.name.to_string()
-            } else {
-                name_ref.name.to_ascii_lowercase()
-            }
-        }
-        _ => name_ref.name.to_string(),
-    }
 }
 
 fn rewrite_simple_derived_subqueries_to_ctes(query: &mut Query, rule_filter: &RuleFilter) {
