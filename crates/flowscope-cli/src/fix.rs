@@ -3941,7 +3941,7 @@ mod tests {
 
     #[test]
     fn cv007_fix_respects_disabled_rules() {
-        let sql = "(SELECT 1)";
+        let sql = "(SELECT 1)\n";
         let out = apply_lint_fixes(
             sql,
             Dialect::Generic,
@@ -4815,7 +4815,7 @@ mod tests {
 
     #[test]
     fn rf004_core_autofix_respects_rule_filter() {
-        let sql = "select a from users as select";
+        let sql = "select a from users as select\n";
 
         let out_rf_disabled = apply_lint_fixes(
             sql,
@@ -4843,7 +4843,7 @@ mod tests {
 
     #[test]
     fn rf003_core_autofix_respects_rule_filter() {
-        let sql = "select a.id, id2 from a";
+        let sql = "select a.id, id2 from a\n";
 
         let out_rf_disabled = apply_lint_fixes(
             sql,

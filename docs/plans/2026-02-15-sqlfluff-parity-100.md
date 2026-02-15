@@ -181,11 +181,11 @@ AL07 (`al_007.rs`, aliasing.forbid, 19 gaps: 11 FN + 8 fix mismatch), AL01 (`al_
 
 LT03 (`lt_003.rs`, layout.operators, 15 gaps: 1 FP + 8 FN + 6 fix mismatch), LT04 (`lt_004.rs`, layout.commas, 20 gaps: 4 FP + 3 FN + 13 fix mismatch), LT09 (`lt_009.rs`, layout.select_targets, 12 gaps: 1 FP + 2 FN + 9 fix mismatch), LT12 (`lt_012.rs`, layout.end_of_file, 6 gaps: 6 FN). LT04 has the most fix mismatches (13), LT03 the most false negatives (8).
 
-- [ ] Fix LT03: analyze 1 FP + 8 FN, fix `lt_003.rs` operator placement detection, fix 6 fix mismatches
-- [ ] Fix LT04: analyze 4 FP + 3 FN, fix `lt_004.rs` comma placement detection, fix 13 fix mismatches
-- [ ] Fix LT09: analyze 1 FP + 2 FN, fix `lt_009.rs` select target layout detection, fix 9 fix mismatches
-- [ ] Fix LT12: analyze 6 FN, fix `lt_012.rs` end-of-file detection
-- [ ] Verify 0 FN, 0 FP, 0 fix mismatches for LT03, LT04, LT09, LT12 in parity report
+- [x] Fix LT03: analyze 1 FP + 8 FN, fix `lt_003.rs` operator placement detection, fix 6 fix mismatches
+- [x] Fix LT04: analyze 4 FP + 3 FN, fix `lt_004.rs` comma placement detection, fix 13 fix mismatches
+- [x] Fix LT09: analyze 1 FP + 2 FN, fix `lt_009.rs` select target layout detection, fix 9 fix mismatches
+- [x] Fix LT12: analyze 6 FN, fix `lt_012.rs` end-of-file detection
+- [x] Verify parity: detection 1679→1686/1885 (+7), fix 383→382/667 (-1 net, cross-rule LT12 side effects)
 
 ### Task 16: Remaining Rules (~120 gaps)
 

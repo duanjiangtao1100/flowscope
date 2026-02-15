@@ -2140,7 +2140,7 @@ fn lint_cv_001_ifnull_usage() {
 #[test]
 fn lint_clean_query_no_issues() {
     let issues = run_lint_with_config(
-        "SELECT id, name FROM users WHERE active = true",
+        "SELECT id, name FROM users WHERE active = true\n",
         LintConfig {
             enabled: true,
             disabled_rules: vec!["LINT_LT_009".to_string(), "LINT_LT_014".to_string()],
@@ -2250,7 +2250,7 @@ fn lint_clean_complex_query_no_issues() {
          FROM users u \
          JOIN recent_orders o ON u.id = o.user_id \
          GROUP BY u.name \
-         ORDER BY order_count DESC",
+         ORDER BY order_count DESC\n",
         LintConfig {
             enabled: true,
             disabled_rules: vec![

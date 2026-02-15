@@ -6,7 +6,7 @@ use tempfile::tempdir;
 const SQL_WITH_VIOLATIONS: &str = "SELECT 1\nUNION\nSELECT 2\n";
 
 /// Clean SQL with no lint violations.
-const SQL_CLEAN: &str = "SELECT 1";
+const SQL_CLEAN: &str = "SELECT 1\n";
 /// Invalid SQL used to verify parser/analysis errors fail lint mode.
 const SQL_INVALID: &str = "SELECT FROM";
 /// Templated SQL used to verify lint-mode Jinja fallback without explicit --template.
@@ -673,7 +673,7 @@ fn test_lint_fix_applies_cv007_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT 1",
+        after, "SELECT 1\n",
         "Expected CV07 core autofix to remove outer wrapper brackets in patch mode"
     );
 }
@@ -1562,7 +1562,7 @@ fn test_lint_fix_applies_cv003_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT a FROM t",
+        after, "SELECT a FROM t\n",
         "Expected CV003 core autofix to remove trailing comma in patch mode"
     );
 }
@@ -1595,7 +1595,7 @@ fn test_lint_fix_rule_configs_enable_cv003_require_core_autofix_in_patch_mode() 
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT a, FROM t",
+        after, "SELECT a, FROM t\n",
         "Expected CV003 require-mode core autofix to insert trailing comma before FROM"
     );
 }
@@ -1836,7 +1836,7 @@ fn test_lint_fix_applies_lt008_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte",
+        after, "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte\n",
         "Expected LT008 core autofix to place SELECT on a new line after CTE close: {after:?}"
     );
 }

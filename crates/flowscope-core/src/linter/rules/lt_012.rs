@@ -30,8 +30,7 @@ impl LintRule for LayoutEndOfFile {
             .len();
         let is_last_statement = ctx.statement_range.end >= content_end;
         let trailing_newlines = trailing_newline_count_tokenized(ctx);
-        let has_violation =
-            is_last_statement && document_is_multiline(ctx) && trailing_newlines != 1;
+        let has_violation = is_last_statement && trailing_newlines != 1;
 
         if has_violation {
             let trailing_span = Span::new(content_end, ctx.sql.len());
@@ -55,7 +54,6 @@ impl LintRule for LayoutEndOfFile {
 struct LocatedToken {
     token: Token,
     end: usize,
-    spans_multiple_lines: bool,
 }
 
 fn trailing_newline_count_tokenized(ctx: &LintContext) -> usize {
@@ -87,7 +85,6 @@ fn tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LocatedToken
         out.push(LocatedToken {
             token: token.token,
             end,
-            spans_multiple_lines: token.span.end.line > token.span.start.line,
         });
     }
     Some(out)
@@ -106,22 +103,11 @@ fn tokenize_with_offsets_for_context(ctx: &LintContext) -> Option<Vec<LocatedTok
                     token_with_span_offsets(ctx.sql, token).map(|(_start, end)| LocatedToken {
                         token: token.token.clone(),
                         end,
-                        spans_multiple_lines: token.span.end.line > token.span.start.line,
                     })
                 })
                 .collect(),
         )
     })
-}
-
-fn document_is_multiline(ctx: &LintContext) -> bool {
-    if let Some(tokens) = tokenize_with_offsets_for_context(ctx)
-        .or_else(|| tokenize_with_offsets(ctx.sql, ctx.dialect()))
-    {
-        return tokens.iter().any(|token| token.spans_multiple_lines);
-    }
-
-    count_line_breaks(ctx.sql) > 0
 }
 
 fn is_whitespace_token(token: &Token) -> bool {
@@ -181,24 +167,6 @@ fn trailing_newline_count(sql: &str) -> usize {
         .count()
 }
 
-fn count_line_breaks(text: &str) -> usize {
-    let mut count = 0usize;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\n' {
-            count += 1;
-            continue;
-        }
-        if ch == '\r' {
-            count += 1;
-            if matches!(chars.peek(), Some('\n')) {
-                let _ = chars.next();
-            }
-        }
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,8 +222,13 @@ mod tests {
     }
 
     #[test]
-    fn does_not_flag_single_line_without_newline() {
-        assert!(run("SELECT 1").is_empty());
+    fn flags_single_line_without_newline() {
+        let sql = "SELECT 1";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_012);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT 1\n");
     }
 
     #[test]

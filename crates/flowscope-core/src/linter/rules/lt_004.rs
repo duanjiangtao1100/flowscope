@@ -98,7 +98,7 @@ impl LintRule for LayoutCommas {
 }
 
 type Lt04Span = (usize, usize);
-type Lt04AutofixEdit = (usize, usize, &'static str);
+type Lt04AutofixEdit = (usize, usize, String);
 type Lt04Violation = (Lt04Span, Vec<Lt04AutofixEdit>);
 
 fn comma_spacing_violation(
@@ -145,7 +145,16 @@ fn comma_spacing_violation(
             CommaLinePosition::Leading => line_break_after && !line_break_before,
         };
         if line_position_violation {
-            return Some(((comma_start, comma_end), Vec::new()));
+            let edits = safe_comma_line_move_edits(
+                sql,
+                &tokens,
+                index,
+                prev_sig_idx,
+                next_sig_idx,
+                line_position,
+            )
+            .unwrap_or_default();
+            return Some(((comma_start, comma_end), edits));
         }
 
         let mut edits = Vec::new();
@@ -162,7 +171,7 @@ fn comma_spacing_violation(
                 safe_inline_gap_between(sql, &tokens[prev_sig_idx], token)
             {
                 if gap_start < gap_end {
-                    edits.push((gap_start, gap_end, ""));
+                    edits.push((gap_start, gap_end, String::new()));
                 }
             }
         }
@@ -177,7 +186,7 @@ fn comma_spacing_violation(
             if let Some((gap_start, gap_end)) =
                 safe_inline_gap_between(sql, token, &tokens[next_sig_idx])
             {
-                edits.push((gap_start, gap_end, " "));
+                edits.push((gap_start, gap_end, " ".to_string()));
             }
         }
 
@@ -187,6 +196,67 @@ fn comma_spacing_violation(
     }
 
     None
+}
+
+/// Generate autofix edits to move a comma across a line break.
+///
+/// For `Trailing` mode (comma should be trailing): input is `a\n  , b` → `a,\n  b`.
+/// For `Leading` mode (comma should be leading): input is `a,\n  b` → `a\n  , b`.
+fn safe_comma_line_move_edits(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    comma_idx: usize,
+    prev_sig_idx: usize,
+    next_sig_idx: usize,
+    line_position: CommaLinePosition,
+) -> Option<Vec<Lt04AutofixEdit>> {
+    let (_, prev_end) = token_with_span_offsets(sql, &tokens[prev_sig_idx])?;
+    let (comma_start, comma_end) = token_with_span_offsets(sql, &tokens[comma_idx])?;
+    let (next_start, _) = token_with_span_offsets(sql, &tokens[next_sig_idx])?;
+
+    if prev_end > comma_start || comma_end > next_start || next_start > sql.len() {
+        return None;
+    }
+
+    let before_gap = &sql[prev_end..comma_start];
+    let after_gap = &sql[comma_end..next_start];
+
+    // Only handle simple whitespace gaps (no comments).
+    if !before_gap.chars().all(char::is_whitespace)
+        || !after_gap.chars().all(char::is_whitespace)
+    {
+        return None;
+    }
+
+    match line_position {
+        CommaLinePosition::Trailing => {
+            // Currently leading: `a\n    , b` → `a,\n    b`
+            // Replace the whole span from prev_end through next_start as one edit.
+            let indent = line_indent_at(sql, next_start);
+            let replacement = format!(",\n{indent}");
+            Some(vec![(prev_end, next_start, replacement)])
+        }
+        CommaLinePosition::Leading => {
+            // Currently trailing: `a,\n    b` → `a\n    , b`
+            // Replace the whole span from prev_end through next_start as one edit.
+            let indent = line_indent_at(sql, next_start);
+            let replacement = format!("\n{indent}, ");
+            Some(vec![(prev_end, next_start, replacement)])
+        }
+    }
+}
+
+/// Extract the leading whitespace (indent) for the line containing `offset`.
+fn line_indent_at(sql: &str, offset: usize) -> &str {
+    let line_start = sql[..offset]
+        .rfind('\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let indent_end = sql[line_start..]
+        .find(|ch: char| !ch.is_whitespace() || ch == '\n')
+        .map(|pos| line_start + pos)
+        .unwrap_or(offset);
+    &sql[line_start..indent_end]
 }
 
 fn safe_inline_gap_between(
@@ -465,6 +535,36 @@ mod tests {
         let issues = run_with_rule("SELECT a,\n b FROM t", &LayoutCommas::from_config(&config));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_004);
+    }
+
+    #[test]
+    fn trailing_mode_moves_leading_comma_to_trailing() {
+        let sql = "SELECT\n    a\n    , b\nFROM c";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT\n    a,\n    b\nFROM c");
+    }
+
+    #[test]
+    fn leading_mode_moves_trailing_comma_to_leading() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.commas".to_string(),
+                serde_json::json!({"line_position": "leading"}),
+            )]),
+        };
+        let sql = "SELECT\n    a,\n    b\nFROM c";
+        let issues = run_with_rule(sql, &LayoutCommas::from_config(&config));
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT\n    a\n    , b\nFROM c");
     }
 
     #[test]

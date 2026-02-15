@@ -6,6 +6,7 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
+use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +140,7 @@ fn operator_layout_violation(
             let Some((start, end)) = token_with_span_offsets(sql, token) else {
                 continue;
             };
-            let edits = safe_operator_leading_autofix_edits(
+            let edits = safe_operator_autofix_edits(
                 sql,
                 &tokens,
                 index,
@@ -155,7 +156,7 @@ fn operator_layout_violation(
     None
 }
 
-fn safe_operator_leading_autofix_edits(
+fn safe_operator_autofix_edits(
     sql: &str,
     tokens: &[TokenWithSpan],
     operator_idx: usize,
@@ -163,10 +164,31 @@ fn safe_operator_leading_autofix_edits(
     line_break_before: bool,
     line_break_after: bool,
 ) -> Option<Vec<Lt03AutofixEdit>> {
-    if line_position != OperatorLinePosition::Leading || line_break_before || !line_break_after {
-        return None;
+    match line_position {
+        OperatorLinePosition::Leading if !line_break_before && line_break_after => {
+            // Trailing operator → move to leading: "a +\n  b" → "a\n+ b"
+            safe_operator_move_edits(sql, tokens, operator_idx, true)
+        }
+        OperatorLinePosition::Trailing if line_break_before && !line_break_after => {
+            // Leading operator → move to trailing: "a\n+ b" → "a +\n  b"
+            safe_operator_move_edits(sql, tokens, operator_idx, false)
+        }
+        _ => None,
     }
+}
 
+/// Move an operator across a line break.
+///
+/// When `to_leading` is true, the operator currently trails on the previous line
+/// and should be moved to lead on the next line.
+/// When `to_leading` is false, the operator currently leads on the next line and
+/// should be moved to trail on the previous line.
+fn safe_operator_move_edits(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    operator_idx: usize,
+    to_leading: bool,
+) -> Option<Vec<Lt03AutofixEdit>> {
     let prev_idx = prev_non_trivia_index(tokens, operator_idx)?;
     let next_idx = next_non_trivia_index(tokens, operator_idx + 1)?;
     let (_, before_start) = token_with_span_offsets(sql, &tokens[prev_idx])?;
@@ -180,22 +202,44 @@ fn safe_operator_leading_autofix_edits(
 
     let before_gap = &sql[before_start..before_end];
     let after_gap = &sql[after_start..after_end];
-    if !before_gap.chars().all(char::is_whitespace)
-        || before_gap.contains('\n')
-        || before_gap.contains('\r')
-    {
-        return None;
-    }
-    if !after_gap.chars().all(char::is_whitespace)
-        || (!after_gap.contains('\n') && !after_gap.contains('\r'))
-    {
-        return None;
-    }
 
-    Some(vec![
-        (before_start, before_end, "\n"),
-        (after_start, after_end, " "),
-    ])
+    if to_leading {
+        // Moving trailing → leading: before_gap should be inline whitespace,
+        // after_gap should contain a line break.
+        if !before_gap.chars().all(char::is_whitespace)
+            || before_gap.contains('\n')
+            || before_gap.contains('\r')
+        {
+            return None;
+        }
+        if !after_gap.chars().all(char::is_whitespace)
+            || (!after_gap.contains('\n') && !after_gap.contains('\r'))
+        {
+            return None;
+        }
+        Some(vec![
+            (before_start, before_end, "\n"),
+            (after_start, after_end, " "),
+        ])
+    } else {
+        // Moving leading → trailing: before_gap should contain a line break,
+        // after_gap should be inline whitespace.
+        if !before_gap.chars().all(char::is_whitespace)
+            || (!before_gap.contains('\n') && !before_gap.contains('\r'))
+        {
+            return None;
+        }
+        if !after_gap.chars().all(char::is_whitespace)
+            || after_gap.contains('\n')
+            || after_gap.contains('\r')
+        {
+            return None;
+        }
+        Some(vec![
+            (before_start, before_end, " "),
+            (after_start, after_end, "\n"),
+        ])
+    }
 }
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
@@ -260,7 +304,7 @@ fn is_layout_operator(token: &Token) -> bool {
             | Token::Neq
             | Token::Lt
             | Token::Gt
-    )
+    ) || matches!(token, Token::Word(word) if matches!(word.keyword, Keyword::AND | Keyword::OR))
 }
 
 fn is_trivia_token(token: &Token) -> bool {
@@ -468,16 +512,38 @@ mod tests {
                 serde_json::json!({"line_position": "trailing"}),
             )]),
         };
-        let issues = run_with_rule(
-            "SELECT a\n + b FROM t",
-            &LayoutOperators::from_config(&config),
-        );
+        let sql = "SELECT a\n + b FROM t";
+        let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
-        assert!(
-            issues[0].autofix.is_none(),
-            "trailing-style violations remain report-only in conservative LT003 migration"
-        );
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a +\nb FROM t");
+    }
+
+    #[test]
+    fn flags_trailing_and_operator() {
+        let sql = "SELECT * FROM t WHERE a AND\nb";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT * FROM t WHERE a\nAND b");
+    }
+
+    #[test]
+    fn flags_trailing_or_operator() {
+        let sql = "SELECT * FROM t WHERE a OR\nb";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT * FROM t WHERE a\nOR b");
+    }
+
+    #[test]
+    fn does_not_flag_leading_and_operator() {
+        assert!(run("SELECT * FROM t WHERE a\nAND b").is_empty());
     }
 
     #[test]

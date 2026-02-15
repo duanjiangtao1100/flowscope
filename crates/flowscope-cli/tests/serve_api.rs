@@ -398,7 +398,7 @@ async fn lint_fix_applies_cv007_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT 1",
+        "SELECT 1\n",
         "expected CV07 core autofix to remove outer wrapper brackets"
     );
 }
@@ -1167,7 +1167,7 @@ async fn lint_fix_applies_cv003_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT a FROM t",
+        "SELECT a FROM t\n",
         "expected CV003 core autofix to remove trailing comma"
     );
 }
@@ -1195,7 +1195,7 @@ async fn lint_fix_rule_config_enables_cv003_require_core_autofix() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT a, FROM t",
+        "SELECT a, FROM t\n",
         "expected CV003 require-mode core autofix to insert trailing comma"
     );
 }
@@ -1408,7 +1408,7 @@ async fn lint_fix_applies_lt008_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte",
+        "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte\n",
         "expected LT008 core autofix to place SELECT on a new line after CTE close"
     );
 }
@@ -1440,7 +1440,7 @@ async fn lint_fix_applies_lt015_core_autofix_in_patch_mode() {
 async fn lint_fix_applies_jj001_core_autofix_only_in_unsafe_mode() {
     let state = test_state(default_config(), vec![]);
     let app = build_router(state, 3000);
-    let sql = "SELECT '{{foo}}' AS templated";
+    let sql = "SELECT '{{foo}}' AS templated\n";
 
     let (safe_status, safe_json) = post_json(
         &app,

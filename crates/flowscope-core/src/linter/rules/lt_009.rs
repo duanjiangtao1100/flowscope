@@ -74,12 +74,12 @@ impl LintRule for LayoutSelectTargets {
                 )
                 .with_statement(ctx.statement_index)
                 .with_span(ctx.span_from_statement_offset(start, end));
-                if let Some((fix_start, fix_end)) = fix_span {
+                if let Some((fix_start, fix_end, replacement)) = fix_span {
                     issue = issue.with_autofix_edits(
                         IssueAutofixApplicability::Safe,
                         vec![IssuePatchEdit::new(
                             ctx.span_from_statement_offset(fix_start, fix_end),
-                            "\n",
+                            replacement,
                         )],
                     );
                 }
@@ -103,8 +103,8 @@ struct SelectClauseLayout {
 }
 
 type Lt09Span = (usize, usize);
-type Lt09AutofixSpan = (usize, usize);
-type Lt09Violation = (Lt09Span, Option<Lt09AutofixSpan>);
+type Lt09AutofixEdit = (usize, usize, &'static str);
+type Lt09Violation = (Lt09Span, Option<Lt09AutofixEdit>);
 
 fn lt09_violation_spans(
     statement: &Statement,
@@ -159,7 +159,7 @@ fn lt09_violation_spans(
             continue;
         };
         let fix_span = if is_single_target {
-            None
+            safe_single_target_collapse_span(sql, &tokens, layout)
         } else {
             safe_from_newline_fix_span(sql, &tokens, layout)
         };
@@ -471,11 +471,42 @@ fn multiple_target_layout_violation(layout: &SelectClauseLayout, tokens: &[Token
     false
 }
 
+/// For single-target violations, collapse `SELECT\n  target` → `SELECT target`
+/// by replacing the whitespace gap with a single space.
+/// For single-target violations, collapse `SELECT\n  target` → `SELECT target`
+/// by replacing the whitespace gap with a single space.
+fn safe_single_target_collapse_span(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    layout: &SelectClauseLayout,
+) -> Option<Lt09AutofixEdit> {
+    let (target_start, _) = layout.target_ranges.first().copied()?;
+
+    // Find the last token before the target (SELECT keyword or modifier like DISTINCT).
+    let last_pre_target_idx = (layout.select_idx..target_start)
+        .rev()
+        .find(|&idx| !is_ignorable_layout_token(&tokens[idx].token))?;
+
+    let (_, gap_start) = token_with_span_offsets(sql, &tokens[last_pre_target_idx])?;
+    let (gap_end, _) = token_with_span_offsets(sql, &tokens[target_start])?;
+    if gap_start > gap_end || gap_end > sql.len() {
+        return None;
+    }
+
+    let gap = &sql[gap_start..gap_end];
+    // Only collapse when the gap is pure whitespace (no comments).
+    if gap.chars().all(char::is_whitespace) && gap.contains('\n') {
+        Some((gap_start, gap_end, " "))
+    } else {
+        None
+    }
+}
+
 fn safe_from_newline_fix_span(
     sql: &str,
     tokens: &[TokenWithSpan],
     layout: &SelectClauseLayout,
-) -> Option<Lt09AutofixSpan> {
+) -> Option<Lt09AutofixEdit> {
     let from_idx = layout.from_idx?;
     if !only_from_shares_last_target_line_violation(layout, tokens) {
         return None;
@@ -495,7 +526,7 @@ fn safe_from_newline_fix_span(
 
     let gap = &sql[gap_start..gap_end];
     if gap.chars().all(char::is_whitespace) && !gap.contains('\n') && !gap.contains('\r') {
-        Some((gap_start, gap_end))
+        Some((gap_start, gap_end, "\n"))
     } else {
         None
     }
@@ -794,6 +825,28 @@ mod tests {
     fn multiple_wildcard_policy_allows_star_on_own_line() {
         let sql = "select\n    *\nfrom x";
         assert!(run_with_wildcard_policy(sql, "multiple").is_empty());
+    }
+
+    #[test]
+    fn single_target_autofix_collapses_to_select_line() {
+        let sql = "SELECT\n  a\nFROM x";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a\nFROM x");
+    }
+
+    #[test]
+    fn single_target_autofix_with_distinct() {
+        let sql = "SELECT DISTINCT\n  a\nFROM x";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT DISTINCT a\nFROM x");
     }
 
     #[test]
