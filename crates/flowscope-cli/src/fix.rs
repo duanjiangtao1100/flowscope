@@ -4144,31 +4144,35 @@ mod tests {
     }
 
     #[test]
-    fn sqlfluff_st005_cases_are_fixed_or_unchanged() {
+    fn sqlfluff_st002_unnecessary_case_fix_cases() {
         let cases = [
+            // Bool coalesce: CASE WHEN cond THEN TRUE ELSE FALSE END → coalesce(cond, false)
+            (
+                "SELECT CASE WHEN x > 0 THEN true ELSE false END FROM t",
+                1,
+                0,
+                1,
+                Some("COALESCE(X > 0, FALSE)"),
+            ),
+            // Negated bool: CASE WHEN cond THEN FALSE ELSE TRUE END → not coalesce(cond, false)
+            (
+                "SELECT CASE WHEN x > 0 THEN false ELSE true END FROM t",
+                1,
+                0,
+                1,
+                Some("NOT COALESCE(X > 0, FALSE)"),
+            ),
+            // Null coalesce: CASE WHEN x IS NULL THEN y ELSE x END → coalesce(x, y)
+            (
+                "SELECT CASE WHEN x IS NULL THEN 0 ELSE x END FROM t",
+                1,
+                0,
+                1,
+                Some("COALESCE(X, 0)"),
+            ),
+            // Not flagged: regular searched CASE (not an unnecessary pattern)
             (
                 "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t",
-                1,
-                0,
-                1,
-                Some("CASE X WHEN 1 THEN 'A' WHEN 2 THEN 'B' END"),
-            ),
-            (
-                "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' ELSE 'c' END FROM t",
-                1,
-                0,
-                1,
-                Some("CASE X WHEN 1 THEN 'A' WHEN 2 THEN 'B' ELSE 'C' END"),
-            ),
-            (
-                "SELECT CASE WHEN x = 1 THEN 'a' WHEN y = 2 THEN 'b' END FROM t",
-                0,
-                0,
-                0,
-                None,
-            ),
-            (
-                "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t",
                 0,
                 0,
                 0,
@@ -4357,6 +4361,7 @@ mod tests {
                 1,
                 0,
                 1,
+                // After flattening: nested CASE removed, inner WHEN promoted.
                 Some("WHEN SPECIES = 'DOG' THEN 'WOOF'"),
             ),
             (
@@ -4364,7 +4369,8 @@ mod tests {
                 1,
                 0,
                 1,
-                Some("CASE SPECIES WHEN 'DOG' THEN 'WOOF' WHEN 'MOUSE' THEN 'SQUEAK' ELSE 'OTHER' END END"),
+                // Flattened: all inner WHENs promoted, only one END remains.
+                Some("WHEN SPECIES = 'MOUSE' THEN 'SQUEAK' ELSE 'OTHER' END AS SOUND"),
             ),
             (
                 "SELECT CASE WHEN species = 'Rat' THEN CASE WHEN colour = 'Black' THEN 'Growl' WHEN colour = 'Grey' THEN 'Squeak' END END AS sound FROM mytable",
@@ -4998,7 +5004,7 @@ mod tests {
 
     #[test]
     fn st002_core_autofix_candidates_apply_cleanly_in_safe_mode() {
-        let sql = "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t\n";
+        let sql = "SELECT CASE WHEN x > 0 THEN true ELSE false END FROM t\n";
         let issues = lint_issues(sql, Dialect::Generic, &default_lint_config());
         let candidates = build_fix_candidates_from_issue_autofixes(sql, &issues);
         assert!(
@@ -5012,7 +5018,7 @@ mod tests {
         let planned = plan_fix_candidates(sql, candidates, &protected, false);
         let applied = apply_planned_edits(sql, &planned.edits);
         assert_eq!(
-            applied, "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t\n",
+            applied, "SELECT coalesce(x > 0, false) FROM t\n",
             "unexpected ST002 planned edits with skipped={:?}",
             planned.skipped
         );
@@ -5754,7 +5760,7 @@ mod tests {
             ),
             (
                 issue_codes::LINT_ST_002,
-                "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t",
+                "SELECT CASE WHEN x > 0 THEN true ELSE false END FROM t",
             ),
             (
                 issue_codes::LINT_ST_005,

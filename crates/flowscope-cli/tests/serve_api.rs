@@ -729,7 +729,7 @@ async fn lint_fix_applies_st002_core_autofix_in_patch_mode() {
         &app,
         "/api/lint-fix",
         json!({
-            "sql": "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t\n"
+            "sql": "SELECT CASE WHEN x > 0 THEN true ELSE false END FROM t\n"
         }),
     )
     .await;
@@ -738,8 +738,8 @@ async fn lint_fix_applies_st002_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t\n",
-        "expected ST002 core autofix to rewrite searched CASE to simple CASE"
+        "SELECT coalesce(x > 0, false) FROM t\n",
+        "expected ST002 core autofix to rewrite unnecessary CASE to coalesce"
     );
 }
 

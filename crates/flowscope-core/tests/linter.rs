@@ -3011,7 +3011,7 @@ fn lint_sqlfluff_parity_rule_smoke_cases() {
         ("LINT_RF_006", "SELECT \"good_name\" FROM t"),
         (
             "LINT_ST_002",
-            "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t",
+            "SELECT CASE WHEN x > 0 THEN true ELSE false END FROM t",
         ),
         (
             "LINT_ST_004",

@@ -1063,7 +1063,7 @@ fn test_lint_fix_applies_st002_core_autofix_in_patch_mode() {
     let sql_path = dir.path().join("structure_simple_case_patch_fix.sql");
     std::fs::write(
         &sql_path,
-        "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t\n",
+        "SELECT CASE WHEN x > 0 THEN true ELSE false END FROM t\n",
     )
     .expect("write sql");
 
@@ -1081,8 +1081,8 @@ fn test_lint_fix_applies_st002_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t\n",
-        "Expected ST002 core autofix to rewrite searched CASE to simple CASE: {after:?}"
+        after, "SELECT coalesce(x > 0, false) FROM t\n",
+        "Expected ST002 core autofix to rewrite unnecessary CASE to coalesce: {after:?}"
     );
 }
 

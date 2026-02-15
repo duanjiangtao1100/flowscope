@@ -1,12 +1,22 @@
-//! LINT_ST_002: Structure simple case.
+//! LINT_ST_002: Unnecessary CASE statement.
 //!
-//! SQLFluff ST02 parity: prefer simple `CASE <expr> WHEN ...` form when all
-//! searched-case predicates compare the same operand for equality.
+//! SQLFluff ST02 parity: detect CASE expressions that can be replaced by
+//! simpler forms such as `COALESCE(...)`, `NOT COALESCE(...)`, or a plain
+//! column reference.
+//!
+//! Detectable patterns:
+//!   1. `CASE WHEN cond THEN TRUE  ELSE FALSE END` → `COALESCE(cond, FALSE)`
+//!   2. `CASE WHEN cond THEN FALSE ELSE TRUE  END` → `NOT COALESCE(cond, FALSE)`
+//!   3. `CASE WHEN x IS NULL     THEN y ELSE x END` → `COALESCE(x, y)`
+//!   4. `CASE WHEN x IS NOT NULL THEN x ELSE y END` → `COALESCE(x, y)`
+//!   5. `CASE WHEN x IS NULL     THEN NULL ELSE x END` → `x`
+//!   6. `CASE WHEN x IS NOT NULL THEN x ELSE NULL END` → `x`
+//!   7. `CASE WHEN x IS NOT NULL THEN x END`          → `x`
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::visit;
 use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
-use sqlparser::ast::{BinaryOperator, Expr, Spanned, Statement};
+use sqlparser::ast::{Expr, Spanned, Statement, Value};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 pub struct StructureSimpleCase;
@@ -28,17 +38,17 @@ impl LintRule for StructureSimpleCase {
         let mut issues = Vec::new();
 
         visit::visit_expressions(stmt, &mut |expr| {
-            let Some(rewrite) = simple_case_rewrite_info(expr) else {
+            let Some(rewrite) = classify_unnecessary_case(expr) else {
                 return;
             };
 
             let mut issue = Issue::info(
                 issue_codes::LINT_ST_002,
-                "CASE expression may be simplified to simple CASE form.",
+                "Unnecessary CASE statement. Use COALESCE function or simple column reference.",
             )
             .with_statement(ctx.statement_index);
 
-            if let Some((span, edits)) = simple_case_autofix(ctx, expr, &rewrite) {
+            if let Some((span, edits)) = build_autofix(ctx, expr, &rewrite) {
                 issue = issue
                     .with_span(span)
                     .with_autofix_edits(IssueAutofixApplicability::Safe, edits);
@@ -51,182 +61,198 @@ impl LintRule for StructureSimpleCase {
     }
 }
 
-#[derive(Clone, Copy)]
-enum OperandSide {
-    Left,
-    Right,
+// ---------------------------------------------------------------------------
+// Rewrite classification
+// ---------------------------------------------------------------------------
+
+/// The kind of simplification that can be applied.
+#[derive(Debug, Clone)]
+enum UnnecessaryCaseKind {
+    /// `CASE WHEN cond THEN TRUE ELSE FALSE END` → `COALESCE(cond, FALSE)`
+    BoolCoalesce { condition_text: String },
+    /// `CASE WHEN cond THEN FALSE ELSE TRUE END` → `NOT COALESCE(cond, FALSE)`
+    BoolCoalesceNegated { condition_text: String },
+    /// `CASE WHEN x IS [NOT] NULL THEN a ELSE b END` → `COALESCE(x, y)`
+    NullCoalesce {
+        checked_text: String,
+        fallback_text: String,
+    },
+    /// `CASE WHEN x IS [NOT] NULL THEN x [ELSE NULL] END` → `x`
+    ColumnIdentity { column_text: String },
 }
 
-#[derive(Clone)]
-struct SimpleCaseRewriteInfo {
-    operand_expr: Expr,
-    conditions: Vec<RewriteConditionMatch>,
-}
-
-fn simple_case_rewrite_info(expr: &Expr) -> Option<SimpleCaseRewriteInfo> {
+/// Classify the CASE expression if it is an unnecessary pattern.
+fn classify_unnecessary_case(expr: &Expr) -> Option<UnnecessaryCaseKind> {
     let Expr::Case {
         operand: None,
         conditions,
+        else_result,
         ..
     } = expr
     else {
         return None;
     };
 
-    if conditions.len() < 2 {
+    // Only single-WHEN case expressions can be simplified.
+    if conditions.len() != 1 {
         return None;
     }
 
-    let mut common_operand: Option<Expr> = None;
-    let mut rewrite_conditions = Vec::with_capacity(conditions.len());
+    let when = &conditions[0];
+    let condition = &when.condition;
+    let result = &when.result;
 
-    for case_when in conditions {
-        let rewrite = split_case_when_equality(&case_when.condition, common_operand.as_ref())?;
-        if common_operand.is_none() {
-            common_operand = Some(rewrite.operand_expr.clone());
+    // -----------------------------------------------------------------------
+    // Pattern group 1: boolean CASE WHEN cond THEN TRUE/FALSE ELSE FALSE/TRUE
+    // -----------------------------------------------------------------------
+    if let Some(result_bool) = expr_bool_value(result) {
+        if let Some(else_bool) = else_result.as_deref().and_then(expr_bool_value) {
+            // TRUE/FALSE or FALSE/TRUE — other combos don't simplify.
+            if result_bool && !else_bool {
+                // CASE WHEN cond THEN TRUE ELSE FALSE END → coalesce(cond, false)
+                return Some(UnnecessaryCaseKind::BoolCoalesce {
+                    condition_text: format!("{condition}"),
+                });
+            } else if !result_bool && else_bool {
+                // CASE WHEN cond THEN FALSE ELSE TRUE END → not coalesce(cond, false)
+                return Some(UnnecessaryCaseKind::BoolCoalesceNegated {
+                    condition_text: format!("{condition}"),
+                });
+            }
         }
-        rewrite_conditions.push(rewrite);
     }
 
-    Some(SimpleCaseRewriteInfo {
-        operand_expr: common_operand?,
-        conditions: rewrite_conditions,
-    })
-}
-
-fn split_case_when_equality(
-    condition: &Expr,
-    expected_operand: Option<&Expr>,
-) -> Option<RewriteConditionMatch> {
-    let Expr::BinaryOp { left, op, right } = condition else {
-        return None;
-    };
-
-    if *op != BinaryOperator::Eq {
-        return None;
+    // -----------------------------------------------------------------------
+    // Pattern group 2: NULL-check simplifications
+    // -----------------------------------------------------------------------
+    // CASE WHEN x IS NULL THEN ... ELSE ... END
+    if let Expr::IsNull(checked_expr) = condition {
+        return classify_null_check_case(checked_expr, result, else_result.as_deref(), true);
     }
 
-    if let Some(expected) = expected_operand {
-        if exprs_equivalent(left, expected) {
-            return Some(RewriteConditionMatch {
-                operand_expr: left.as_ref().clone(),
-                value_expr: right.as_ref().clone(),
-                operand_side: OperandSide::Left,
-            });
-        }
-        if exprs_equivalent(right, expected) {
-            return Some(RewriteConditionMatch {
-                operand_expr: right.as_ref().clone(),
-                value_expr: left.as_ref().clone(),
-                operand_side: OperandSide::Right,
-            });
-        }
-        return None;
-    }
-
-    if simple_case_operand_candidate(left) {
-        return Some(RewriteConditionMatch {
-            operand_expr: left.as_ref().clone(),
-            value_expr: right.as_ref().clone(),
-            operand_side: OperandSide::Left,
-        });
-    }
-    if simple_case_operand_candidate(right) {
-        return Some(RewriteConditionMatch {
-            operand_expr: right.as_ref().clone(),
-            value_expr: left.as_ref().clone(),
-            operand_side: OperandSide::Right,
-        });
+    // CASE WHEN x IS NOT NULL THEN ... ELSE ... END
+    if let Expr::IsNotNull(checked_expr) = condition {
+        return classify_null_check_case(checked_expr, result, else_result.as_deref(), false);
     }
 
     None
 }
 
-#[derive(Clone)]
-struct RewriteConditionMatch {
-    operand_expr: Expr,
-    value_expr: Expr,
-    operand_side: OperandSide,
-}
+/// Classify a CASE with IS NULL / IS NOT NULL condition.
+fn classify_null_check_case(
+    checked_expr: &Expr,
+    then_result: &Expr,
+    else_result: Option<&Expr>,
+    is_null_check: bool,
+) -> Option<UnnecessaryCaseKind> {
+    let checked_text = format!("{checked_expr}");
+    let then_text = format!("{then_result}");
+    let else_text = else_result.map(|e| format!("{e}"));
 
-fn simple_case_autofix(
-    ctx: &LintContext,
-    expr: &Expr,
-    rewrite: &SimpleCaseRewriteInfo,
-) -> Option<(Span, Vec<IssuePatchEdit>)> {
-    let Expr::Case {
-        operand: None,
-        conditions,
-        ..
-    } = expr
-    else {
-        return None;
-    };
-
-    if conditions.len() != rewrite.conditions.len() || conditions.is_empty() {
-        return None;
-    }
-
-    let (expr_start, expr_end) = expr_statement_offsets(ctx, expr)?;
-    let expr_span = ctx.span_from_statement_offset(expr_start, expr_end);
-    if span_contains_comment(ctx, expr_span) {
-        return None;
-    }
-
-    let (operand_start, operand_end) = expr_statement_offsets(ctx, &rewrite.operand_expr)?;
-    let operand_text = ctx
-        .statement_sql()
-        .get(operand_start..operand_end)?
-        .to_string();
-
-    let (first_condition_start, _) = expr_statement_offsets(ctx, &conditions[0].condition)?;
-    let case_keyword_end = expr_start + "CASE".len();
-    if case_keyword_end > first_condition_start {
-        return None;
-    }
-
-    let mut edits = Vec::with_capacity(1 + rewrite.conditions.len());
-    edits.push(IssuePatchEdit::new(
-        ctx.span_from_statement_offset(case_keyword_end, first_condition_start),
-        format!(" {operand_text} WHEN "),
-    ));
-
-    for (case_when, rewrite_condition) in conditions.iter().zip(&rewrite.conditions) {
-        let (condition_start, condition_end) = expr_statement_offsets(ctx, &case_when.condition)?;
-        let (value_start, value_end) = expr_statement_offsets(ctx, &rewrite_condition.value_expr)?;
-
-        match rewrite_condition.operand_side {
-            OperandSide::Left => {
-                if condition_start >= value_start {
-                    return None;
+    if is_null_check {
+        // CASE WHEN x IS NULL THEN ... ELSE x END
+        if let Some(ref else_t) = else_text {
+            if else_t == &checked_text {
+                // CASE WHEN x IS NULL THEN result ELSE x END
+                if is_null_expr(then_result) {
+                    // CASE WHEN x IS NULL THEN NULL ELSE x END → x
+                    return Some(UnnecessaryCaseKind::ColumnIdentity {
+                        column_text: checked_text,
+                    });
                 }
-                edits.push(IssuePatchEdit::new(
-                    ctx.span_from_statement_offset(condition_start, value_start),
-                    "",
-                ));
+                // CASE WHEN x IS NULL THEN y ELSE x END → COALESCE(x, y)
+                return Some(UnnecessaryCaseKind::NullCoalesce {
+                    checked_text,
+                    fallback_text: then_text,
+                });
             }
-            OperandSide::Right => {
-                if value_end >= condition_end {
-                    return None;
+        }
+    } else {
+        // CASE WHEN x IS NOT NULL THEN ... ELSE ... END
+        if then_text == checked_text {
+            match &else_text {
+                Some(et) if is_null_text(et) => {
+                    // CASE WHEN x IS NOT NULL THEN x ELSE NULL END → x
+                    return Some(UnnecessaryCaseKind::ColumnIdentity {
+                        column_text: checked_text,
+                    });
                 }
-                edits.push(IssuePatchEdit::new(
-                    ctx.span_from_statement_offset(value_end, condition_end),
-                    "",
-                ));
+                None => {
+                    // CASE WHEN x IS NOT NULL THEN x END → x
+                    return Some(UnnecessaryCaseKind::ColumnIdentity {
+                        column_text: checked_text,
+                    });
+                }
+                Some(fallback) => {
+                    // CASE WHEN x IS NOT NULL THEN x ELSE y END → COALESCE(x, y)
+                    return Some(UnnecessaryCaseKind::NullCoalesce {
+                        checked_text,
+                        fallback_text: fallback.clone(),
+                    });
+                }
             }
         }
     }
 
-    Some((expr_span, edits))
+    None
 }
 
-fn simple_case_operand_candidate(expr: &Expr) -> bool {
-    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+fn expr_bool_value(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
-fn exprs_equivalent(left: &Expr, right: &Expr) -> bool {
-    format!("{left}") == format!("{right}")
+fn is_null_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(v) if matches!(v.value, Value::Null))
 }
+
+fn is_null_text(s: &str) -> bool {
+    s.eq_ignore_ascii_case("NULL")
+}
+
+// ---------------------------------------------------------------------------
+// Autofix
+// ---------------------------------------------------------------------------
+
+fn build_autofix(
+    ctx: &LintContext,
+    expr: &Expr,
+    rewrite: &UnnecessaryCaseKind,
+) -> Option<(Span, Vec<IssuePatchEdit>)> {
+    let (expr_start, expr_end) = expr_statement_offsets(ctx, expr)?;
+    let expr_span = ctx.span_from_statement_offset(expr_start, expr_end);
+
+    if span_contains_comment(ctx, expr_span) {
+        return None;
+    }
+
+    let replacement = match rewrite {
+        UnnecessaryCaseKind::BoolCoalesce { condition_text } => {
+            format!("coalesce({condition_text}, false)")
+        }
+        UnnecessaryCaseKind::BoolCoalesceNegated { condition_text } => {
+            format!("not coalesce({condition_text}, false)")
+        }
+        UnnecessaryCaseKind::NullCoalesce {
+            checked_text,
+            fallback_text,
+        } => {
+            format!("coalesce({checked_text}, {fallback_text})")
+        }
+        UnnecessaryCaseKind::ColumnIdentity { column_text } => column_text.clone(),
+    };
+
+    Some((expr_span, vec![IssuePatchEdit::new(expr_span, replacement)]))
+}
+
+// ---------------------------------------------------------------------------
+// Span and offset utilities
+// ---------------------------------------------------------------------------
 
 fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usize)> {
     if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
@@ -394,72 +420,237 @@ mod tests {
         output
     }
 
-    // --- Edge cases adopted from sqlfluff ST02 ---
+    // --- Pass cases from SQLFluff ST02 fixture ---
 
     #[test]
-    fn flags_simple_case_candidate() {
-        let sql = "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t";
+    fn pass_case_cannot_be_reduced_1() {
+        let sql = "select fab > 0 as is_fab from fancy_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_case_cannot_be_reduced_2() {
+        let sql = "select case when fab > 0 then true end as is_fab from fancy_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_case_cannot_be_reduced_3() {
+        let sql = "select case when fab is not null then false end as is_fab from fancy_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_case_cannot_be_reduced_4() {
+        let sql = "select case when fab > 0 then true else true end as is_fab from fancy_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_case_cannot_be_reduced_5() {
+        let sql =
+            "select case when fab <> 0 then 'just a string' end as fab_category from fancy_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_case_cannot_be_reduced_6() {
+        let sql = "select case when fab <> 0 then true when fab < 0 then 'not a bool' end as fab_category from fancy_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_single_when_is_null_then_bar() {
+        let sql = "select foo, case when bar is null then bar else '123' end as test from baz";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_is_not_null_then_literal() {
+        let sql = "select foo, case when bar is not null then '123' else bar end as test from baz";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_multiple_when_is_not_null() {
+        let sql = "select foo, case when bar is not null then '123' when foo is not null then '456' else bar end as test from baz";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_compound_condition() {
+        let sql = "select foo, case when bar is not null and abs(foo) > 0 then '123' else bar end as test from baz";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_window_lead_is_null() {
+        let sql = "SELECT dv_runid, CASE WHEN LEAD(dv_startdateutc) OVER (PARTITION BY rowid ORDER BY dv_startdateutc) IS NULL THEN 1 ELSE 0 END AS loadstate FROM d";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_coalesce_is_null() {
+        let sql = "select field_1, field_2, field_3, case when coalesce(field_2, field_3) is null then 1 else 0 end as field_4 from my_table";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_submitted_timestamp() {
+        let sql = "SELECT CASE WHEN item.submitted_timestamp IS NOT NULL THEN item.sitting_id END";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn pass_array_accessor_snowflake() {
+        let sql = "SELECT CASE WHEN genres[0] IS NULL THEN 'x' ELSE genres END AS g FROM table_t";
+        assert!(run(sql).is_empty());
+    }
+
+    // --- Fail cases from SQLFluff ST02 fixture ---
+
+    #[test]
+    fn fail_unnecessary_case_bool_true_false() {
+        let sql = "select case when fab > 0 then true else false end as is_fab from fancy_table";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_ST_002);
     }
 
     #[test]
-    fn flags_reversed_operand_comparisons() {
-        let sql = "SELECT CASE WHEN 1 = x THEN 'a' WHEN 2 = x THEN 'b' END FROM t";
+    fn fail_unnecessary_case_bool_false_true() {
+        let sql = "select case when fab > 0 then false else true end as is_fab from fancy_table";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
     }
 
     #[test]
-    fn does_not_flag_when_operands_differ() {
-        let sql = "SELECT CASE WHEN x = 1 THEN 'a' WHEN y = 2 THEN 'b' END FROM t";
-        let issues = run(sql);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn does_not_flag_simple_case_form() {
-        let sql = "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t";
-        let issues = run(sql);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn does_not_flag_single_when_case() {
-        let sql = "SELECT CASE WHEN x = 1 THEN 'a' END FROM t";
-        let issues = run(sql);
-        assert!(issues.is_empty());
-    }
-
-    #[test]
-    fn emits_safe_autofix_for_simple_case_rewrite() {
-        let sql = "SELECT CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END FROM t";
+    fn fail_unnecessary_case_bool_compound_condition() {
+        let sql = "select case when fab > 0 and tot > 0 then true else false end as is_fab from fancy_table";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
+    }
 
-        let autofix = issues[0]
-            .autofix
-            .as_ref()
-            .expect("expected ST002 core autofix metadata");
+    #[test]
+    fn fail_unnecessary_case_is_null_coalesce() {
+        let sql = "select foo, case when bar is null then '123' else bar end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_unnecessary_case_is_not_null_coalesce() {
+        let sql = "select foo, case when bar is not null then bar else '123' end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_unnecessary_case_is_null_identity_null_else() {
+        let sql = "select foo, case when bar is null then null else bar end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_unnecessary_case_is_not_null_identity_else_null() {
+        let sql = "select foo, case when bar is not null then bar else null end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_unnecessary_case_is_not_null_identity_no_else() {
+        let sql = "select foo, case when bar is not null then bar end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_is_null_then_false_else_true() {
+        let sql = "select case when perks.perk is null then false else true end as perk_redeemed from subscriptions_xf";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    // --- Autofix tests ---
+
+    #[test]
+    fn autofix_bool_true_false() {
+        let sql = "select case when fab > 0 then true else false end as is_fab from fancy_table";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
-        assert_eq!(autofix.edits.len(), 3);
-
         let fixed = apply_edits(sql, &autofix.edits);
         assert_eq!(
             fixed,
-            "SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END FROM t"
+            "select coalesce(fab > 0, false) as is_fab from fancy_table"
         );
     }
 
     #[test]
-    fn comment_in_case_blocks_safe_autofix_metadata() {
-        let sql = "SELECT CASE WHEN x = 1 /*keep*/ THEN 'a' WHEN x = 2 THEN 'b' END FROM t";
+    fn autofix_bool_false_true() {
+        let sql = "select case when fab > 0 then false else true end as is_fab from fancy_table";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select not coalesce(fab > 0, false) as is_fab from fancy_table"
+        );
+    }
+
+    #[test]
+    fn autofix_is_null_coalesce() {
+        let sql = "select foo, case when bar is null then '123' else bar end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "select foo, coalesce(bar, '123') as test from baz");
+    }
+
+    #[test]
+    fn autofix_is_not_null_coalesce() {
+        let sql = "select foo, case when bar is not null then bar else '123' end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "select foo, coalesce(bar, '123') as test from baz");
+    }
+
+    #[test]
+    fn autofix_is_null_then_null_identity() {
+        let sql = "select foo, case when bar is null then null else bar end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "select foo, bar as test from baz");
+    }
+
+    #[test]
+    fn autofix_is_not_null_identity_no_else() {
+        let sql = "select foo, case when bar is not null then bar end as test from baz";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "select foo, bar as test from baz");
+    }
+
+    #[test]
+    fn comment_in_case_blocks_safe_autofix() {
+        let sql =
+            "select case when fab > 0 /*keep*/ then true else false end as is_fab from fancy_table";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert!(
             issues[0].autofix.is_none(),
-            "comment-bearing CASE expression should not receive ST002 safe patch metadata"
+            "comment-bearing CASE expression should not receive safe patch metadata"
         );
     }
 }

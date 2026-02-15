@@ -1,14 +1,19 @@
 //! LINT_ST_006: Structure column order.
 //!
-//! SQLFluff ST06 parity: prefer simple column references before complex
-//! expressions in SELECT projection lists.
+//! SQLFluff ST06 parity: prefer wildcards first, then simple column references
+//! and casts, before complex expressions (aggregates, window functions, etc.)
+//! in SELECT projection lists.
+//!
+//! The rule only applies to order-insensitive SELECTs: it skips INSERT, MERGE,
+//! CREATE TABLE AS, and SELECTs participating in UNION/set operations (where
+//! column position is semantically significant).
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
-use sqlparser::ast::{Expr, SelectItem, Statement};
+use sqlparser::ast::{
+    Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-
-use super::semantic_helpers::visit_selects_in_statement;
 
 pub struct StructureColumnOrder;
 
@@ -26,24 +31,21 @@ impl LintRule for StructureColumnOrder {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let mut first_simple_indexes = Vec::new();
-        visit_selects_in_statement(statement, &mut |select| {
-            first_simple_indexes.push(select.projection.iter().position(is_simple_projection_item));
+        let mut violations_info: Vec<ViolationInfo> = Vec::new();
+        visit_order_safe_selects(statement, &mut |select| {
+            if let Some(info) = check_select_order(select) {
+                violations_info.push(info);
+            }
         });
 
-        let violations = first_simple_indexes
-            .iter()
-            .filter_map(|index| *index)
-            .filter(|index| *index > 0)
-            .count();
-
-        let mut autofix_candidates =
-            st006_autofix_candidates_for_context(ctx, &first_simple_indexes);
+        let mut autofix_candidates = st006_autofix_candidates_for_context(ctx, &violations_info);
         autofix_candidates.sort_by_key(|candidate| candidate.span.start);
-        let candidates_align = autofix_candidates.len() == violations;
+        let candidates_align = autofix_candidates.len() == violations_info.len();
 
-        (0..violations)
-            .map(|index| {
+        violations_info
+            .iter()
+            .enumerate()
+            .map(|(index, _info)| {
                 let mut issue = Issue::info(
                     issue_codes::LINT_ST_006,
                     "Prefer simple columns before complex expressions in SELECT.",
@@ -61,6 +63,293 @@ impl LintRule for StructureColumnOrder {
             .collect()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Band-based item classification
+// ---------------------------------------------------------------------------
+
+/// SQLFluff ST06 classifies items into ordered bands:
+///   Band 0: wildcards (`*`, `table.*`)
+///   Band 1: simple columns, literals, standalone casts
+///   Band 2: complex expressions (aggregates, window functions, arithmetic, etc.)
+fn item_band(item: &SelectItem) -> u8 {
+    match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => 0,
+        SelectItem::UnnamedExpr(expr) => expr_band(expr),
+        SelectItem::ExprWithAlias { expr, .. } => expr_band(expr),
+    }
+}
+
+fn expr_band(expr: &Expr) -> u8 {
+    match expr {
+        // Simple identifiers.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => 1,
+        // Literal values.
+        Expr::Value(_) => 1,
+        // Standalone CAST expressions: `CAST(x AS type)` or `x::type`.
+        Expr::Cast { expr: inner, .. } => {
+            let inner_band = expr_band(inner);
+            if inner_band <= 1 {
+                1
+            } else {
+                2
+            }
+        }
+        // CAST as a function call: `cast(b)` parsed as Function.
+        Expr::Function(f) if is_cast_function(f) => 1,
+        // Nested/parenthesized expression — unwrap.
+        Expr::Nested(inner) => expr_band(inner),
+        // Everything else: functions, binary ops, window functions, etc.
+        _ => 2,
+    }
+}
+
+/// Check if a function call is a CAST function (e.g. `cast(b)` parsed as Function).
+fn is_cast_function(f: &sqlparser::ast::Function) -> bool {
+    use sqlparser::ast::ObjectNamePart;
+    f.name
+        .0
+        .last()
+        .and_then(ObjectNamePart::as_ident)
+        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("CAST"))
+}
+
+// ---------------------------------------------------------------------------
+// Violation detection
+// ---------------------------------------------------------------------------
+
+struct ViolationInfo {
+    /// The band assignments for each projection item.
+    bands: Vec<u8>,
+    /// Whether the SELECT has implicit column references (GROUP BY 1, 2).
+    has_implicit_refs: bool,
+}
+
+/// Check if a SELECT's projection ordering violates band order.
+/// Returns `Some(ViolationInfo)` if there is a violation.
+fn check_select_order(select: &Select) -> Option<ViolationInfo> {
+    if select.projection.len() < 2 {
+        return None;
+    }
+
+    let bands: Vec<u8> = select.projection.iter().map(item_band).collect();
+
+    // A violation exists when any item has a lower band than a preceding item.
+    let mut max_band = 0u8;
+    let mut violated = false;
+    for &band in &bands {
+        if band < max_band {
+            violated = true;
+            break;
+        }
+        max_band = max_band.max(band);
+    }
+
+    if !violated {
+        return None;
+    }
+
+    let has_implicit_refs = has_implicit_column_references(select);
+
+    Some(ViolationInfo {
+        bands,
+        has_implicit_refs,
+    })
+}
+
+/// Returns true if the SELECT uses positional (numeric) column references
+/// in GROUP BY or ORDER BY (e.g. `GROUP BY 1, 2`).
+fn has_implicit_column_references(select: &Select) -> bool {
+    if let GroupByExpr::Expressions(exprs, _) = &select.group_by {
+        for expr in exprs {
+            if matches!(expr, Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Number(_, _)))
+            {
+                return true;
+            }
+        }
+    }
+
+    for sort in &select.sort_by {
+        if matches!(&sort.expr, Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Number(_, _)))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Context-aware SELECT visitor (skips order-sensitive contexts)
+// ---------------------------------------------------------------------------
+
+/// Visit only SELECTs where column order is NOT semantically significant.
+/// Skips INSERT, MERGE, CREATE TABLE AS, and set operations (UNION, etc.).
+fn visit_order_safe_selects<F: FnMut(&Select)>(statement: &Statement, visitor: &mut F) {
+    match statement {
+        Statement::Query(query) => visit_query_selects(query, visitor, false),
+        // INSERT: column order matters — skip entirely.
+        Statement::Insert(_) => {}
+        // MERGE: column order matters — skip entirely.
+        Statement::Merge { .. } => {}
+        // CREATE TABLE AS SELECT: column order matters — skip entirely.
+        Statement::CreateTable(create) => {
+            if create.query.is_some() {
+                // CREATE TABLE AS SELECT — skip.
+            }
+            // Regular CREATE TABLE without AS SELECT — nothing relevant to visit.
+        }
+        Statement::CreateView { query, .. } => {
+            visit_query_selects(query, visitor, false);
+        }
+        Statement::Update {
+            table,
+            from,
+            selection,
+            ..
+        } => {
+            // Visit subqueries in table/from/where but not the statement columns.
+            visit_table_factor_selects(&table.relation, visitor);
+            for join in &table.joins {
+                visit_table_factor_selects(&join.relation, visitor);
+            }
+            if let Some(from) = from {
+                match from {
+                    sqlparser::ast::UpdateTableFromKind::BeforeSet(tables)
+                    | sqlparser::ast::UpdateTableFromKind::AfterSet(tables) => {
+                        for t in tables {
+                            visit_table_factor_selects(&t.relation, visitor);
+                            for j in &t.joins {
+                                visit_table_factor_selects(&j.relation, visitor);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(sel) = selection {
+                visit_expr_selects(sel, visitor);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_query_selects<F: FnMut(&Select)>(query: &Query, visitor: &mut F, in_set_operation: bool) {
+    // Visit CTE definitions — these may or may not be order-sensitive.
+    // A CTE is order-sensitive if referenced in a set operation with SELECT *.
+    // For simplicity and SQLFluff parity: skip CTEs whose query body is used
+    // in a set operation context.
+    if let Some(with) = &query.with {
+        let body_is_set = matches!(query.body.as_ref(), SetExpr::SetOperation { .. });
+        for cte in &with.cte_tables {
+            // If the outer body is a set operation, CTE order matters.
+            visit_query_selects(&cte.query, visitor, body_is_set);
+        }
+    }
+
+    visit_set_expr_selects(&query.body, visitor, in_set_operation);
+}
+
+fn visit_set_expr_selects<F: FnMut(&Select)>(
+    set_expr: &SetExpr,
+    visitor: &mut F,
+    in_set_operation: bool,
+) {
+    match set_expr {
+        SetExpr::Select(select) => {
+            if in_set_operation {
+                // In a set operation, column order is semantically significant.
+                // Skip both this SELECT and its FROM subqueries, since subquery
+                // column order feeds into the set operation result.
+                return;
+            }
+            visitor(select);
+            // Visit subqueries in FROM clause.
+            for table in &select.from {
+                visit_table_factor_selects(&table.relation, visitor);
+                for join in &table.joins {
+                    visit_table_factor_selects(&join.relation, visitor);
+                }
+            }
+            // Visit subqueries in WHERE, etc.
+            if let Some(sel) = &select.selection {
+                visit_expr_selects(sel, visitor);
+            }
+        }
+        SetExpr::Query(query) => visit_query_selects(query, visitor, in_set_operation),
+        SetExpr::SetOperation { left, right, .. } => {
+            // Both sides of a set operation are order-sensitive.
+            visit_set_expr_selects(left, visitor, true);
+            visit_set_expr_selects(right, visitor, true);
+        }
+        _ => {}
+    }
+}
+
+fn visit_table_factor_selects<F: FnMut(&Select)>(table_factor: &TableFactor, visitor: &mut F) {
+    match table_factor {
+        TableFactor::Derived { subquery, .. } => {
+            visit_query_selects(subquery, visitor, false);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            visit_table_factor_selects(&table_with_joins.relation, visitor);
+            for join in &table_with_joins.joins {
+                visit_table_factor_selects(&join.relation, visitor);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_expr_selects<F: FnMut(&Select)>(expr: &Expr, visitor: &mut F) {
+    match expr {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => visit_query_selects(query, visitor, false),
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
+            visit_expr_selects(inner, visitor);
+            visit_query_selects(subquery, visitor, false);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            visit_expr_selects(left, visitor);
+            visit_expr_selects(right, visitor);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => visit_expr_selects(inner, visitor),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                visit_expr_selects(op, visitor);
+            }
+            for when in conditions {
+                visit_expr_selects(&when.condition, visitor);
+                visit_expr_selects(&when.result, visitor);
+            }
+            if let Some(e) = else_result {
+                visit_expr_selects(e, visitor);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Autofix
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 struct PositionedToken {
@@ -82,7 +371,7 @@ struct St006AutofixCandidate {
 
 fn st006_autofix_candidates_for_context(
     ctx: &LintContext,
-    first_simple_indexes: &[Option<usize>],
+    violations: &[ViolationInfo],
 ) -> Vec<St006AutofixCandidate> {
     let from_document_tokens = ctx.with_document_tokens(|tokens| {
         if tokens.is_empty() {
@@ -126,25 +415,41 @@ fn st006_autofix_candidates_for_context(
     };
 
     let segments = select_projection_segments(&tokens);
-    if segments.len() != first_simple_indexes.len() {
+
+    // We need to match segments to violations. Since we skip some SELECTs
+    // (set operations, INSERT, etc.), the segments from token scanning may
+    // not 1:1 align with violations. Use positional matching.
+    // If counts don't match, bail out.
+    if segments.len() < violations.len() {
         return Vec::new();
     }
 
+    // Find segments that have violations by scanning all segments and matching
+    // against the violation bands. For each segment, compute its bands from
+    // token-based item count and see if it matches a violation.
     let mut candidates = Vec::new();
-    for (segment, first_simple_idx) in segments.iter().zip(first_simple_indexes.iter()) {
-        let Some(first_simple_idx) = *first_simple_idx else {
-            continue;
-        };
-        if first_simple_idx == 0 {
+    let mut violation_idx = 0;
+    for segment in &segments {
+        if violation_idx >= violations.len() {
+            break;
+        }
+        let violation = &violations[violation_idx];
+        if segment.item_spans.len() != violation.bands.len() {
             continue;
         }
 
-        let Some(candidate) =
-            projection_reorder_candidate(ctx.sql, &tokens, segment, first_simple_idx)
-        else {
+        // Skip autofix if implicit column references exist.
+        if violation.has_implicit_refs {
+            violation_idx += 1;
             continue;
-        };
-        candidates.push(candidate);
+        }
+
+        if let Some(candidate) =
+            projection_reorder_candidate_by_band(ctx.sql, &tokens, segment, &violation.bands)
+        {
+            candidates.push(candidate);
+        }
+        violation_idx += 1;
     }
 
     candidates
@@ -313,13 +618,14 @@ fn span_from_positions(
     (start < end).then_some(Span::new(start, end))
 }
 
-fn projection_reorder_candidate(
+/// Reorder projection items by band, preserving relative order within each band.
+fn projection_reorder_candidate_by_band(
     sql: &str,
     tokens: &[PositionedToken],
     segment: &SelectProjectionSegment,
-    first_simple_idx: usize,
+    bands: &[u8],
 ) -> Option<St006AutofixCandidate> {
-    if first_simple_idx >= segment.item_spans.len() {
+    if segment.item_spans.len() != bands.len() {
         return None;
     }
 
@@ -346,9 +652,16 @@ fn projection_reorder_candidate(
         item_texts.push(text.to_string());
     }
 
-    let mut reordered = Vec::with_capacity(item_texts.len());
-    reordered.extend(item_texts[first_simple_idx..].iter().cloned());
-    reordered.extend(item_texts[..first_simple_idx].iter().cloned());
+    // Stable sort by band — items with same band keep their relative order.
+    let mut indexed: Vec<(usize, u8, &str)> = item_texts
+        .iter()
+        .enumerate()
+        .zip(bands.iter())
+        .map(|((i, text), &band)| (i, band, text.as_str()))
+        .collect();
+    indexed.sort_by_key(|&(i, band, _)| (band, i));
+
+    let reordered: Vec<&str> = indexed.iter().map(|&(_, _, text)| text).collect();
     let replacement = reordered.join(", ");
     if replacement.is_empty() || replacement == sql[replace_span.start..replace_span.end].trim() {
         return None;
@@ -366,16 +679,9 @@ fn segment_contains_comment(tokens: &[PositionedToken], span: Span) -> bool {
         .any(|token| token.start >= span.start && token.end <= span.end && is_comment(&token.token))
 }
 
-fn is_simple_projection_item(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::UnnamedExpr(Expr::Identifier(_))
-        | SelectItem::UnnamedExpr(Expr::CompoundIdentifier(_)) => true,
-        SelectItem::ExprWithAlias { expr, .. } => {
-            matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-        }
-        _ => false,
-    }
-}
+// ---------------------------------------------------------------------------
+// Token utilities
+// ---------------------------------------------------------------------------
 
 fn tokenize_with_spans(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
     let dialect = dialect.to_sqlparser_dialect();
@@ -470,14 +776,285 @@ mod tests {
             .collect()
     }
 
-    // --- Edge cases adopted from sqlfluff ST06 ---
+    fn apply_edits(sql: &str, edits: &[IssuePatchEdit]) -> String {
+        let mut output = sql.to_string();
+        let mut ordered = edits.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|edit| edit.span.start);
+
+        for edit in ordered.into_iter().rev() {
+            output.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+
+        output
+    }
+
+    // --- Pass cases from SQLFluff ST06 fixture ---
 
     #[test]
-    fn flags_when_complex_projection_precedes_first_simple_target() {
-        let issues = run("SELECT a + 1, a FROM t");
+    fn pass_select_statement_order() {
+        // a (simple), cast(b) (cast), c (simple) — all in band 1, no violation.
+        let issues = run("SELECT a, cast(b as int) as b, c FROM x");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_union_statements_ignored() {
+        let sql = "SELECT a + b as c, d FROM table_a UNION ALL SELECT c, d FROM table_b";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_insert_statements_ignored() {
+        let sql = "\
+INSERT INTO example_schema.example_table
+(id, example_column, rank_asc, rank_desc)
+SELECT
+    id,
+    CASE WHEN col_a IN('a', 'b', 'c') THEN col_a END AS example_column,
+    rank_asc,
+    rank_desc
+FROM another_schema.another_table";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_insert_statement_with_cte_ignored() {
+        let sql = "\
+INSERT INTO my_table
+WITH my_cte AS (SELECT * FROM t1)
+SELECT MAX(field1), field2
+FROM t1";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_merge_statements_ignored() {
+        let sql = "\
+MERGE INTO t
+USING
+(
+    SELECT
+        DATE_TRUNC('DAY', end_time) AS time_day,
+        b
+    FROM u
+) AS u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET a = b
+WHEN NOT MATCHED THEN
+INSERT (b) VALUES (c)";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_merge_statement_with_cte_ignored() {
+        let sql = "\
+MERGE INTO t
+USING
+(
+    WITH my_cte AS (SELECT * FROM t1)
+    SELECT MAX(field1), field2
+    FROM t1
+) AS u ON (a = b)
+WHEN MATCHED THEN
+UPDATE SET a = b
+WHEN NOT MATCHED THEN
+INSERT (b) VALUES (c)";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_create_table_as_select_with_cte_ignored() {
+        let sql = "\
+CREATE TABLE new_table AS (
+  WITH my_cte AS (SELECT * FROM t1)
+  SELECT MAX(field1), field2
+  FROM t1
+)";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_cte_used_in_set() {
+        let sql = "\
+WITH T1 AS (
+  SELECT
+    'a'::varchar AS A,
+    1::bigint AS B
+),
+T2 AS (
+  SELECT
+    CASE WHEN COL > 1 THEN 'x' ELSE 'y' END AS A,
+    COL AS B
+  FROM T
+)
+SELECT * FROM T1
+UNION ALL
+SELECT * FROM T2";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn pass_subquery_used_in_set() {
+        let sql = "\
+SELECT * FROM (SELECT 'a'::varchar AS A, 1::bigint AS B)
+UNION ALL
+SELECT * FROM (SELECT CASE WHEN COL > 1 THEN 'x' ELSE 'y' END AS A, COL AS B FROM T)";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    // --- Fail cases from SQLFluff ST06 fixture ---
+
+    #[test]
+    fn fail_select_statement_order_1() {
+        // a (band 1), row_number() over (...) (band 2), b (band 1) → violation.
+        let sql = "SELECT a, row_number() over (partition by id order by date) as y, b FROM x";
+        let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_ST_006);
     }
+
+    #[test]
+    fn fail_select_statement_order_2() {
+        // row_number() (band 2), * (band 0), cast(b) (band 1) → violation.
+        let sql = "SELECT row_number() over (partition by id order by date) as y, *, cast(b as int) as b_int FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_select_statement_order_3() {
+        // row_number() (band 2), cast(b) (band 1), * (band 0) → violation.
+        let sql = "SELECT row_number() over (partition by id order by date) as y, cast(b as int) as b_int, * FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_select_statement_order_4() {
+        // row_number() (band 2), b::int (band 1), * (band 0) → violation.
+        let sql = "SELECT row_number() over (partition by id order by date) as y, b::int, * FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn fail_select_statement_order_5() {
+        // row_number() (band 2), * (band 0), 2::int + 4 (band 2), cast(b) (band 1) → violation.
+        let sql = "SELECT row_number() over (partition by id order by date) as y, *, 2::int + 4 as sum, cast(b) as c FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    // --- Autofix tests ---
+
+    #[test]
+    fn autofix_reorder_simple_before_complex() {
+        let sql = "SELECT a + 1, a FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "SELECT a, a + 1 FROM t");
+    }
+
+    #[test]
+    fn autofix_reorder_wildcard_first() {
+        let sql = "SELECT row_number() over (partition by id order by date) as y, *, cast(b as int) as b_int FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "SELECT *, cast(b as int) as b_int, row_number() over (partition by id order by date) as y FROM x");
+    }
+
+    #[test]
+    fn autofix_reorder_with_casts() {
+        let sql = "SELECT row_number() over (partition by id order by date) as y, b::int, * FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "SELECT *, b::int, row_number() over (partition by id order by date) as y FROM x"
+        );
+    }
+
+    #[test]
+    fn autofix_fail_order_5_complex() {
+        // row_number() (2), * (0), 2::int + 4 (2), cast(b) (1)
+        // Expected: * (0), cast(b) (1), row_number() (2), 2::int + 4 (2)
+        let sql = "SELECT row_number() over (partition by id order by date) as y, *, 2::int + 4 as sum, cast(b) as c FROM x";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "SELECT *, cast(b) as c, row_number() over (partition by id order by date) as y, 2::int + 4 as sum FROM x");
+    }
+
+    #[test]
+    fn no_autofix_with_implicit_column_references() {
+        let sql =
+            "SELECT DATE_TRUNC('DAY', end_time) AS time_day, b_field FROM table_name GROUP BY 1, 2";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_none(),
+            "should not autofix when implicit column references exist"
+        );
+    }
+
+    #[test]
+    fn autofix_explicit_column_references() {
+        let sql = "SELECT DATE_TRUNC('DAY', end_time) AS time_day, b_field FROM table_name GROUP BY time_day, b_field";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(fixed, "SELECT b_field, DATE_TRUNC('DAY', end_time) AS time_day FROM table_name GROUP BY time_day, b_field");
+    }
+
+    #[test]
+    fn fail_cte_used_in_select_not_set() {
+        // CTE used in a regular SELECT (not UNION), so ST06 should apply to the CTE.
+        let sql = "\
+WITH T2 AS (
+  SELECT
+    CASE WHEN COL > 1 THEN 'x' ELSE 'y' END AS A,
+    COL AS B
+  FROM T
+)
+SELECT * FROM T2";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn comment_in_projection_blocks_safe_autofix_metadata() {
+        let sql = "SELECT a + 1 /*keep*/, a FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_none(),
+            "comment-bearing projection should not receive ST006 safe patch metadata"
+        );
+    }
+
+    // --- Existing tests ---
 
     #[test]
     fn does_not_flag_when_simple_target_starts_projection() {
@@ -486,9 +1063,10 @@ mod tests {
     }
 
     #[test]
-    fn does_not_flag_when_simple_target_appears_again_after_complex() {
+    fn flags_simple_target_after_complex() {
+        // SQLFluff ST06 flags `b` (band 1) appearing after `a + 1` (band 2).
         let issues = run("SELECT a, a + 1, b FROM t");
-        assert!(issues.is_empty());
+        assert_eq!(issues.len(), 1);
     }
 
     #[test]
@@ -501,31 +1079,5 @@ mod tests {
     fn flags_in_nested_select_scopes() {
         let issues = run("SELECT * FROM (SELECT a + 1, a FROM t) AS sub");
         assert_eq!(issues.len(), 1);
-    }
-
-    #[test]
-    fn emits_safe_autofix_for_simple_projection_reorder() {
-        let sql = "SELECT a + 1, a FROM t";
-        let issues = run(sql);
-        assert_eq!(issues.len(), 1);
-
-        let autofix = issues[0]
-            .autofix
-            .as_ref()
-            .expect("expected ST006 core autofix metadata");
-        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
-        assert_eq!(autofix.edits.len(), 1);
-        assert_eq!(autofix.edits[0].replacement, "a, a + 1");
-    }
-
-    #[test]
-    fn comment_in_projection_blocks_safe_autofix_metadata() {
-        let sql = "SELECT a + 1 /*keep*/, a FROM t";
-        let issues = run(sql);
-        assert_eq!(issues.len(), 1);
-        assert!(
-            issues[0].autofix.is_none(),
-            "comment-bearing projection should not receive ST006 safe patch metadata"
-        );
     }
 }
