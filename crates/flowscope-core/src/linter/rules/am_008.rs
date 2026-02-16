@@ -32,6 +32,11 @@ impl LintRule for AmbiguousJoinCondition {
             violations += count_implicit_cross_join_violations(select);
         });
 
+        // Subtract join types the AST doesn't distinguish but the token
+        // scanner can identify (e.g., DuckDB POSITIONAL JOIN).
+        let positional_joins = count_positional_joins_in_context(ctx);
+        violations = violations.saturating_sub(positional_joins);
+
         let mut autofix_candidates = am008_autofix_candidates_for_context(ctx);
         autofix_candidates.sort_by_key(|candidate| candidate.span.start);
         let candidates_align = autofix_candidates.len() == violations;
@@ -151,6 +156,42 @@ struct Am008AutofixCandidate {
 struct JoinOperatorTokenSpan {
     start_position: usize,
     end_position: usize,
+}
+
+/// Count `POSITIONAL JOIN` occurrences in the statement's token stream.
+///
+/// sqlparser doesn't model POSITIONAL JOIN as a distinct operator — it parses
+/// `POSITIONAL` as a table alias and `JOIN` as a bare join. This function
+/// detects the pattern at the token level so the AST violation count can be
+/// corrected.
+fn count_positional_joins_in_context(ctx: &LintContext) -> usize {
+    let sql = ctx.statement_sql();
+    // Quick textual check to avoid tokenization when not needed.
+    if !sql.to_ascii_uppercase().contains("POSITIONAL") {
+        return 0;
+    }
+
+    let Some(tokens) = tokenize_with_spans(sql, ctx.dialect()) else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut prev_word: Option<String> = None;
+    for token in &tokens {
+        match &token.token {
+            Token::Word(w) => {
+                let upper = w.value.to_ascii_uppercase();
+                if upper == "JOIN" && prev_word.as_deref() == Some("POSITIONAL") {
+                    count += 1;
+                }
+                prev_word = Some(upper);
+            }
+            t if is_trivia(t) => {}
+            _ => {
+                prev_word = None;
+            }
+        }
+    }
+    count
 }
 
 fn am008_autofix_candidates_for_context(ctx: &LintContext) -> Vec<Am008AutofixCandidate> {
@@ -345,6 +386,7 @@ fn previous_token_is_join_modifier(
         || token_word_equals(previous, "ASOF")
         || token_word_equals(previous, "STRAIGHT")
         || token_word_equals(previous, "STRAIGHT_JOIN")
+        || token_word_equals(previous, "POSITIONAL")
 }
 
 fn has_explicit_join_constraint(
@@ -358,6 +400,18 @@ fn has_explicit_join_constraint(
             significant_indexes,
             operator_span.start_position - 1,
             "NATURAL",
+        )
+    {
+        return true;
+    }
+
+    // DuckDB POSITIONAL JOIN matches rows by position; no ON/USING needed.
+    if operator_span.start_position > 0
+        && token_is_word_at(
+            tokens,
+            significant_indexes,
+            operator_span.start_position - 1,
+            "POSITIONAL",
         )
     {
         return true;
@@ -652,5 +706,11 @@ mod tests {
             issues[0].autofix.is_none(),
             "comment-bearing join operator span should remain unpatched"
         );
+    }
+
+    #[test]
+    fn allows_positional_join_duckdb() {
+        let issues = run("SELECT foo.a, bar.b FROM foo POSITIONAL JOIN bar");
+        assert!(issues.is_empty());
     }
 }

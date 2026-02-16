@@ -74,13 +74,19 @@ impl LintRule for LayoutSelectTargets {
                 )
                 .with_statement(ctx.statement_index)
                 .with_span(ctx.span_from_statement_offset(start, end));
-                if let Some((fix_start, fix_end, replacement)) = fix_span {
+                if let Some(fix_edits) = fix_span {
+                    let edits: Vec<IssuePatchEdit> = fix_edits
+                        .into_iter()
+                        .map(|(fix_start, fix_end, replacement)| {
+                            IssuePatchEdit::new(
+                                ctx.span_from_statement_offset(fix_start, fix_end),
+                                replacement,
+                            )
+                        })
+                        .collect();
                     issue = issue.with_autofix_edits(
                         IssueAutofixApplicability::Safe,
-                        vec![IssuePatchEdit::new(
-                            ctx.span_from_statement_offset(fix_start, fix_end),
-                            replacement,
-                        )],
+                        edits,
                     );
                 }
                 issue
@@ -103,8 +109,8 @@ struct SelectClauseLayout {
 }
 
 type Lt09Span = (usize, usize);
-type Lt09AutofixEdit = (usize, usize, &'static str);
-type Lt09Violation = (Lt09Span, Option<Lt09AutofixEdit>);
+type Lt09AutofixEdits = Vec<(usize, usize, String)>;
+type Lt09Violation = (Lt09Span, Option<Lt09AutofixEdits>);
 
 fn lt09_violation_spans(
     statement: &Statement,
@@ -479,34 +485,171 @@ fn safe_single_target_collapse_span(
     sql: &str,
     tokens: &[TokenWithSpan],
     layout: &SelectClauseLayout,
-) -> Option<Lt09AutofixEdit> {
-    let (target_start, _) = layout.target_ranges.first().copied()?;
+) -> Option<Lt09AutofixEdits> {
+    let (target_start_idx, target_end_idx) = layout.target_ranges.first().copied()?;
 
     // Find the last token before the target (SELECT keyword or modifier like DISTINCT).
-    let last_pre_target_idx = (layout.select_idx..target_start)
+    let last_pre_target_idx = (layout.select_idx..target_start_idx)
         .rev()
         .find(|&idx| !is_ignorable_layout_token(&tokens[idx].token))?;
 
     let (_, gap_start) = token_with_span_offsets(sql, &tokens[last_pre_target_idx])?;
-    let (gap_end, _) = token_with_span_offsets(sql, &tokens[target_start])?;
+    let (gap_end, _) = token_with_span_offsets(sql, &tokens[target_start_idx])?;
     if gap_start > gap_end || gap_end > sql.len() {
         return None;
     }
 
     let gap = &sql[gap_start..gap_end];
-    // Only collapse when the gap is pure whitespace (no comments).
-    if gap.chars().all(char::is_whitespace) && gap.contains('\n') {
-        Some((gap_start, gap_end, " "))
-    } else {
-        None
+    let (_, target_text_end) = token_with_span_offsets(sql, &tokens[target_end_idx - 1])?;
+    let target_line = tokens[target_start_idx].span.start.line;
+
+    // Check for comments in the gap (between SELECT/modifier and target).
+    let has_gap_comments = (last_pre_target_idx + 1..target_start_idx)
+        .any(|idx| comment_token_text(&tokens[idx]).is_some());
+
+    // Check for trailing inline comments after the target on the same line.
+    let has_trailing_comments = tokens
+        .iter()
+        .skip(target_end_idx)
+        .take_while(|t| t.span.start.line == target_line)
+        .any(|t| comment_token_text(t).is_some());
+
+    let gap_is_whitespace_only = gap.chars().all(char::is_whitespace) && gap.contains('\n');
+
+    // Simple case: no comments at all — collapse to single space.
+    if !has_gap_comments && !has_trailing_comments && gap_is_whitespace_only {
+        return Some(vec![(gap_start, gap_end, " ".to_string())]);
     }
+
+    // Comment-aware collapse: move the target text onto the SELECT line and
+    // relocate adjacent comments. Edits must avoid spanning comment protected
+    // ranges — we produce multiple surgical edits around comments instead.
+    let target_text = sql[gap_end..target_text_end].to_string();
+    let target_indent = detect_indent(sql, gap_end);
+
+    // Collect comment token indices.
+    let mut gap_comment_indices: Vec<usize> = Vec::new();
+    for idx in (last_pre_target_idx + 1)..target_start_idx {
+        if comment_token_text(&tokens[idx]).is_some() {
+            gap_comment_indices.push(idx);
+        }
+    }
+    let mut trailing_comment_indices: Vec<usize> = Vec::new();
+    for (offset, t) in tokens.iter().enumerate().skip(target_end_idx) {
+        if t.span.start.line != target_line {
+            break;
+        }
+        if comment_token_text(t).is_some() {
+            trailing_comment_indices.push(offset);
+        }
+    }
+
+    let has_subsequent_content = layout.from_idx.is_some()
+        || tokens
+            .iter()
+            .skip(target_end_idx)
+            .any(|t| {
+                t.span.start.line > target_line
+                    && !is_ignorable_layout_token(&t.token)
+                    && comment_token_text(t).is_none()
+            });
+
+    // Determine whether the two-edit strategy (split around comments) would
+    // overlap. The two-edit strategy uses:
+    //   Edit 1: (gap_start, first_comment_start, ...)
+    //   Edit 2: (target_line_nl, target_text_end, ...)
+    // These overlap when first_comment_start > target_line_nl, meaning the
+    // comment is between the newline and the target on the same line.
+    let target_line_nl = sql[..gap_end].rfind('\n');
+    let first_gap_comment_start = gap_comment_indices
+        .first()
+        .and_then(|&idx| token_with_span_offsets(sql, &tokens[idx]).map(|(s, _)| s));
+    let two_edit_would_overlap = target_line_nl
+        .zip(first_gap_comment_start)
+        .is_some_and(|(nl, cs)| cs > nl);
+
+    let mut edits = Vec::new();
+
+    if !gap_comment_indices.is_empty()
+        && trailing_comment_indices.is_empty()
+        && !two_edit_would_overlap
+        && has_subsequent_content
+    {
+        // Comments on separate line(s) before target, with FROM after.
+        // Two non-overlapping edits.
+        let first_comment_idx = gap_comment_indices[0];
+        let (first_comment_start, _) = token_with_span_offsets(sql, &tokens[first_comment_idx])?;
+        edits.push((gap_start, first_comment_start, format!(" {target_text}\n{target_indent}")));
+        let nl = target_line_nl?;
+        edits.push((nl, target_text_end, String::new()));
+    } else if !gap_comment_indices.is_empty()
+        && trailing_comment_indices.is_empty()
+        && (two_edit_would_overlap || !has_subsequent_content)
+    {
+        // Comments and target on same line after SELECT, or no FROM clause.
+        // Use surgical edits around comment protected ranges.
+        let first_comment_idx = gap_comment_indices[0];
+        let last_comment_idx = *gap_comment_indices.last().unwrap();
+        let (first_comment_start, _) = token_with_span_offsets(sql, &tokens[first_comment_idx])?;
+        let (_, last_comment_end) = token_with_span_offsets(sql, &tokens[last_comment_idx])?;
+
+        if has_subsequent_content {
+            // Place target before comments, comments on their own line.
+            edits.push((gap_start, first_comment_start, format!(" {target_text}\n{target_indent}")));
+            edits.push((last_comment_end, target_text_end, String::new()));
+        } else {
+            // No FROM — place target and comments on the same line.
+            edits.push((gap_start, first_comment_start, format!(" {target_text} ")));
+            edits.push((last_comment_end, target_text_end, String::new()));
+        }
+    } else if gap_comment_indices.is_empty() && !trailing_comment_indices.is_empty() {
+        // Comments trail the target on the same line (e.g., `1-- comment`).
+        // Edit 1: Collapse the gap to a space.
+        edits.push((gap_start, gap_end, " ".to_string()));
+
+        // Edit 2: Insert newline+indent before the trailing comment by
+        // replacing the last byte of the target with itself + \n + indent.
+        // This avoids a zero-width insert at the comment's protected range.
+        if target_text_end > 0 {
+            let anchor = target_text_end - 1;
+            let anchor_char = &sql[anchor..target_text_end];
+            edits.push((anchor, target_text_end, format!("{anchor_char}\n{target_indent}")));
+        } else {
+            return None;
+        }
+    } else if !gap_comment_indices.is_empty() && !trailing_comment_indices.is_empty() {
+        // Comments both before and after target. Produce surgical edits that
+        // avoid spanning any comment's protected range.
+        let first_comment_idx = gap_comment_indices[0];
+        let (first_comment_start, _) = token_with_span_offsets(sql, &tokens[first_comment_idx])?;
+
+        // Edit 1: Replace gap before first comment with target.
+        edits.push((gap_start, first_comment_start, format!(" {target_text}\n{target_indent}")));
+
+        // Edit 2: Remove the target and whitespace between the last gap comment
+        // and the first trailing comment. This avoids spanning the trailing
+        // comment's protected range.
+        let last_gap_comment_idx = *gap_comment_indices.last().unwrap();
+        let (_, last_gap_comment_end) = token_with_span_offsets(sql, &tokens[last_gap_comment_idx])?;
+        let first_trailing_idx = trailing_comment_indices[0];
+        let (first_trailing_start, _) = token_with_span_offsets(sql, &tokens[first_trailing_idx])?;
+
+        // Replace the region from after the last gap comment to the start of
+        // the first trailing comment with just the indent (so the trailing
+        // comment stays on its own line).
+        edits.push((last_gap_comment_end, first_trailing_start, format!("{target_indent}")));
+    } else {
+        return None;
+    }
+
+    Some(edits)
 }
 
 fn safe_from_newline_fix_span(
     sql: &str,
     tokens: &[TokenWithSpan],
     layout: &SelectClauseLayout,
-) -> Option<Lt09AutofixEdit> {
+) -> Option<Lt09AutofixEdits> {
     let from_idx = layout.from_idx?;
     if !only_from_shares_last_target_line_violation(layout, tokens) {
         return None;
@@ -526,7 +669,7 @@ fn safe_from_newline_fix_span(
 
     let gap = &sql[gap_start..gap_end];
     if gap.chars().all(char::is_whitespace) && !gap.contains('\n') && !gap.contains('\r') {
-        Some((gap_start, gap_end, "\n"))
+        Some(vec![(gap_start, gap_end, "\n".to_string())])
     } else {
         None
     }
@@ -558,6 +701,38 @@ fn only_from_shares_last_target_line_violation(
     }
 
     true
+}
+
+/// Extract comment text from a token, if it is a comment.
+/// Trailing newlines are stripped because the caller handles line breaks.
+fn comment_token_text(token: &TokenWithSpan) -> Option<String> {
+    use sqlparser::tokenizer::Whitespace;
+    match &token.token {
+        Token::Whitespace(Whitespace::SingleLineComment { prefix, comment }) => {
+            let text = format!("{prefix}{comment}");
+            Some(text.trim_end_matches('\n').trim_end_matches('\r').to_string())
+        }
+        Token::Whitespace(Whitespace::MultiLineComment(content)) => {
+            Some(format!("/*{content}*/"))
+        }
+        _ => None,
+    }
+}
+
+
+
+/// Detect the indentation prefix on the line where `offset` points.
+fn detect_indent(sql: &str, offset: usize) -> String {
+    // Walk backwards from offset to find the start of the line.
+    let line_start = sql[..offset]
+        .rfind('\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    // Collect leading whitespace from that line.
+    sql[line_start..]
+        .chars()
+        .take_while(|ch| ch.is_whitespace() && *ch != '\n')
+        .collect()
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -853,5 +1028,66 @@ mod tests {
     fn allows_leading_comma_layout_for_multiple_targets() {
         let sql = "select\n    a\n    , b\n    , c";
         assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn single_target_with_comment_before_collapses() {
+        let sql = "SELECT\n    -- This is the user's ID.\n    user_id\nFROM\n    safe_user";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT user_id\n    -- This is the user's ID.\nFROM\n    safe_user"
+        );
+    }
+
+    #[test]
+    fn single_target_with_block_comment_before_collapses_inline() {
+        // No FROM clause — comment is placed inline after target.
+        let sql = "SELECT\n /* test */  10000000";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT 10000000 /* test */");
+    }
+
+    #[test]
+    fn single_target_with_trailing_inline_comment_collapses() {
+        // Trailing comment after target — comment moves to its own indented line.
+        let sql = "SELECT\n  1-- this is a comment\nFROM\n  my_table";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT 1\n  -- this is a comment\nFROM\n  my_table"
+        );
+    }
+
+    #[test]
+    fn single_target_with_block_comment_before_on_same_line_collapses() {
+        // Block comment before target on same line — comment moves below target.
+        let sql = "SELECT\n  /* comment before */ 1\nFROM\n  my_table";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT 1\n  /* comment before */\nFROM\n  my_table"
+        );
+    }
+
+    #[test]
+    fn single_target_with_multiple_mixed_comments_collapses() {
+        // Gap comment on separate line + trailing inline comment.
+        let sql = "SELECT\n  -- previous comment\n  1 -- this is a comment\nFROM\n  my_table";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT 1\n  -- previous comment\n  -- this is a comment\nFROM\n  my_table"
+        );
     }
 }

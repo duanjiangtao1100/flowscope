@@ -69,16 +69,13 @@ impl LintRule for StructureSimpleCase {
 #[derive(Debug, Clone)]
 enum UnnecessaryCaseKind {
     /// `CASE WHEN cond THEN TRUE ELSE FALSE END` → `COALESCE(cond, FALSE)`
-    BoolCoalesce { condition_text: String },
+    BoolCoalesce,
     /// `CASE WHEN cond THEN FALSE ELSE TRUE END` → `NOT COALESCE(cond, FALSE)`
-    BoolCoalesceNegated { condition_text: String },
+    BoolCoalesceNegated,
     /// `CASE WHEN x IS [NOT] NULL THEN a ELSE b END` → `COALESCE(x, y)`
-    NullCoalesce {
-        checked_text: String,
-        fallback_text: String,
-    },
+    NullCoalesce,
     /// `CASE WHEN x IS [NOT] NULL THEN x [ELSE NULL] END` → `x`
-    ColumnIdentity { column_text: String },
+    ColumnIdentity,
 }
 
 /// Classify the CASE expression if it is an unnecessary pattern.
@@ -110,14 +107,10 @@ fn classify_unnecessary_case(expr: &Expr) -> Option<UnnecessaryCaseKind> {
             // TRUE/FALSE or FALSE/TRUE — other combos don't simplify.
             if result_bool && !else_bool {
                 // CASE WHEN cond THEN TRUE ELSE FALSE END → coalesce(cond, false)
-                return Some(UnnecessaryCaseKind::BoolCoalesce {
-                    condition_text: format!("{condition}"),
-                });
+                return Some(UnnecessaryCaseKind::BoolCoalesce);
             } else if !result_bool && else_bool {
                 // CASE WHEN cond THEN FALSE ELSE TRUE END → not coalesce(cond, false)
-                return Some(UnnecessaryCaseKind::BoolCoalesceNegated {
-                    condition_text: format!("{condition}"),
-                });
+                return Some(UnnecessaryCaseKind::BoolCoalesceNegated);
             }
         }
     }
@@ -145,6 +138,7 @@ fn classify_null_check_case(
     else_result: Option<&Expr>,
     is_null_check: bool,
 ) -> Option<UnnecessaryCaseKind> {
+    // Use AST Display for structural comparison only (case-insensitive matching).
     let checked_text = format!("{checked_expr}");
     let then_text = format!("{then_result}");
     let else_text = else_result.map(|e| format!("{e}"));
@@ -153,18 +147,12 @@ fn classify_null_check_case(
         // CASE WHEN x IS NULL THEN ... ELSE x END
         if let Some(ref else_t) = else_text {
             if else_t == &checked_text {
-                // CASE WHEN x IS NULL THEN result ELSE x END
                 if is_null_expr(then_result) {
                     // CASE WHEN x IS NULL THEN NULL ELSE x END → x
-                    return Some(UnnecessaryCaseKind::ColumnIdentity {
-                        column_text: checked_text,
-                    });
+                    return Some(UnnecessaryCaseKind::ColumnIdentity);
                 }
                 // CASE WHEN x IS NULL THEN y ELSE x END → COALESCE(x, y)
-                return Some(UnnecessaryCaseKind::NullCoalesce {
-                    checked_text,
-                    fallback_text: then_text,
-                });
+                return Some(UnnecessaryCaseKind::NullCoalesce);
             }
         }
     } else {
@@ -173,22 +161,15 @@ fn classify_null_check_case(
             match &else_text {
                 Some(et) if is_null_text(et) => {
                     // CASE WHEN x IS NOT NULL THEN x ELSE NULL END → x
-                    return Some(UnnecessaryCaseKind::ColumnIdentity {
-                        column_text: checked_text,
-                    });
+                    return Some(UnnecessaryCaseKind::ColumnIdentity);
                 }
                 None => {
                     // CASE WHEN x IS NOT NULL THEN x END → x
-                    return Some(UnnecessaryCaseKind::ColumnIdentity {
-                        column_text: checked_text,
-                    });
+                    return Some(UnnecessaryCaseKind::ColumnIdentity);
                 }
-                Some(fallback) => {
+                Some(_) => {
                     // CASE WHEN x IS NOT NULL THEN x ELSE y END → COALESCE(x, y)
-                    return Some(UnnecessaryCaseKind::NullCoalesce {
-                        checked_text,
-                        fallback_text: fallback.clone(),
-                    });
+                    return Some(UnnecessaryCaseKind::NullCoalesce);
                 }
             }
         }
@@ -231,23 +212,125 @@ fn build_autofix(
         return None;
     }
 
+    let Expr::Case {
+        conditions,
+        else_result,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    let when = conditions.first()?;
+    let condition = &when.condition;
+
     let replacement = match rewrite {
-        UnnecessaryCaseKind::BoolCoalesce { condition_text } => {
-            format!("coalesce({condition_text}, false)")
+        UnnecessaryCaseKind::BoolCoalesce => {
+            let cond_text = source_text_for_expr(ctx, condition)?;
+            format!("coalesce({cond_text}, false)")
         }
-        UnnecessaryCaseKind::BoolCoalesceNegated { condition_text } => {
-            format!("not coalesce({condition_text}, false)")
+        UnnecessaryCaseKind::BoolCoalesceNegated => {
+            let cond_text = source_text_for_expr(ctx, condition)?;
+            format!("not coalesce({cond_text}, false)")
         }
-        UnnecessaryCaseKind::NullCoalesce {
-            checked_text,
-            fallback_text,
-        } => {
+        UnnecessaryCaseKind::NullCoalesce => {
+            let (checked_expr, fallback_expr) = null_coalesce_operands(condition, &when.result, else_result.as_deref())?;
+            let checked_text = source_text_for_expr(ctx, checked_expr)?;
+            let fallback_text = source_text_for_expr(ctx, fallback_expr)?;
             format!("coalesce({checked_text}, {fallback_text})")
         }
-        UnnecessaryCaseKind::ColumnIdentity { column_text } => column_text.clone(),
+        UnnecessaryCaseKind::ColumnIdentity => {
+            let col_expr = column_identity_expr(condition, &when.result, else_result.as_deref())?;
+            source_text_for_expr(ctx, col_expr)?
+        }
     };
 
     Some((expr_span, vec![IssuePatchEdit::new(expr_span, replacement)]))
+}
+
+/// Extract the original source text for an expression, preserving keyword case.
+///
+/// Falls back to AST Display with keyword-case normalization when the span
+/// does not capture the full expression text (e.g. sqlparser omits unary
+/// operator keywords like `NOT` from span calculations).
+fn source_text_for_expr(ctx: &LintContext, expr: &Expr) -> Option<String> {
+    let (start, end) = expr_statement_offsets(ctx, expr)?;
+    let sql = ctx.statement_sql();
+    if end > sql.len() || start > end {
+        return None;
+    }
+
+    let source = &sql[start..end];
+
+    // Validate that the source text is correct by checking the AST Display
+    // output length.  When sqlparser's Spanned impl omits a keyword prefix
+    // (e.g. NOT in UnaryOp), the source text will be too short.
+    let display_text = format!("{expr}");
+    if source.len() >= display_text.len() {
+        return Some(source.to_string());
+    }
+
+    // Fall back to AST Display but normalise keyword case to match the
+    // surrounding SQL.  Detect the dominant case from the CASE expression
+    // context by looking at the `when` keyword that precedes the condition.
+    Some(normalize_keywords_to_match_source(sql, &display_text))
+}
+
+/// Normalise SQL keywords in `text` to match the case used in `context_sql`.
+fn normalize_keywords_to_match_source(context_sql: &str, text: &str) -> String {
+    let lower = context_sql.to_ascii_lowercase();
+    let uses_lowercase =
+        lower.contains(" and ") || lower.contains(" or ") || lower.contains(" not ");
+
+    // Check if the source SQL actually uses lowercase keywords by comparing
+    // against the original (non-lowered) text.
+    let source_uses_lower = context_sql.contains(" and ")
+        || context_sql.contains(" or ")
+        || context_sql.contains(" not ")
+        || context_sql.contains("when not ")
+        || context_sql.contains("when ");
+
+    if uses_lowercase && source_uses_lower {
+        text.replace(" AND ", " and ")
+            .replace(" OR ", " or ")
+            .replace("NOT ", "not ")
+    } else {
+        text.to_string()
+    }
+}
+
+/// For a NullCoalesce rewrite, return (checked_expr, fallback_expr).
+fn null_coalesce_operands<'a>(
+    condition: &'a Expr,
+    then_result: &'a Expr,
+    else_result: Option<&'a Expr>,
+) -> Option<(&'a Expr, &'a Expr)> {
+    if let Expr::IsNull(checked) = condition {
+        // CASE WHEN x IS NULL THEN y ELSE x END → COALESCE(x, y)
+        Some((checked.as_ref(), then_result))
+    } else if let Expr::IsNotNull(checked) = condition {
+        // CASE WHEN x IS NOT NULL THEN x ELSE y END → COALESCE(x, y)
+        let fallback = else_result?;
+        Some((checked.as_ref(), fallback))
+    } else {
+        None
+    }
+}
+
+/// For a ColumnIdentity rewrite, return the column expression.
+fn column_identity_expr<'a>(
+    condition: &'a Expr,
+    _then_result: &'a Expr,
+    _else_result: Option<&'a Expr>,
+) -> Option<&'a Expr> {
+    if let Expr::IsNull(checked) = condition {
+        // CASE WHEN x IS NULL THEN NULL ELSE x END → x
+        Some(checked.as_ref())
+    } else if let Expr::IsNotNull(checked) = condition {
+        // CASE WHEN x IS NOT NULL THEN x [ELSE NULL] END → x
+        Some(checked.as_ref())
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +723,60 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("expected autofix");
         let fixed = apply_edits(sql, &autofix.edits);
         assert_eq!(fixed, "select foo, bar as test from baz");
+    }
+
+    #[test]
+    fn autofix_bool_compound_preserves_keyword_case() {
+        let sql =
+            "select case when fab > 0 and tot > 0 then true else false end as is_fab from fancy_table";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select coalesce(fab > 0 and tot > 0, false) as is_fab from fancy_table"
+        );
+    }
+
+    #[test]
+    fn autofix_bool_negated_compound_preserves_keyword_case() {
+        let sql =
+            "select case when fab > 0 and tot > 0 then false else true end as is_fab from fancy_table";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select not coalesce(fab > 0 and tot > 0, false) as is_fab from fancy_table"
+        );
+    }
+
+    #[test]
+    fn autofix_multiline_compound_preserves_keyword_case() {
+        let sql = "select\n    case\n        when fab > 0 and tot > 0 then true else false end as is_fab\nfrom fancy_table";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select\n    coalesce(fab > 0 and tot > 0, false) as is_fab\nfrom fancy_table"
+        );
+    }
+
+    #[test]
+    fn autofix_multiline_negated_or_preserves_keyword_case() {
+        let sql = "select\n    case\n        when not fab > 0 or tot > 0 then false else true end as is_fab\nfrom fancy_table";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("expected autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select\n    not coalesce(not fab > 0 or tot > 0, false) as is_fab\nfrom fancy_table"
+        );
     }
 
     #[test]

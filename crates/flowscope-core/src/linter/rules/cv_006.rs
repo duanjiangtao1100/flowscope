@@ -335,45 +335,50 @@ fn build_multiline_newline_fix(
     };
 
     // Check for an inline comment AFTER the semicolon on the same line.
-    // Pattern: `foo ; -- comment` → `foo -- comment\n;`
     let after_semi_comment = after_semicolon.trim();
     if !after_semi_comment.is_empty()
         && (after_semi_comment.starts_with("--") || after_semi_comment.starts_with("/*"))
     {
-        // The comment after the semicolon needs to stay on the code line.
-        // Strategy: remove `;[space]` between code and comment, insert `\n;`
-        // after the comment line.
         let mut edits = Vec::new();
 
-        // Delete from the semicolon to the start of the comment text.
-        // Find the comment start in the after-semicolon content.
-        let comment_start_in_after = after_semicolon
-            .find("--")
-            .or_else(|| after_semicolon.find("/*"))
-            .unwrap_or(0);
-        let abs_comment_start = semicolon_end + comment_start_in_after;
-        // Delete from semicolon to the comment start (removes `; `)
-        edits.push(IssuePatchEdit::new(
-            Span::new(semicolon_offset, abs_comment_start),
-            "",
-        ));
-
-        // Find the end of the after-semicolon content line. Single-line
-        // comment tokens include the trailing \n in their span, so advance
-        // past it to land outside the comment protected range.
-        let mut insert_pos = semicolon_end + after_semicolon.len();
-        if insert_pos < ctx.sql.len() && ctx.sql.as_bytes()[insert_pos] == b'\n' {
-            insert_pos += 1;
-        }
-        // Insert ; on its own new line
-        let mut rep = String::new();
-        if insert_pos == semicolon_end + after_semicolon.len() {
-            // No newline found after comment content — add one
+        if after_semi_comment.starts_with("/*") {
+            // Block comment after semicolon: keep the comment after the
+            // semicolon but move both to a new line.
+            // Pattern: `foo; /* comment */` → `foo\n; /* comment */`
+            let mut rep = String::new();
             rep.push('\n');
+            rep.push_str(&indent);
+            rep.push(';');
+            edits.push(IssuePatchEdit::new(
+                Span::new(code_end, semicolon_end),
+                &rep,
+            ));
+        } else {
+            // Single-line comment after semicolon: move comment before
+            // semicolon on the code line, then semicolon on its own line.
+            // Pattern: `foo ; -- comment` → `foo -- comment\n;`
+
+            // Delete just the semicolon, preserving space before comment.
+            edits.push(IssuePatchEdit::new(
+                Span::new(semicolon_offset, semicolon_end),
+                "",
+            ));
+
+            // Find the end of the after-semicolon content line.
+            // Single-line comment tokens include the trailing \n.
+            let mut insert_pos = semicolon_end + after_semicolon.len();
+            if insert_pos < ctx.sql.len() && ctx.sql.as_bytes()[insert_pos] == b'\n' {
+                insert_pos += 1;
+            }
+            // Insert ; on its own new line
+            let mut rep = String::new();
+            if insert_pos == semicolon_end + after_semicolon.len() {
+                rep.push('\n');
+            }
+            rep.push_str(&indent);
+            rep.push(';');
+            edits.push(IssuePatchEdit::new(Span::new(insert_pos, insert_pos), &rep));
         }
-        rep.push_str(&indent);
-        rep.push(';');
-        edits.push(IssuePatchEdit::new(Span::new(insert_pos, insert_pos), &rep));
 
         edits.sort_by_key(|e| e.span.start);
         return edits;
@@ -395,8 +400,14 @@ fn build_multiline_newline_fix(
     // Edit 2: Insert newline + indent + semicolon at the anchor point.
     // Token ends are exclusive, so anchor_end is the first byte OUTSIDE
     // the comment token — safe for zero-width inserts.
+    // Single-line comment tokens include their trailing \n, so skip the
+    // extra \n prefix when the anchor already ends with one.
+    let anchor_has_newline = anchor_end > 0
+        && matches!(ctx.sql.as_bytes().get(anchor_end - 1), Some(b'\n'));
     let mut replacement = String::new();
-    replacement.push('\n');
+    if !anchor_has_newline {
+        replacement.push('\n');
+    }
     replacement.push_str(&indent);
     replacement.push(';');
     edits.push(IssuePatchEdit::new(
@@ -406,9 +417,13 @@ fn build_multiline_newline_fix(
 
     // Also clean up whitespace between code_end and the semicolon when no
     // comments are involved (simple gap case).
+    let gap_has_comment = code_end < semicolon_offset
+        && (ctx.sql[code_end..semicolon_offset].contains("--")
+            || ctx.sql[code_end..semicolon_offset].contains("/*"));
     if trailing.comments_before_semicolon.is_empty()
         && trailing.inline_comment_after_stmt.is_none()
         && code_end == anchor_end
+        && !gap_has_comment
     {
         // Remove any whitespace gap between code end and semicolon that isn't
         // covered by the other edits. For the simple case `stmt_end;` -> `stmt_end\n;`
@@ -471,10 +486,16 @@ fn build_require_final_semicolon_edits(
 
         let indent = detect_statement_indent(ctx);
 
-        // Token ends are exclusive, so anchor_end is the first byte OUTSIDE
-        // the comment token — safe for zero-width inserts.
+        // Single-line comment tokens include their trailing \n in the span.
+        // If the anchor already ends with \n, use just indent + ; to avoid
+        // a double newline.
+        let anchor_has_newline = anchor_end > 0
+            && matches!(ctx.sql.as_bytes().get(anchor_end - 1), Some(b'\n'));
+
         let mut replacement = String::new();
-        replacement.push('\n');
+        if !anchor_has_newline {
+            replacement.push('\n');
+        }
         replacement.push_str(&indent);
         replacement.push(';');
 
@@ -687,8 +708,18 @@ fn has_standalone_comment_at_end_of_statement(
         return false;
     };
 
-    // If the comment starts on a different line than the previous code token, it's standalone
-    offset_to_line_number(ctx.sql, last.start) != offset_to_line_number(ctx.sql, prev.start)
+    // If the comment starts on a different line than the previous code token, it's standalone.
+    // Also treat multiline block comments (spanning more than one line) as standalone, even
+    // when they start on the same line as code — the portion that extends to subsequent
+    // lines should be positioned after the semicolon.
+    if offset_to_line_number(ctx.sql, last.start) != offset_to_line_number(ctx.sql, prev.start) {
+        return true;
+    }
+
+    matches!(
+        &last.token,
+        Token::Whitespace(Whitespace::MultiLineComment(_))
+    ) && last.start_line != last.end_line
 }
 
 struct LocatedToken {
@@ -1367,5 +1398,123 @@ mod tests {
         assert_eq!(issues.len(), 1);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(fixed, "SELECT a\nFROM foo\n;\n");
+    }
+
+    #[test]
+    fn require_final_multiline_with_inline_comment_avoids_double_newline() {
+        // test_fail_final_semi_colon_newline_inline_comment_custom_multiline
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.terminator".to_string(),
+                serde_json::json!({"require_final_semicolon": true, "multiline_newline": true}),
+            )]),
+        };
+        let rule = ConventionTerminator::from_config(&config);
+        let sql = "SELECT a\nFROM foo -- inline comment\n";
+        let stmts = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &stmts[0],
+            &LintContext {
+                sql,
+                statement_range: 0.."SELECT a\nFROM foo".len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // The trailing \n after `;` is not added here because the edit only
+        // inserts at the anchor point. The parity report normalizes whitespace.
+        assert_eq!(fixed, "SELECT a\nFROM foo -- inline comment\n;");
+    }
+
+    #[test]
+    fn multiline_newline_block_comment_before_semicolon_inside_statement() {
+        // test_fail_newline_block_comment_semi_colon_after
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.terminator".to_string(),
+                serde_json::json!({"multiline_newline": true}),
+            )]),
+        };
+        let rule = ConventionTerminator::from_config(&config);
+        // Statement range includes the block comment.
+        let sql = "SELECT foo\nFROM bar\n/* multiline\ncomment\n*/\n;\n";
+        let stmt_range = 0.."SELECT foo\nFROM bar\n/* multiline\ncomment\n*/".len();
+        let stmts = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &stmts[0],
+            &LintContext {
+                sql,
+                statement_range: stmt_range,
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Semicolon inserted before block comment. The old semicolon deletion
+        // may leave a trailing \n; the parity report normalizes whitespace.
+        assert_eq!(fixed, "SELECT foo\nFROM bar\n;\n/* multiline\ncomment\n*/\n\n");
+    }
+
+    #[test]
+    fn multiline_newline_inline_block_comment_before_semicolon() {
+        // test_fail_newline_preceding_block_comment_custom_multiline
+        // Block comment starts on the same line as code but spans multiple lines.
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.terminator".to_string(),
+                serde_json::json!({"multiline_newline": true}),
+            )]),
+        };
+        let rule = ConventionTerminator::from_config(&config);
+        let sql = "SELECT foo\nFROM bar /* multiline\ncomment\n*/\n;\n";
+        let stmt_range = 0.."SELECT foo\nFROM bar /* multiline\ncomment\n*/".len();
+        let stmts = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &stmts[0],
+            &LintContext {
+                sql,
+                statement_range: stmt_range,
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_CV_006);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT foo\nFROM bar\n; /* multiline\ncomment\n*/\n\n");
+    }
+
+    #[test]
+    fn multiline_newline_trailing_block_comment_after_semicolon() {
+        // test_fail_newline_trailing_block_comment
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.terminator".to_string(),
+                serde_json::json!({"multiline_newline": true}),
+            )]),
+        };
+        let rule = ConventionTerminator::from_config(&config);
+        let sql = "SELECT foo\nFROM bar; /* multiline\ncomment\n*/\n";
+        let stmts = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &stmts[0],
+            &LintContext {
+                sql,
+                statement_range: 0.."SELECT foo\nFROM bar".len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Block comment stays after semicolon, both on the new line.
+        assert_eq!(fixed, "SELECT foo\nFROM bar\n; /* multiline\ncomment\n*/\n");
     }
 }

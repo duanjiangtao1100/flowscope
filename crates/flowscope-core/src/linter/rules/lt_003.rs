@@ -71,44 +71,54 @@ impl LintRule for LayoutOperators {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if let Some(((start, end), edits)) = operator_layout_violation(ctx, self.line_position) {
-            let mut issue = Issue::info(
-                issue_codes::LINT_LT_003,
-                "Operator line placement appears inconsistent.",
-            )
-            .with_statement(ctx.statement_index)
-            .with_span(ctx.span_from_statement_offset(start, end));
-            if !edits.is_empty() {
-                let edits = edits
-                    .into_iter()
-                    .map(|(edit_start, edit_end, replacement)| {
-                        IssuePatchEdit::new(
-                            ctx.span_from_statement_offset(edit_start, edit_end),
-                            replacement,
-                        )
-                    })
-                    .collect();
-                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
-            }
-            vec![issue]
-        } else {
-            Vec::new()
+        let violations = operator_layout_violations(ctx, self.line_position);
+        if violations.is_empty() {
+            return Vec::new();
         }
+
+        let ((start, end), _) = &violations[0];
+        let all_edits: Vec<Lt03AutofixEdit> = violations
+            .iter()
+            .flat_map(|(_, edits)| edits.iter().cloned())
+            .collect();
+
+        let mut issue = Issue::info(
+            issue_codes::LINT_LT_003,
+            "Operator line placement appears inconsistent.",
+        )
+        .with_statement(ctx.statement_index)
+        .with_span(ctx.span_from_statement_offset(*start, *end));
+        if !all_edits.is_empty() {
+            let edits = all_edits
+                .into_iter()
+                .map(|(edit_start, edit_end, replacement)| {
+                    IssuePatchEdit::new(
+                        ctx.span_from_statement_offset(edit_start, edit_end),
+                        &replacement,
+                    )
+                })
+                .collect();
+            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+        }
+        vec![issue]
     }
 }
 
 type Lt03Span = (usize, usize);
-type Lt03AutofixEdit = (usize, usize, &'static str);
+type Lt03AutofixEdit = (usize, usize, String);
 type Lt03Violation = (Lt03Span, Vec<Lt03AutofixEdit>);
 
-fn operator_layout_violation(
+fn operator_layout_violations(
     ctx: &LintContext,
     line_position: OperatorLinePosition,
-) -> Option<Lt03Violation> {
+) -> Vec<Lt03Violation> {
     let tokens =
         tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
-    let tokens = tokens?;
+    let Some(tokens) = tokens else {
+        return Vec::new();
+    };
     let sql = ctx.statement_sql();
+    let mut violations = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
         if !is_layout_operator(&token.token) {
@@ -149,11 +159,11 @@ fn operator_layout_violation(
                 line_break_after,
             )
             .unwrap_or_default();
-            return Some(((start, end), edits));
+            violations.push(((start, end), edits));
         }
     }
 
-    None
+    violations
 }
 
 fn safe_operator_autofix_edits(
@@ -183,6 +193,8 @@ fn safe_operator_autofix_edits(
 /// and should be moved to lead on the next line.
 /// When `to_leading` is false, the operator currently leads on the next line and
 /// should be moved to trail on the previous line.
+///
+/// Edits are split to avoid spanning comment protected ranges.
 fn safe_operator_move_edits(
     sql: &str,
     tokens: &[TokenWithSpan],
@@ -191,56 +203,121 @@ fn safe_operator_move_edits(
 ) -> Option<Vec<Lt03AutofixEdit>> {
     let prev_idx = prev_non_trivia_index(tokens, operator_idx)?;
     let next_idx = next_non_trivia_index(tokens, operator_idx + 1)?;
-    let (_, before_start) = token_with_span_offsets(sql, &tokens[prev_idx])?;
-    let (before_end, _) = token_with_span_offsets(sql, &tokens[operator_idx])?;
-    let (_, after_start) = token_with_span_offsets(sql, &tokens[operator_idx])?;
-    let (after_end, _) = token_with_span_offsets(sql, &tokens[next_idx])?;
+    let (_, prev_end) = token_with_span_offsets(sql, &tokens[prev_idx])?;
+    let (op_start, op_end) = token_with_span_offsets(sql, &tokens[operator_idx])?;
+    let (next_start, _) = token_with_span_offsets(sql, &tokens[next_idx])?;
 
-    if before_start > before_end || after_start > after_end || after_end > sql.len() {
+    if prev_end > op_start || op_end > next_start || next_start > sql.len() {
         return None;
     }
 
-    let before_gap = &sql[before_start..before_end];
-    let after_gap = &sql[after_start..after_end];
+    let before_gap = &sql[prev_end..op_start];
+    let after_gap = &sql[op_end..next_start];
+    let has_comments = gap_has_comment(before_gap) || gap_has_comment(after_gap);
+    let op_text = &sql[op_start..op_end];
 
+    if !has_comments {
+        // Simple case: no comments.
+        if to_leading {
+            if !before_gap.chars().all(char::is_whitespace)
+                || before_gap.contains('\n')
+                || before_gap.contains('\r')
+            {
+                return None;
+            }
+            if !after_gap.chars().all(char::is_whitespace)
+                || (!after_gap.contains('\n') && !after_gap.contains('\r'))
+            {
+                return None;
+            }
+            return Some(vec![
+                (prev_end, op_end, "\n".to_string()),
+                (op_end, next_start, format!("{op_text} ")),
+            ]);
+        } else {
+            if !before_gap.chars().all(char::is_whitespace)
+                || (!before_gap.contains('\n') && !before_gap.contains('\r'))
+            {
+                return None;
+            }
+            if !after_gap.chars().all(char::is_whitespace)
+                || after_gap.contains('\n')
+                || after_gap.contains('\r')
+            {
+                return None;
+            }
+            return Some(vec![
+                (prev_end, op_start, format!(" {op_text}")),
+                (op_start, next_start, "\n".to_string()),
+            ]);
+        }
+    }
+
+    // Comment-aware operator move: surgical edits that avoid comment spans.
     if to_leading {
-        // Moving trailing → leading: before_gap should be inline whitespace,
-        // after_gap should contain a line break.
-        if !before_gap.chars().all(char::is_whitespace)
-            || before_gap.contains('\n')
-            || before_gap.contains('\r')
-        {
-            return None;
-        }
-        if !after_gap.chars().all(char::is_whitespace)
-            || (!after_gap.contains('\n') && !after_gap.contains('\r'))
-        {
-            return None;
-        }
-        Some(vec![
-            (before_start, before_end, "\n"),
-            (after_start, after_end, " "),
-        ])
+        // Trailing → leading: "a +\n  b" → "a\n  + b"
+        // Also handles: "a + -- foo\n  b" → "a -- foo\n  + b"
+        // Also handles: "a AND\n  -- c1\n  -- c2\n  b" → "a\n  -- c1\n  -- c2\n  AND b"
+        let mut edits = Vec::new();
+
+        // 1) Delete operator and whitespace before it on the same line.
+        let delete_start = whitespace_before_on_same_line(sql, op_start, prev_end);
+        edits.push((delete_start, op_end, String::new()));
+
+        // 2) Insert operator before the next significant token.
+        //    Insert right at next_start to avoid spanning over any block comments
+        //    on the same line.
+        edits.push((next_start, next_start, format!("{op_text} ")));
+
+        Some(edits)
     } else {
-        // Moving leading → trailing: before_gap should contain a line break,
-        // after_gap should be inline whitespace.
-        if !before_gap.chars().all(char::is_whitespace)
-            || (!before_gap.contains('\n') && !before_gap.contains('\r'))
-        {
-            return None;
+        // Leading → trailing: "a\n  + b" → "a +\n  b"
+        // Also handles: "a -- foo\n  + b" → "a + -- foo\n  b"
+        // Also handles: "a\n  -- c1\n  -- c2\n  + b" → "a +\n  -- c1\n  -- c2\n  b"
+        let mut edits = Vec::new();
+
+        // 1) Insert operator after prev token.
+        //    Use the same trick as LT04: if a comment starts immediately at
+        //    prev_end, extend one byte into the prev token to avoid touching
+        //    the comment protected range.
+        if prev_end > 0 && gap_has_comment(&sql[prev_end..op_start]) {
+            let anchor = prev_end - 1;
+            let ch = &sql[anchor..prev_end];
+            edits.push((anchor, prev_end, format!("{ch} {op_text}")));
+        } else {
+            edits.push((prev_end, prev_end, format!(" {op_text}")));
         }
-        if !after_gap.chars().all(char::is_whitespace)
-            || after_gap.contains('\n')
-            || after_gap.contains('\r')
-        {
-            return None;
-        }
-        Some(vec![
-            (before_start, before_end, " "),
-            (after_start, after_end, "\n"),
-        ])
+
+        // 2) Delete operator and trailing whitespace from its current position.
+        let delete_end = skip_inline_whitespace(sql, op_end);
+        edits.push((op_start, delete_end, String::new()));
+
+        Some(edits)
     }
 }
+
+fn gap_has_comment(gap: &str) -> bool {
+    gap.contains("--") || gap.contains("/*")
+}
+
+fn skip_inline_whitespace(sql: &str, offset: usize) -> usize {
+    let mut pos = offset;
+    let bytes = sql.as_bytes();
+    while pos < bytes.len() && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+        pos += 1;
+    }
+    pos
+}
+
+fn whitespace_before_on_same_line(sql: &str, offset: usize, floor: usize) -> usize {
+    let mut pos = offset;
+    let bytes = sql.as_bytes();
+    while pos > floor && (bytes[pos - 1] == b' ' || bytes[pos - 1] == b'\t') {
+        pos -= 1;
+    }
+    pos
+}
+
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
     let dialect = dialect.to_sqlparser_dialect();
@@ -594,6 +671,55 @@ mod tests {
         let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+    }
+
+    #[test]
+    fn leading_mode_moves_trailing_and_with_comments() {
+        // SQLFluff: fails_on_after_with_comment_order_preserved
+        let sql = "select\n    a AND\n    -- comment1!\n    -- comment2!\n    b\nfrom foo";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "select\n    a\n    -- comment1!\n    -- comment2!\n    AND b\nfrom foo"
+        );
+    }
+
+    #[test]
+    fn trailing_mode_moves_leading_plus_with_comments() {
+        // SQLFluff: fails_on_before_override_with_comment_order
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.operators".to_string(),
+                serde_json::json!({"line_position": "trailing"}),
+            )]),
+        };
+        let sql =
+            "select\n    a -- comment1!\n    -- comment2!\n    -- comment3!\n    + b\nfrom foo";
+        let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "select\n    a + -- comment1!\n    -- comment2!\n    -- comment3!\n    b\nfrom foo"
+        );
+    }
+
+    #[test]
+    fn leading_mode_moves_trailing_plus_with_inline_comment() {
+        // SQLFluff: fails_on_after_override_with_comment_order
+        let sql =
+            "select\n    a + -- comment1!\n    -- comment2!\n    -- comment3!\n    b\nfrom foo";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "select\n    a -- comment1!\n    -- comment2!\n    -- comment3!\n    + b\nfrom foo"
+        );
     }
 
     #[test]

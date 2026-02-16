@@ -7,7 +7,6 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{BinaryOperator, Expr, Spanned, Statement, TableFactor};
-use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::semantic_helpers::{
     join_on_expr, table_factor_reference_name, visit_selects_in_statement,
@@ -254,39 +253,60 @@ fn has_join_pair(expr: &Expr, left_source_name: &str, right_source_name: &str) -
     }
 }
 
+/// Produce source-text-level edits that swap individual reversed comparison
+/// pairs while preserving original formatting, quoting, and keyword casing.
 fn join_condition_autofix(
     ctx: &LintContext,
     on_expr: &Expr,
     current_source: &str,
     previous_source: &str,
 ) -> Option<(Span, String)> {
-    let mut rewritten = on_expr.clone();
-    rewrite_reversed_join_pairs(&mut rewritten, current_source, previous_source);
-    if exprs_equivalent(on_expr, &rewritten) {
+    let sql = ctx.statement_sql();
+
+    // Collect text-level edits for each reversed pair.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    collect_reversed_pair_edits(sql, on_expr, current_source, previous_source, &mut edits);
+
+    if edits.is_empty() {
         return None;
     }
 
-    let (start, end) = expr_statement_offsets(ctx, on_expr)?;
-    let span = ctx.span_from_statement_offset(start, end);
-    if span_contains_comment(ctx, span) {
-        return None;
-    }
+    // Sort edits by position (ascending) for deterministic application.
+    edits.sort_by_key(|(start, _, _)| *start);
 
-    Some((span, rewritten.to_string()))
+    // Build replacement by applying text edits to the overall ON expression
+    // source span.
+    let (expr_start, expr_end) = expr_statement_offsets(ctx, on_expr)?;
+    let expr_span = ctx.span_from_statement_offset(expr_start, expr_end);
+
+    let source = &sql[expr_start..expr_end];
+    let mut result = String::with_capacity(source.len());
+    let mut cursor = expr_start;
+
+    for (edit_start, edit_end, replacement) in &edits {
+        if *edit_start < cursor {
+            // Overlapping edits — bail out to avoid corruption.
+            return None;
+        }
+        result.push_str(&sql[cursor..*edit_start]);
+        result.push_str(replacement);
+        cursor = *edit_end;
+    }
+    result.push_str(&sql[cursor..expr_end]);
+
+    Some((expr_span, result))
 }
 
-fn flip_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
-    match op {
-        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Spaceship => Some(op.clone()),
-        BinaryOperator::Lt => Some(BinaryOperator::Gt),
-        BinaryOperator::Gt => Some(BinaryOperator::Lt),
-        BinaryOperator::LtEq => Some(BinaryOperator::GtEq),
-        BinaryOperator::GtEq => Some(BinaryOperator::LtEq),
-        _ => None,
-    }
-}
-
-fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_source: &str) {
+/// Walk the AST and collect source-text edits for each reversed comparison
+/// pair. Each edit replaces `left op right` with `right flipped_op left`
+/// using the original source text for both operands.
+fn collect_reversed_pair_edits(
+    sql: &str,
+    expr: &Expr,
+    current_source: &str,
+    previous_source: &str,
+    edits: &mut Vec<(usize, usize, String)>,
+) {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if is_comparison_operator(op) {
@@ -295,15 +315,33 @@ fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_s
                 if left_prefix.as_deref() == Some(current_source)
                     && right_prefix.as_deref() == Some(previous_source)
                 {
-                    std::mem::swap(left, right);
-                    if let Some(flipped) = flip_comparison_operator(op) {
-                        *op = flipped;
+                    // Extract source text for left and right operands.
+                    if let (Some((l_start, l_end)), Some((r_start, r_end))) = (
+                        expr_span_offsets(sql, left),
+                        expr_span_offsets(sql, right),
+                    ) {
+                        let gap = &sql[l_end..r_start];
+                        // Skip if the gap contains a comment — swapping could
+                        // misplace or corrupt it.
+                        if gap.contains("--") || gap.contains("/*") {
+                            return;
+                        }
+                        let left_text = &sql[l_start..l_end];
+                        let right_text = &sql[r_start..r_end];
+                        let op_text = flip_operator_text(gap, op);
+
+                        // Replace the entire `left op right` span with `right op left`.
+                        let replacement =
+                            format!("{right_text}{op_text}{left_text}");
+                        edits.push((l_start, r_end, replacement));
+                        return; // Don't recurse into children we just handled.
                     }
                 }
             }
 
-            rewrite_reversed_join_pairs(left, current_source, previous_source);
-            rewrite_reversed_join_pairs(right, current_source, previous_source);
+            // Recurse into children for logical connectives (AND, OR).
+            collect_reversed_pair_edits(sql, left, current_source, previous_source, edits);
+            collect_reversed_pair_edits(sql, right, current_source, previous_source, edits);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::Nested(inner)
@@ -316,14 +354,14 @@ fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_s
         | Expr::IsUnknown(inner)
         | Expr::IsNotUnknown(inner)
         | Expr::Cast { expr: inner, .. } => {
-            rewrite_reversed_join_pairs(inner, current_source, previous_source)
+            collect_reversed_pair_edits(sql, inner, current_source, previous_source, edits)
         }
         Expr::InList {
             expr: target, list, ..
         } => {
-            rewrite_reversed_join_pairs(target, current_source, previous_source);
+            collect_reversed_pair_edits(sql, target, current_source, previous_source, edits);
             for item in list {
-                rewrite_reversed_join_pairs(item, current_source, previous_source);
+                collect_reversed_pair_edits(sql, item, current_source, previous_source, edits);
             }
         }
         Expr::Between {
@@ -332,9 +370,9 @@ fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_s
             high,
             ..
         } => {
-            rewrite_reversed_join_pairs(target, current_source, previous_source);
-            rewrite_reversed_join_pairs(low, current_source, previous_source);
-            rewrite_reversed_join_pairs(high, current_source, previous_source);
+            collect_reversed_pair_edits(sql, target, current_source, previous_source, edits);
+            collect_reversed_pair_edits(sql, low, current_source, previous_source, edits);
+            collect_reversed_pair_edits(sql, high, current_source, previous_source, edits);
         }
         Expr::Case {
             operand,
@@ -343,23 +381,56 @@ fn rewrite_reversed_join_pairs(expr: &mut Expr, current_source: &str, previous_s
             ..
         } => {
             if let Some(operand) = operand {
-                rewrite_reversed_join_pairs(operand, current_source, previous_source);
+                collect_reversed_pair_edits(sql, operand, current_source, previous_source, edits);
             }
             for case_when in conditions {
-                rewrite_reversed_join_pairs(
-                    &mut case_when.condition,
+                collect_reversed_pair_edits(
+                    sql,
+                    &case_when.condition,
                     current_source,
                     previous_source,
+                    edits,
                 );
-                rewrite_reversed_join_pairs(&mut case_when.result, current_source, previous_source);
+                collect_reversed_pair_edits(
+                    sql,
+                    &case_when.result,
+                    current_source,
+                    previous_source,
+                    edits,
+                );
             }
             if let Some(else_result) = else_result {
-                rewrite_reversed_join_pairs(else_result, current_source, previous_source);
+                collect_reversed_pair_edits(
+                    sql,
+                    else_result,
+                    current_source,
+                    previous_source,
+                    edits,
+                );
             }
         }
         _ => {}
     }
 }
+
+/// Given the source text between the left and right operands (which contains
+/// whitespace + operator + whitespace), return it with the operator flipped
+/// for directional comparison operators.
+fn flip_operator_text(gap: &str, op: &BinaryOperator) -> String {
+    match op {
+        // Symmetric operators — no change needed.
+        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Spaceship => {
+            gap.to_string()
+        }
+        // Directional operators — flip the operator while preserving surrounding whitespace.
+        BinaryOperator::Lt => gap.replacen('<', ">", 1),
+        BinaryOperator::Gt => gap.replacen('>', "<", 1),
+        BinaryOperator::LtEq => gap.replacen("<=", ">=", 1),
+        BinaryOperator::GtEq => gap.replacen(">=", "<=", 1),
+        _ => gap.to_string(),
+    }
+}
+
 
 fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usize)> {
     if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
@@ -387,61 +458,6 @@ fn expr_span_offsets(sql: &str, expr: &Expr) -> Option<(usize, usize)> {
     let start = line_col_to_offset(sql, span.start.line as usize, span.start.column as usize)?;
     let end = line_col_to_offset(sql, span.end.line as usize, span.end.column as usize)?;
     (end >= start).then_some((start, end))
-}
-
-fn span_contains_comment(ctx: &LintContext, span: Span) -> bool {
-    let from_document_tokens = ctx.with_document_tokens(|tokens| {
-        if tokens.is_empty() {
-            return None;
-        }
-        Some(tokens.iter().any(|token| {
-            let Some((start, end)) = token_with_span_offsets(ctx.sql, token) else {
-                return false;
-            };
-            start >= span.start && end <= span.end && is_comment_token(&token.token)
-        }))
-    });
-
-    if let Some(has_comment) = from_document_tokens {
-        return has_comment;
-    }
-
-    let Some(tokens) = tokenize_statement_with_spans(ctx.statement_sql(), ctx.dialect()) else {
-        return false;
-    };
-    let statement_span = Span::new(
-        span.start.saturating_sub(ctx.statement_range.start),
-        span.end.saturating_sub(ctx.statement_range.start),
-    );
-    tokens.iter().any(|token| {
-        let Some((start, end)) = token_with_span_offsets(ctx.statement_sql(), token) else {
-            return false;
-        };
-        start >= statement_span.start && end <= statement_span.end && is_comment_token(&token.token)
-    })
-}
-
-fn tokenize_statement_with_spans(
-    sql: &str,
-    dialect: crate::types::Dialect,
-) -> Option<Vec<TokenWithSpan>> {
-    let dialect = dialect.to_sqlparser_dialect();
-    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
-    tokenizer.tokenize_with_location().ok()
-}
-
-fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
-    let start = line_col_to_offset(
-        sql,
-        token.span.start.line as usize,
-        token.span.start.column as usize,
-    )?;
-    let end = line_col_to_offset(
-        sql,
-        token.span.end.line as usize,
-        token.span.end.column as usize,
-    )?;
-    Some((start, end))
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -481,17 +497,6 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
     }
 
     None
-}
-
-fn is_comment_token(token: &Token) -> bool {
-    matches!(
-        token,
-        Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_))
-    )
-}
-
-fn exprs_equivalent(left: &Expr, right: &Expr) -> bool {
-    format!("{left}") == format!("{right}")
 }
 
 fn expr_qualified_prefix(expr: &Expr) -> Option<String> {
@@ -654,5 +659,57 @@ mod tests {
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_ST_009);
+    }
+
+    #[test]
+    fn autofix_preserves_parentheses_around_condition() {
+        // SQLFluff: test_fail_later_table_first_brackets_after_on
+        let sql = "select foo.a, bar.b from foo left join bar on (bar.a = foo.a)";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_edits(sql, &issues[0].autofix.as_ref().unwrap().edits);
+        assert_eq!(
+            fixed,
+            "select foo.a, bar.b from foo left join bar on (foo.a = bar.a)"
+        );
+    }
+
+    #[test]
+    fn autofix_preserves_multiline_formatting_and_keyword_case() {
+        // SQLFluff: test_fail_later_table_first_multiple_subconditions
+        let sql = "select\n    foo.a,\n    foo.b,\n    bar.c\nfrom foo\nleft join bar\n    on bar.a = foo.a\n    and bar.b = foo.b\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_edits(sql, &issues[0].autofix.as_ref().unwrap().edits);
+        assert_eq!(
+            fixed,
+            "select\n    foo.a,\n    foo.b,\n    bar.c\nfrom foo\nleft join bar\n    on foo.a = bar.a\n    and foo.b = bar.b\n"
+        );
+    }
+
+    #[test]
+    fn autofix_flips_directional_comparison_operators() {
+        // SQLFluff: test_fail_later_table_first_multiple_comparison_operators (single join)
+        let sql = "select foo.a, bar.b from foo left join bar on bar.a != foo.a and bar.b > foo.b and bar.c <= foo.c";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_edits(sql, &issues[0].autofix.as_ref().unwrap().edits);
+        assert_eq!(
+            fixed,
+            "select foo.a, bar.b from foo left join bar on foo.a != bar.a and foo.b < bar.b and foo.c >= bar.c"
+        );
+    }
+
+    #[test]
+    fn autofix_preserves_quoted_identifiers() {
+        // SQLFluff: test_fail_later_table_first_quoted_table_not_columns
+        let sql = "select\n    \"foo\".\"a\",\n    \"bar\".\"b\"\nfrom foo\nleft join \"bar\"\n    on \"bar\".\"a\" = \"foo\".\"a\"\n    and \"bar\".\"b\" = foo.\"b\"\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_edits(sql, &issues[0].autofix.as_ref().unwrap().edits);
+        assert_eq!(
+            fixed,
+            "select\n    \"foo\".\"a\",\n    \"bar\".\"b\"\nfrom foo\nleft join \"bar\"\n    on \"foo\".\"a\" = \"bar\".\"a\"\n    and foo.\"b\" = \"bar\".\"b\"\n"
+        );
     }
 }

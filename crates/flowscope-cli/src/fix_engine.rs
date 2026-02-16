@@ -194,7 +194,23 @@ pub fn protected_ranges_from_tokenizer(sql: &str, dialect: Dialect) -> Vec<Prote
             continue;
         };
         if start_byte < end_byte {
-            ranges.push(ProtectedRange::new(start_byte, end_byte, kind));
+            // Exclude trailing newlines from single-line comment protection.
+            // The newline is a line separator, not comment content — other rules
+            // may need to adjust it when rearranging lines.
+            let mut adjusted_end = end_byte;
+            if matches!(
+                &token.token,
+                Token::Whitespace(Whitespace::SingleLineComment { .. })
+            ) {
+                while adjusted_end > start_byte
+                    && matches!(sql.as_bytes().get(adjusted_end - 1), Some(b'\n' | b'\r'))
+                {
+                    adjusted_end -= 1;
+                }
+            }
+            if start_byte < adjusted_end {
+                ranges.push(ProtectedRange::new(start_byte, adjusted_end, kind));
+            }
         }
     }
 
