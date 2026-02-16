@@ -420,7 +420,27 @@ fn normalize_token(token: &str) -> String {
 
 fn is_keyword(token: &str) -> bool {
     let upper = token.trim().to_ascii_uppercase();
-    ALL_KEYWORDS.binary_search(&upper.as_str()).is_ok()
+    ALL_KEYWORDS.binary_search(&upper.as_str()).is_ok() && !is_non_keyword_identifier(&upper)
+}
+
+/// Returns true for words that sqlparser includes in `ALL_KEYWORDS` but that
+/// SQLFluff does not treat as keywords for RF04.  These fall into two groups:
+///
+///  1. Window/aggregate function names (compound names with underscores like
+///     `ROW_NUMBER`, `DATE_PART`) — excluding `CURRENT_*` / `LOCAL_*` /
+///     `SESSION_*` / `SYSTEM_*` which are SQL-standard reserved pseudo-functions.
+///  2. Dialect-specific parser tokens that are not general SQL keywords
+///     (`METADATA` for BigQuery, `CHANNEL` for PostgreSQL LISTEN/NOTIFY, etc.).
+fn is_non_keyword_identifier(upper: &str) -> bool {
+    if upper.contains('_')
+        && !upper.starts_with("CURRENT_")
+        && !upper.starts_with("LOCAL_")
+        && !upper.starts_with("SESSION_")
+        && !upper.starts_with("SYSTEM_")
+    {
+        return true;
+    }
+    matches!(upper, "CHANNEL" | "GENERATED" | "METADATA" | "STATUS")
 }
 
 #[cfg(test)]
@@ -664,6 +684,29 @@ mod tests {
     fn flags_keyword_as_column_name_postgres() {
         // SQLFluff: test_fail_keyword_as_column_name_postgres
         let issues = run("CREATE TABLE test_table (type varchar(30) NOT NULL)");
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn does_not_flag_function_name_as_keyword() {
+        // ROW_NUMBER is a window function name, not a SQL keyword.
+        assert!(run("SELECT ROW_NUMBER() OVER () AS row_number FROM t").is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_non_keyword_identifiers() {
+        // Words in sqlparser's ALL_KEYWORDS that are not treated as keywords
+        // by SQLFluff: METADATA, CHANNEL, STATUS, GENERATED.
+        assert!(run("WITH generated AS (SELECT 1 AS x) SELECT x FROM generated").is_empty());
+        assert!(run("SELECT x AS status FROM t").is_empty());
+        assert!(run("SELECT x AS metadata FROM t").is_empty());
+        assert!(run("SELECT x AS channel FROM t").is_empty());
+    }
+
+    #[test]
+    fn still_flags_current_date_as_keyword() {
+        // CURRENT_DATE is a SQL-standard reserved pseudo-function.
+        let issues = run("SELECT x AS current_date FROM t");
         assert_eq!(issues.len(), 1);
     }
 }
