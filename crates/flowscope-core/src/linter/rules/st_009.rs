@@ -161,21 +161,36 @@ fn check_table_factor_joins(
             if let Some(previous) = matching_previous {
                 let left = preference.left_source(current, previous.as_str());
                 let right = preference.right_source(current, previous.as_str());
-                let mut issue = Issue::info(
-                    issue_codes::LINT_ST_009,
-                    "Join condition ordering appears inconsistent with configured preference.",
-                )
-                .with_statement(ctx.statement_index);
 
                 if let Some((span, replacement)) = join_condition_autofix(ctx, on_expr, left, right)
                 {
-                    issue = issue.with_span(span).with_autofix_edits(
-                        IssueAutofixApplicability::Safe,
-                        vec![IssuePatchEdit::new(span, replacement)],
+                    issues.push(
+                        Issue::info(
+                            issue_codes::LINT_ST_009,
+                            "Join condition ordering appears inconsistent with configured preference.",
+                        )
+                        .with_statement(ctx.statement_index)
+                        .with_span(span)
+                        .with_autofix_edits(
+                            IssueAutofixApplicability::Safe,
+                            vec![IssuePatchEdit::new(span, replacement)],
+                        ),
+                    );
+                } else if let Some((expr_start, expr_end)) =
+                    expr_statement_offsets(ctx, on_expr)
+                {
+                    let span = ctx.span_from_statement_offset(expr_start, expr_end);
+                    issues.push(
+                        Issue::info(
+                            issue_codes::LINT_ST_009,
+                            "Join condition ordering appears inconsistent with configured preference.",
+                        )
+                        .with_statement(ctx.statement_index)
+                        .with_span(span),
                     );
                 }
-
-                issues.push(issue);
+                // Skip issues where neither the autofix nor the ON expression
+                // span can be resolved — these produce misleading L1:1 reports.
             }
         }
 
