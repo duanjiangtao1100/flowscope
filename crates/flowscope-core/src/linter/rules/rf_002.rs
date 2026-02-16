@@ -345,7 +345,11 @@ fn table_factor_value_table_alias(table_factor: &TableFactor) -> Option<String> 
 }
 
 fn is_value_table_function(table_factor: &TableFactor, dialect: Dialect) -> bool {
-    matches!(dialect, Dialect::Bigquery) && matches!(table_factor, TableFactor::UNNEST { .. })
+    // UNNEST produces a value table whose alias names a column, not a table.
+    // BigQuery parses UNNEST as a dedicated TableFactor; PostgreSQL also supports
+    // UNNEST in FROM and sqlparser emits the same AST node.
+    matches!(dialect, Dialect::Bigquery | Dialect::Postgres)
+        && matches!(table_factor, TableFactor::UNNEST { .. })
 }
 
 fn unqualified_references_in_select_scope(

@@ -93,7 +93,6 @@ fn check_query(
         ctx,
         allow_scalar,
         issues,
-        false,
         has_cte_column_list,
     );
 }
@@ -103,16 +102,10 @@ fn check_set_expr(
     ctx: &LintContext,
     allow_scalar: bool,
     issues: &mut Vec<Issue>,
-    in_set_rhs: bool,
     has_cte_column_list: bool,
 ) {
     match body {
         SetExpr::Select(select) => {
-            // In set-operation RHS branches, output column names come from the left side.
-            // Requiring aliases here creates noisy false positives on common UNION patterns.
-            if in_set_rhs {
-                return;
-            }
             // When a CTE has an explicit column list, the inner SELECT's column
             // names are automatically overridden, so aliases are not required.
             if has_cte_column_list {
@@ -139,8 +132,11 @@ fn check_set_expr(
         }
         SetExpr::Query(q) => check_query(q, ctx, allow_scalar, issues, has_cte_column_list),
         SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr(left, ctx, allow_scalar, issues, false, has_cte_column_list);
-            check_set_expr(right, ctx, allow_scalar, issues, true, has_cte_column_list);
+            check_set_expr(left, ctx, allow_scalar, issues, has_cte_column_list);
+            // In set-operation RHS branches, output column names come from the
+            // left side.  SQLFluff still requires aliases on scalar literals in
+            // these branches, so disable the `allow_scalar` exemption here.
+            check_set_expr(right, ctx, false, issues, has_cte_column_list);
         }
         SetExpr::Insert(stmt)
         | SetExpr::Update(stmt)
