@@ -181,6 +181,12 @@ fn function_candidates(
             continue;
         }
 
+        // Skip SQL keywords that can precede `(` but are not function calls
+        // (e.g. `IN (...)`, `AS (...)`, `EXISTS (...)`).
+        if is_non_function_sql_keyword(word.value.as_str()) {
+            continue;
+        }
+
         let next_index = next_non_trivia_index(tokens, index + 1);
         let is_regular_function_call = next_index
             .map(|idx| matches!(tokens[idx].token, Token::LParen))
@@ -459,6 +465,33 @@ fn is_bare_function_keyword(value: &str) -> bool {
     matches!(
         value.to_ascii_uppercase().as_str(),
         "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME" | "LOCALTIMESTAMP"
+    )
+}
+
+/// SQL clause/operator keywords that can precede `(` but are not function calls.
+/// Without AST context, these would be false-positive function candidates.
+fn is_non_function_sql_keyword(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        // Operators and predicates
+        "IN" | "NOT" | "EXISTS" | "BETWEEN" | "LIKE" | "ILIKE"
+            // Logical operators
+            | "AND" | "OR" | "IS"
+            // Clause keywords that precede parenthesized content
+            | "AS" | "ON" | "USING" | "OVER" | "FILTER" | "WITHIN"
+            // Quantified comparison operators
+            | "ANY" | "ALL" | "SOME"
+            // DML/DDL clause heads
+            | "VALUES" | "SET" | "INTO" | "FROM" | "WHERE" | "HAVING"
+            | "SELECT" | "TABLE" | "JOIN"
+            // Set operations and CTE
+            | "UNION" | "INTERSECT" | "EXCEPT" | "WITH" | "RECURSIVE"
+            // CASE expression parts
+            | "WHEN" | "THEN" | "ELSE" | "END" | "CASE"
+            // Ordering/grouping
+            | "GROUP" | "ORDER" | "PARTITION" | "LIMIT" | "OFFSET" | "FETCH"
+            // Literals and modifiers
+            | "NULL" | "TRUE" | "FALSE" | "DISTINCT" | "LATERAL"
     )
 }
 
