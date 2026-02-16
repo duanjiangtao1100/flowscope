@@ -4441,6 +4441,8 @@ mod tests {
 
     #[test]
     fn rewrite_mode_falls_back_to_core_plan_when_core_rule_is_not_improved() {
+        // Consistent mode normalizes to whichever style appears first.
+        // `<>` is first, so the fix normalizes `!=` to `<>`.
         let sql = "SELECT * FROM t WHERE a <> b AND c != d";
         let out = apply_lint_fixes_with_options(
             sql,
@@ -4455,18 +4457,18 @@ mod tests {
 
         assert_eq!(fix_count_for_code(&out.counts, issue_codes::LINT_CV_001), 1);
         assert!(
-            out.sql.contains("a != b"),
+            out.sql.contains("a <> b"),
             "expected CV001 style fix: {}",
             out.sql
         );
         assert!(
-            out.sql.contains("c != d"),
+            out.sql.contains("c <> d"),
             "expected CV001 style fix: {}",
             out.sql
         );
         assert!(
-            !out.sql.contains("<>"),
-            "expected no angle-style operator: {}",
+            !out.sql.contains("!="),
+            "expected no bang-style operator: {}",
             out.sql
         );
     }

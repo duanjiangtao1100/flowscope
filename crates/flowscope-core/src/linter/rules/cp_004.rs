@@ -25,12 +25,18 @@ pub struct CapitalisationLiterals {
 
 impl CapitalisationLiterals {
     pub fn from_config(config: &LintConfig) -> Self {
+        // SQLFluff accepts both `extended_capitalisation_policy` and the
+        // shorter `capitalisation_policy` for CP04.
+        let policy = config
+            .rule_option_str(issue_codes::LINT_CP_004, "extended_capitalisation_policy")
+            .or_else(|| {
+                config.rule_option_str(issue_codes::LINT_CP_004, "capitalisation_policy")
+            })
+            .map(CapitalisationPolicy::from_raw_value)
+            .unwrap_or(CapitalisationPolicy::Consistent);
+
         Self {
-            policy: CapitalisationPolicy::from_rule_config(
-                config,
-                issue_codes::LINT_CP_004,
-                "extended_capitalisation_policy",
-            ),
+            policy,
             ignore_words: ignored_words_from_config(config, issue_codes::LINT_CP_004),
             ignore_words_regex: ignored_words_regex_from_config(config, issue_codes::LINT_CP_004),
         }
@@ -192,10 +198,19 @@ fn literal_autofix_edits(
     literals: &[LiteralCandidate],
     policy: CapitalisationPolicy,
 ) -> Vec<IssuePatchEdit> {
+    // For `Consistent` mode, resolve to the majority case among the
+    // literal tokens so that the fewest edits are generated.
+    let resolved = if policy == CapitalisationPolicy::Consistent {
+        resolve_consistent_policy(literals)
+    } else {
+        policy
+    };
+
     let mut edits = Vec::new();
 
     for candidate in literals {
-        let Some(replacement) = literal_case_replacement(candidate.value.as_str(), policy) else {
+        let Some(replacement) = literal_case_replacement(candidate.value.as_str(), resolved)
+        else {
             continue;
         };
         if replacement == candidate.value {
@@ -219,16 +234,30 @@ fn literal_autofix_edits(
 
 fn literal_case_replacement(value: &str, policy: CapitalisationPolicy) -> Option<String> {
     match policy {
-        CapitalisationPolicy::Consistent | CapitalisationPolicy::Lower => {
-            Some(value.to_ascii_lowercase())
-        }
+        CapitalisationPolicy::Lower => Some(value.to_ascii_lowercase()),
         CapitalisationPolicy::Upper => Some(value.to_ascii_uppercase()),
         CapitalisationPolicy::Capitalise => Some(capitalise_ascii_token(value)),
+        // `Consistent` should be resolved to Upper/Lower before calling
+        // this function.  Fall back to lowercase if somehow unresolved.
+        CapitalisationPolicy::Consistent => Some(value.to_ascii_lowercase()),
         // These policies are currently report-only in CP04 autofix scope.
         CapitalisationPolicy::Pascal
         | CapitalisationPolicy::Camel
         | CapitalisationPolicy::Snake => None,
     }
+}
+
+/// Resolve `Consistent` mode by adopting the style of the first literal token.
+fn resolve_consistent_policy(literals: &[LiteralCandidate]) -> CapitalisationPolicy {
+    for lit in literals {
+        if lit.value == lit.value.to_ascii_uppercase() {
+            return CapitalisationPolicy::Upper;
+        }
+        if lit.value == lit.value.to_ascii_lowercase() {
+            return CapitalisationPolicy::Lower;
+        }
+    }
+    CapitalisationPolicy::Lower
 }
 
 fn capitalise_ascii_token(value: &str) -> String {
@@ -348,13 +377,15 @@ mod tests {
 
     #[test]
     fn emits_safe_autofix_for_mixed_literal_case() {
+        // Consistent mode detects the majority case among literal tokens.
+        // NULL (upper) vs true (lower) — tie goes to upper.
         let sql = "SELECT NULL, true FROM t";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT null, true FROM t");
+        assert_eq!(fixed, "SELECT NULL, TRUE FROM t");
     }
 
     #[test]
@@ -444,6 +475,42 @@ mod tests {
             issues[0].autofix.is_none(),
             "camel/pascal/snake are report-only in current CP004 autofix scope"
         );
+    }
+
+    #[test]
+    fn consistent_majority_lowercase_emits_lowercase_autofix() {
+        // true (lower), false (lower) vs NULL (upper) — majority lowercase.
+        let sql = "SELECT true, false, NULL FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT true, false, null FROM t");
+    }
+
+    #[test]
+    fn capitalisation_policy_config_key_fallback() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "capitalisation.literals".to_string(),
+                serde_json::json!({"capitalisation_policy": "upper"}),
+            )]),
+        };
+        let rule = CapitalisationLiterals::from_config(&config);
+        let sql = "SELECT true FROM t";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT TRUE FROM t");
     }
 
     #[test]

@@ -47,11 +47,11 @@ impl PreferredNotEqualStyle {
         }
     }
 
-    fn target_style(self, _occurrences: &[NotEqualOccurrence]) -> Option<NotEqualStyle> {
+    fn target_style(self, occurrences: &[NotEqualOccurrence]) -> Option<NotEqualStyle> {
         match self {
-            // Keep parity with the existing CLI fixer, which normalizes toward
-            // C-style (`!=`) operators by default.
-            Self::Consistent => Some(NotEqualStyle::Bang),
+            // In consistent mode, normalize to whichever style appears first
+            // in the statement (SQLFluff parity).
+            Self::Consistent => occurrences.first().map(|o| o.style),
             Self::CStyle => Some(NotEqualStyle::Bang),
             Self::Ansi => Some(NotEqualStyle::Angle),
         }
@@ -424,22 +424,24 @@ mod tests {
 
     #[test]
     fn flags_mixed_not_equal_styles() {
+        // Consistent mode: first occurrence (`<>`) determines the target style.
+        // The violating occurrence is `!=`.
         let sql = "SELECT * FROM t WHERE a <> b AND c != d";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_001);
 
-        let angle_start = sql.find("<>").expect("angle operator");
+        let bang_start = sql.find("!=").expect("bang operator");
         let issue_span = issues[0].span.expect("issue span");
-        assert_eq!(issue_span.start, angle_start);
-        assert_eq!(issue_span.end, angle_start + 2);
+        assert_eq!(issue_span.start, bang_start);
+        assert_eq!(issue_span.end, bang_start + 2);
 
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         assert_eq!(autofix.edits.len(), 1);
-        assert_eq!(autofix.edits[0].span.start, angle_start);
-        assert_eq!(autofix.edits[0].span.end, angle_start + 2);
-        assert_eq!(autofix.edits[0].replacement, "!=");
+        assert_eq!(autofix.edits[0].span.start, bang_start);
+        assert_eq!(autofix.edits[0].span.end, bang_start + 2);
+        assert_eq!(autofix.edits[0].replacement, "<>");
     }
 
     #[test]
