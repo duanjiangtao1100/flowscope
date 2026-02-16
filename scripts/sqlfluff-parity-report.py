@@ -241,7 +241,10 @@ def run_flowscope_lint(
                 data = json.loads(result.stdout)
                 violations = data[0].get("violations", []) if data else []
                 if rule:
-                    violations = [v for v in violations if v.get("code") == rule]
+                    rule_set = {c.strip() for c in rule.split(",")}
+                    violations = [
+                        v for v in violations if v.get("code") in rule_set
+                    ]
                 return violations
             except (json.JSONDecodeError, IndexError, KeyError):
                 return []
