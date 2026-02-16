@@ -189,7 +189,8 @@ fn type_candidates_from_tokens(
                     && (is_tracked_type_name(word.value.as_str())
                         || user_defined_types.contains(&word.value.to_ascii_uppercase()))
                     && !token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex)
-                    && !is_keyword_after_as(tokens, index);
+                    && !is_keyword_after_as(tokens, index)
+                    && !is_constructor_or_function_call(tokens, index);
                 if is_candidate {
                     let (start, end) = token_with_span_offsets(sql, token)?;
                     let local_start = start.checked_sub(statement_start)?;
@@ -455,6 +456,56 @@ fn next_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<u
     None
 }
 
+/// Returns true when a tracked type-name token is being used as a function
+/// call or array constructor rather than as a type annotation.
+///
+/// Examples that should be skipped:
+///   `ARRAY[1, 2, 3]`  — array constructor (not a type)
+///   `DATE(col)`        — function call (not a type)
+///
+/// Counter-examples that are legitimate type contexts:
+///   `col::DATE`        — cast
+///   `VARCHAR(255)`     — type with precision
+///   `TEXT[]`           — type with array modifier
+fn is_constructor_or_function_call(tokens: &[TokenWithSpan], index: usize) -> bool {
+    let Token::Word(word) = &tokens[index].token else {
+        return false;
+    };
+    let Some(next_idx) = next_non_trivia_index(tokens, index + 1) else {
+        return false;
+    };
+    let upper = word.value.to_ascii_uppercase();
+    match &tokens[next_idx].token {
+        // `ARRAY[...]` is an array constructor.
+        Token::LBracket => upper == "ARRAY",
+        // `DATE(...)`, `STRUCT(...)`, etc. are function/constructor calls.
+        // Types that legitimately take parenthesised precision are excluded.
+        Token::LParen => !type_takes_precision(&upper),
+        _ => false,
+    }
+}
+
+/// Returns `true` for type names where `TYPE(n)` is a valid type-precision
+/// annotation rather than a function call.
+fn type_takes_precision(upper: &str) -> bool {
+    matches!(
+        upper,
+        "VARCHAR"
+            | "CHAR"
+            | "NUMERIC"
+            | "DECIMAL"
+            | "FLOAT"
+            | "DOUBLE"
+            | "TIMESTAMP"
+            | "TIME"
+            | "INT"
+            | "INTEGER"
+            | "BIGINT"
+            | "SMALLINT"
+            | "TINYINT"
+    )
+}
+
 fn is_tracked_type_name(value: &str) -> bool {
     matches!(
         value.to_ascii_uppercase().as_str(),
@@ -653,5 +704,26 @@ mod tests {
             },
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn array_constructor_is_not_a_type_candidate() {
+        // ARRAY[]::text[] — ARRAY is a constructor, not a type annotation.
+        // Only `text` remains as a type candidate, so no inconsistency.
+        assert!(run("SELECT COALESCE(x, ARRAY[]::text[]) FROM t").is_empty());
+    }
+
+    #[test]
+    fn date_function_is_not_a_type_candidate() {
+        // DATE(col) is a function call, not a type annotation.
+        assert!(run("SELECT DATE(created_at), col::text FROM t").is_empty());
+    }
+
+    #[test]
+    fn date_cast_is_still_a_type_candidate() {
+        // col::DATE is a type cast — DATE here IS a type candidate.
+        // Mixed with lowercase `text` triggers a violation.
+        let issues = run("SELECT col::DATE, x::text FROM t");
+        assert_eq!(issues.len(), 1);
     }
 }
