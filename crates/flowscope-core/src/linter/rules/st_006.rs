@@ -38,27 +38,26 @@ impl LintRule for StructureColumnOrder {
             }
         });
 
-        let mut autofix_candidates = st006_autofix_candidates_for_context(ctx, &violations_info);
-        autofix_candidates.sort_by_key(|candidate| candidate.span.start);
-        let candidates_align = autofix_candidates.len() == violations_info.len();
+        let resolved = st006_resolve_violations(ctx, &violations_info);
 
-        violations_info
-            .iter()
-            .enumerate()
-            .map(|(index, _info)| {
+        // Only emit violations that could be pinpointed in the token stream.
+        // When a violation has no span, the detection may be unreliable and
+        // SQLFluff would not emit in this case either.
+        resolved
+            .into_iter()
+            .filter_map(|r| {
+                let span = r.span?;
                 let mut issue = Issue::info(
                     issue_codes::LINT_ST_006,
                     "Prefer simple columns before complex expressions in SELECT.",
                 )
-                .with_statement(ctx.statement_index);
-                if candidates_align {
-                    let candidate = &autofix_candidates[index];
-                    issue = issue.with_span(candidate.span).with_autofix_edits(
-                        IssueAutofixApplicability::Safe,
-                        candidate.edits.clone(),
-                    );
+                .with_statement(ctx.statement_index)
+                .with_span(span);
+                if let Some(edits) = r.edits {
+                    issue =
+                        issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
                 }
-                issue
+                Some(issue)
             })
             .collect()
     }
@@ -389,10 +388,60 @@ struct St006AutofixCandidate {
     edits: Vec<IssuePatchEdit>,
 }
 
-fn st006_autofix_candidates_for_context(
+/// A violation resolved to a span (location in token stream), with optional
+/// autofix edits. Violations without a span are suppressed — the detection
+/// may be unreliable when the token stream doesn't match the AST.
+struct ResolvedViolation {
+    span: Option<Span>,
+    edits: Option<Vec<IssuePatchEdit>>,
+}
+
+/// Resolve each violation to a token-stream span and, when safe, autofix edits.
+fn st006_resolve_violations(
     ctx: &LintContext,
     violations: &[ViolationInfo],
-) -> Vec<St006AutofixCandidate> {
+) -> Vec<ResolvedViolation> {
+    let candidates = st006_autofix_candidates_for_context(ctx, violations);
+
+    // If candidates align 1:1 with violations, use them for spans and edits.
+    if candidates.len() == violations.len() {
+        return candidates
+            .into_iter()
+            .map(|c| ResolvedViolation {
+                span: Some(c.span),
+                edits: if c.edits.is_empty() {
+                    None
+                } else {
+                    Some(c.edits)
+                },
+            })
+            .collect();
+    }
+
+    // Candidates don't align — try to at least find spans by matching
+    // segments to violations.
+    let spans = st006_violation_spans(ctx, violations);
+    if spans.len() == violations.len() {
+        return spans
+            .into_iter()
+            .map(|span| ResolvedViolation {
+                span: Some(span),
+                edits: None,
+            })
+            .collect();
+    }
+
+    // Can't resolve any violations to spans.
+    violations
+        .iter()
+        .map(|_| ResolvedViolation {
+            span: None,
+            edits: None,
+        })
+        .collect()
+}
+
+fn positioned_tokens_for_context(ctx: &LintContext) -> Vec<PositionedToken> {
     let from_document_tokens = ctx.with_document_tokens(|tokens| {
         if tokens.is_empty() {
             return None;
@@ -413,7 +462,7 @@ fn st006_autofix_candidates_for_context(
         Some(positioned)
     });
 
-    let tokens = if let Some(tokens) = from_document_tokens {
+    if let Some(tokens) = from_document_tokens {
         tokens
     } else {
         let Some(tokens) = tokenize_with_spans(ctx.statement_sql(), ctx.dialect()) else {
@@ -432,8 +481,14 @@ fn st006_autofix_candidates_for_context(
             });
         }
         positioned
-    };
+    }
+}
 
+fn st006_autofix_candidates_for_context(
+    ctx: &LintContext,
+    violations: &[ViolationInfo],
+) -> Vec<St006AutofixCandidate> {
+    let tokens = positioned_tokens_for_context(ctx);
     let segments = select_projection_segments(&tokens);
 
     // We need to match segments to violations. Since we skip some SELECTs
@@ -473,6 +528,37 @@ fn st006_autofix_candidates_for_context(
     }
 
     candidates
+}
+
+/// Resolve violations to spans without autofix, using the same segment-matching
+/// logic as the autofix path but without requiring the reorder to succeed.
+fn st006_violation_spans(ctx: &LintContext, violations: &[ViolationInfo]) -> Vec<Span> {
+    let tokens = positioned_tokens_for_context(ctx);
+    let segments = select_projection_segments(&tokens);
+
+    if segments.len() < violations.len() {
+        return Vec::new();
+    }
+
+    let mut spans = Vec::new();
+    let mut violation_idx = 0;
+    for segment in &segments {
+        if violation_idx >= violations.len() {
+            break;
+        }
+        let violation = &violations[violation_idx];
+        if segment.item_spans.len() != violation.bands.len() {
+            continue;
+        }
+
+        // Use the first item span as the violation location.
+        if let Some(first) = segment.item_spans.first() {
+            spans.push(*first);
+        }
+        violation_idx += 1;
+    }
+
+    spans
 }
 
 fn select_projection_segments(tokens: &[PositionedToken]) -> Vec<SelectProjectionSegment> {
