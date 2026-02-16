@@ -85,7 +85,8 @@ impl LintRule for ReferencesSpecialChars {
         let dialect = ctx.dialect();
         let has_special_chars = collect_identifier_candidates(statement)
             .into_iter()
-            .any(|candidate| candidate_triggers_rule(&candidate, self, dialect));
+            .any(|candidate| candidate_triggers_rule(&candidate, self, dialect))
+            || show_tblproperties_property_key_triggers_rule(ctx.statement_sql(), self, dialect);
 
         if has_special_chars {
             vec![Issue::warning(
@@ -177,6 +178,46 @@ fn candidate_triggers_rule(
         &candidate.value,
         &rule.additional_allowed_characters,
         rule.allow_space_in_identifier,
+    )
+}
+
+fn show_tblproperties_property_key_triggers_rule(
+    sql: &str,
+    rule: &ReferencesSpecialChars,
+    dialect: Dialect,
+) -> bool {
+    if !matches!(dialect, Dialect::Databricks) {
+        return false;
+    }
+
+    // SparkSQL grammar uses a string literal for the optional property key in
+    // SHOW TBLPROPERTIES. SQLFluff still applies RF05 semantics to that key.
+    let lowered = sql.to_ascii_lowercase();
+    if !lowered.contains("show tblproperties") {
+        return false;
+    }
+
+    let Some(open_paren) = sql.find('(') else {
+        return false;
+    };
+    let Some(close_rel) = sql[open_paren + 1..].find(')') else {
+        return false;
+    };
+    let inside = sql[open_paren + 1..open_paren + 1 + close_rel].trim();
+    if inside.len() < 2 || !inside.starts_with('\'') || !inside.ends_with('\'') {
+        return false;
+    }
+
+    let property_key = inside.trim_matches('\'');
+    if is_ignored_token(property_key, rule) {
+        return false;
+    }
+
+    contains_disallowed_identifier_chars_with_extras(
+        property_key,
+        &rule.additional_allowed_characters,
+        rule.allow_space_in_identifier,
+        &['.'],
     )
 }
 
@@ -277,7 +318,10 @@ fn normalize_token(token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
+    use crate::parser::parse_sql_with_dialect;
+    use crate::types::Dialect;
 
     fn run(sql: &str) -> Vec<Issue> {
         run_with_config(sql, LintConfig::default())
@@ -300,6 +344,25 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn run_in_dialect(sql: &str, dialect: Dialect) -> Vec<Issue> {
+        let statements = parse_sql_with_dialect(sql, dialect).expect("parse");
+        let rule = ReferencesSpecialChars::default();
+        let mut issues = Vec::new();
+        with_active_dialect(dialect, || {
+            for (index, statement) in statements.iter().enumerate() {
+                issues.extend(rule.check(
+                    statement,
+                    &LintContext {
+                        sql,
+                        statement_range: 0..sql.len(),
+                        statement_index: index,
+                    },
+                ));
+            }
+        });
+        issues
     }
 
     #[test]
@@ -422,5 +485,24 @@ mod tests {
             },
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn sparksql_show_tblproperties_allows_dot_in_property_key() {
+        let issues = run_in_dialect(
+            "SHOW TBLPROPERTIES customer ('created.date');",
+            Dialect::Databricks,
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn sparksql_show_tblproperties_flags_wildcard_in_property_key() {
+        let issues = run_in_dialect(
+            "SHOW TBLPROPERTIES customer ('created.*');",
+            Dialect::Databricks,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_RF_005);
     }
 }

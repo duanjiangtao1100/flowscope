@@ -115,7 +115,7 @@ fn operator_layout_violations(
     let tokens =
         tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
     let Some(tokens) = tokens else {
-        return Vec::new();
+        return operator_layout_violations_template_fallback(ctx.statement_sql(), line_position);
     };
     let sql = ctx.statement_sql();
     let mut violations = Vec::new();
@@ -164,6 +164,114 @@ fn operator_layout_violations(
     }
 
     violations
+}
+
+fn operator_layout_violations_template_fallback(
+    sql: &str,
+    line_position: OperatorLinePosition,
+) -> Vec<Lt03Violation> {
+    if !contains_template_marker(sql) {
+        return Vec::new();
+    }
+
+    if !matches!(line_position, OperatorLinePosition::Leading) {
+        return Vec::new();
+    }
+
+    let mut violations = Vec::new();
+    let line_ranges = line_ranges(sql);
+
+    for (index, (line_start, line_end)) in line_ranges.iter().copied().enumerate() {
+        let line = &sql[line_start..line_end];
+        let trimmed = line.trim_end();
+        let Some((op_start, op_end)) = trailing_operator_span_in_line(line, trimmed) else {
+            continue;
+        };
+
+        let Some(next_non_empty) = line_ranges
+            .iter()
+            .copied()
+            .skip(index + 1)
+            .find(|(start, end)| !sql[*start..*end].trim().is_empty())
+        else {
+            continue;
+        };
+        let next_line = sql[next_non_empty.0..next_non_empty.1].trim_start();
+        if !next_line.starts_with("{{")
+            && !next_line.starts_with("{%")
+            && !next_line.starts_with("{#")
+        {
+            continue;
+        }
+
+        violations.push(((line_start + op_start, line_start + op_end), Vec::new()));
+    }
+
+    violations
+}
+
+fn trailing_operator_span_in_line(line: &str, trimmed: &str) -> Option<(usize, usize)> {
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = [
+        "AND", "OR", "||", ">=", "<=", "!=", "<>", "=", "+", "-", "*", "/", "<", ">",
+    ];
+    for op in candidate {
+        if let Some(start) = trimmed.rfind(op) {
+            let end = start + op.len();
+            let suffix = &trimmed[end..];
+            if !suffix.chars().all(char::is_whitespace) {
+                continue;
+            }
+            if op.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                let left_ok = start == 0
+                    || !trimmed[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+                let right_ok = end >= trimmed.len()
+                    || !trimmed[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+                if !left_ok || !right_ok {
+                    continue;
+                }
+            }
+            if line[start..].trim_end().len() == op.len() {
+                return Some((start, end));
+            }
+        }
+    }
+
+    None
+}
+
+fn contains_template_marker(sql: &str) -> bool {
+    sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
+}
+
+fn line_ranges(sql: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for (idx, ch) in sql.char_indices() {
+        if ch == '\n' {
+            let mut end = idx;
+            if end > start && sql[start..end].ends_with('\r') {
+                end -= 1;
+            }
+            ranges.push((start, end));
+            start = idx + 1;
+        }
+    }
+    let mut end = sql.len();
+    if end > start && sql[start..end].ends_with('\r') {
+        end -= 1;
+    }
+    ranges.push((start, end));
+    ranges
 }
 
 fn safe_operator_autofix_edits(
@@ -317,7 +425,6 @@ fn whitespace_before_on_same_line(sql: &str, offset: usize, floor: usize) -> usi
     }
     pos
 }
-
 
 fn tokenized(sql: &str, dialect: Dialect) -> Option<Vec<TokenWithSpan>> {
     let dialect = dialect.to_sqlparser_dialect();
@@ -634,7 +741,8 @@ mod tests {
                 serde_json::json!({"line_position": "trailing"}),
             )]),
         };
-        let sql = "select\n    a -- comment1!\n    -- comment2!\n    -- comment3!\n    + b\nfrom foo";
+        let sql =
+            "select\n    a -- comment1!\n    -- comment2!\n    -- comment3!\n    + b\nfrom foo";
         let issues = run_with_rule(sql, &LayoutOperators::from_config(&config));
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
@@ -737,5 +845,22 @@ mod tests {
             &LayoutOperators::from_config(&config),
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn statementless_template_line_break_after_operator_is_flagged() {
+        let sql = "{% macro binary_literal(expression) %}\n  X'{{ expression }}'\n{% endmacro %}\n\nselect\n    *\nfrom my_table\nwhere\n    a =\n        {{ binary_literal(\"0000\") }}\n";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = LayoutOperators::default();
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
     }
 }

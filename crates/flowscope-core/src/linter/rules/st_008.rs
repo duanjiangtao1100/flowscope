@@ -71,7 +71,8 @@ fn st008_autofix_candidates(sql: &str, dialect: Dialect) -> Vec<St008AutofixCand
         }
 
         // Check if there's already a space between DISTINCT and `(`.
-        let has_space_before_paren = has_whitespace_between(&tokens, distinct_index, left_paren_index);
+        let has_space_before_paren =
+            has_whitespace_between(&tokens, distinct_index, left_paren_index);
 
         let Some((right_paren_index, has_projection_comma, has_subquery)) =
             find_matching_distinct_rparen(&tokens, left_paren_index)
@@ -83,8 +84,7 @@ fn st008_autofix_candidates(sql: &str, dialect: Dialect) -> Vec<St008AutofixCand
         }
 
         // Determine whether parens can be removed or only a space is needed.
-        let paren_removable =
-            next_token_allows_paren_removal(&tokens, right_paren_index + 1);
+        let paren_removable = next_token_allows_paren_removal(&tokens, right_paren_index + 1);
 
         // If parens are needed and there's already a space, no violation.
         if !paren_removable && has_space_before_paren {

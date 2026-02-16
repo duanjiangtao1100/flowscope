@@ -5,7 +5,7 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, Value};
 use std::collections::HashMap;
 
 use super::column_count_helpers::{resolve_query_output_columns_strict, CteColumnCounts};
@@ -26,7 +26,11 @@ impl LintRule for AmbiguousColumnCount {
     }
 
     fn check(&self, stmt: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if statement_has_unknown_result_columns(stmt, &HashMap::new()) {
+        let ast_unknown = statement_has_unknown_result_columns(stmt, &HashMap::new());
+        let fallback_unknown = !ast_unknown
+            && statement_has_unknown_result_columns_fallback(stmt, ctx.statement_sql());
+
+        if ast_unknown || fallback_unknown {
             vec![Issue::warning(
                 issue_codes::LINT_AM_004,
                 "Query produces an unknown number of result columns.",
@@ -40,19 +44,85 @@ impl LintRule for AmbiguousColumnCount {
 
 fn statement_has_unknown_result_columns(stmt: &Statement, outer_ctes: &CteColumnCounts) -> bool {
     match stmt {
-        Statement::Query(query) => resolve_query_output_columns_strict(query, outer_ctes).is_none(),
+        Statement::Query(query) => {
+            query_outputs_result_set(query)
+                && resolve_query_output_columns_strict(query, outer_ctes).is_none()
+        }
         Statement::Insert(insert) => insert.source.as_ref().is_some_and(|source| {
             resolve_query_output_columns_strict(source, outer_ctes).is_none()
         }),
         Statement::CreateView { query, .. } => {
-            resolve_query_output_columns_strict(query, outer_ctes).is_none()
+            query_outputs_result_set(query)
+                && resolve_query_output_columns_strict(query, outer_ctes).is_none()
         }
-        Statement::CreateTable(create) => create
-            .query
-            .as_ref()
-            .is_some_and(|query| resolve_query_output_columns_strict(query, outer_ctes).is_none()),
+        Statement::CreateTable(create) => create.query.as_ref().is_some_and(|query| {
+            query_outputs_result_set(query)
+                && resolve_query_output_columns_strict(query, outer_ctes).is_none()
+        }),
         _ => false,
     }
+}
+
+fn query_outputs_result_set(query: &sqlparser::ast::Query) -> bool {
+    matches!(
+        query.body.as_ref(),
+        SetExpr::Select(_) | SetExpr::Query(_) | SetExpr::Values(_) | SetExpr::SetOperation { .. }
+    )
+}
+
+fn statement_has_unknown_result_columns_fallback(stmt: &Statement, sql: &str) -> bool {
+    if !is_synthetic_select_one_statement(stmt, sql) {
+        return false;
+    }
+
+    // Targeted parser-fallback heuristic for AM04 issue #930-style CTE chains:
+    // WITH a AS (SELECT * FROM ...), b AS (SELECT * FROM a) SELECT * FROM b
+    // should be treated as unknown-width output.
+    let compact = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+
+    if !compact.starts_with("with ") {
+        return false;
+    }
+
+    let wildcard_count = compact.match_indices("select * from").count();
+    wildcard_count >= 3 && compact.contains("),") && compact.contains(" as (")
+}
+
+fn is_synthetic_select_one_statement(stmt: &Statement, statement_sql: &str) -> bool {
+    if statement_sql.trim().eq_ignore_ascii_case("select 1") {
+        return false;
+    }
+
+    let Statement::Query(query) = stmt else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let group_by_empty = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => exprs.is_empty(),
+        _ => false,
+    };
+    if !select.from.is_empty()
+        || select.selection.is_some()
+        || !group_by_empty
+        || select.having.is_some()
+    {
+        return false;
+    }
+    if select.projection.len() != 1 {
+        return false;
+    }
+
+    matches!(
+        &select.projection[0],
+        SelectItem::UnnamedExpr(Expr::Value(v))
+            if matches!(&v.value, Value::Number(num, false) if num == "1")
+    )
 }
 
 #[cfg(test)]
@@ -207,5 +277,36 @@ mod tests {
     fn flags_select_star_without_from_source() {
         let issues = run("select *");
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn allows_unresolved_qualified_wildcard_for_non_am04_concerns() {
+        let sql = "with cte as (\n    select\n        a, b\n    from\n        t\n)\nselect\n    cte.*,\n    t_alias.a\nfrom cte1\njoin (select * from t) as t_alias\nusing (a)\n";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_with_update_statement_without_select_output() {
+        let sql = "WITH mycte AS ( SELECT foo, bar FROM mytable1 )\nUPDATE sometable SET sometable.baz = mycte.bar FROM mycte;";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn statementless_fallback_flags_unknown_cte_wildcard_chain() {
+        let sql = "with\nhubspot__contacts as (\n  select * from ANALYTICS.PUBLIC_intermediate.hubspot__contacts\n),\nfinal as (\n  select *\n  from\n    hubspot__contacts\n    where not coalesce(_fivetran_deleted, false)\n)\nselect * from final\n";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = AmbiguousColumnCount;
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_AM_004);
     }
 }

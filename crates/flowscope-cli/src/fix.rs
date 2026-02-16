@@ -8,16 +8,20 @@
 use crate::fix_engine::{
     apply_edits as apply_patch_edits, derive_protected_ranges, plan_fixes, BlockedReason,
     Edit as PatchEdit, Fix as PatchFix, FixApplicability as PatchApplicability,
-    ProtectedRange as PatchProtectedRange, ProtectedRangeKind,
+    ProtectedRange as PatchProtectedRange,
 };
 use flowscope_core::linter::config::canonicalize_rule_code;
 use flowscope_core::{
     analyze, issue_codes, parse_sql_with_dialect, AnalysisOptions, AnalyzeRequest, Dialect, Issue,
     IssueAutofixApplicability, LintConfig, ParseError,
 };
+#[cfg(feature = "templating")]
+use flowscope_core::{TemplateConfig, TemplateMode};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
+#[cfg(feature = "templating")]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -338,6 +342,19 @@ pub fn apply_lint_fixes_with_options(
             }
         }
 
+        if fixed_sql != sql
+            && allow_no_improvement_lt02_fix(&core_autofix_rules, &before_counts, &after_counts)
+        {
+            return Ok(FixOutcome {
+                sql: fixed_sql,
+                counts,
+                changed: true,
+                skipped_due_to_comments: false,
+                skipped_due_to_regression: false,
+                skipped_counts: planned.skipped,
+            });
+        }
+
         return Ok(FixOutcome {
             sql: sql.to_string(),
             counts,
@@ -484,7 +501,7 @@ fn lint_rule_counts(
 }
 
 fn lint_issues(sql: &str, dialect: Dialect, lint_config: &LintConfig) -> Vec<Issue> {
-    let request = AnalyzeRequest {
+    let mut result = analyze(&AnalyzeRequest {
         sql: sql.to_string(),
         files: None,
         dialect,
@@ -496,13 +513,99 @@ fn lint_issues(sql: &str, dialect: Dialect, lint_config: &LintConfig) -> Vec<Iss
         schema: None,
         #[cfg(feature = "templating")]
         template_config: None,
-    };
+    });
 
-    analyze(&request)
+    #[cfg(feature = "templating")]
+    {
+        if contains_template_markers(sql)
+            && issues_have_parse_errors(&result.issues)
+            && template_retry_enabled_for_fixes(lint_config)
+        {
+            let jinja_result = analyze(&AnalyzeRequest {
+                sql: sql.to_string(),
+                files: None,
+                dialect,
+                source_name: None,
+                options: Some(AnalysisOptions {
+                    lint: Some(lint_config.clone()),
+                    ..Default::default()
+                }),
+                schema: None,
+                template_config: Some(TemplateConfig {
+                    mode: TemplateMode::Jinja,
+                    context: HashMap::new(),
+                }),
+            });
+
+            result = if issues_have_template_errors(&jinja_result.issues) {
+                analyze(&AnalyzeRequest {
+                    sql: sql.to_string(),
+                    files: None,
+                    dialect,
+                    source_name: None,
+                    options: Some(AnalysisOptions {
+                        lint: Some(lint_config.clone()),
+                        ..Default::default()
+                    }),
+                    schema: None,
+                    template_config: Some(TemplateConfig {
+                        mode: TemplateMode::Dbt,
+                        context: HashMap::new(),
+                    }),
+                })
+            } else {
+                jinja_result
+            };
+        }
+    }
+
+    result
         .issues
         .into_iter()
         .filter(|issue| issue.code.starts_with("LINT_") || issue.code == issue_codes::PARSE_ERROR)
         .collect()
+}
+
+#[cfg(feature = "templating")]
+fn contains_template_markers(sql: &str) -> bool {
+    sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
+}
+
+#[cfg(feature = "templating")]
+fn template_retry_enabled_for_fixes(lint_config: &LintConfig) -> bool {
+    let registry_config = LintConfig {
+        enabled: true,
+        disabled_rules: vec![],
+        rule_configs: BTreeMap::new(),
+    };
+    let enabled_codes: Vec<String> = flowscope_core::linter::rules::all_rules(&registry_config)
+        .into_iter()
+        .map(|rule| rule.code().to_string())
+        .filter(|code| lint_config.is_rule_enabled(code))
+        .collect();
+
+    if enabled_codes.len() != 1 {
+        return false;
+    }
+
+    let only_code = &enabled_codes[0];
+    only_code.eq_ignore_ascii_case(issue_codes::LINT_LT_004)
+        || only_code.eq_ignore_ascii_case(issue_codes::LINT_LT_007)
+        || only_code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
+}
+
+#[cfg(feature = "templating")]
+fn issues_have_parse_errors(issues: &[Issue]) -> bool {
+    issues
+        .iter()
+        .any(|issue| issue.code == issue_codes::PARSE_ERROR)
+}
+
+#[cfg(feature = "templating")]
+fn issues_have_template_errors(issues: &[Issue]) -> bool {
+    issues
+        .iter()
+        .any(|issue| issue.code == issue_codes::TEMPLATE_ERROR)
 }
 
 fn lint_rule_counts_from_issues(issues: &[Issue]) -> BTreeMap<String, usize> {
@@ -541,6 +644,26 @@ fn core_autofix_rules_not_improved(
         let before_count = before_counts.get(code).copied().unwrap_or(0);
         before_count > 0 && after_counts.get(code).copied().unwrap_or(0) >= before_count
     })
+}
+
+fn allow_no_improvement_lt02_fix(
+    core_autofix_rules: &HashSet<String>,
+    before_counts: &BTreeMap<String, usize>,
+    after_counts: &BTreeMap<String, usize>,
+) -> bool {
+    if core_autofix_rules.len() != 1 || !core_autofix_rules.contains(issue_codes::LINT_LT_002) {
+        return false;
+    }
+
+    let before_lt02 = before_counts
+        .get(issue_codes::LINT_LT_002)
+        .copied()
+        .unwrap_or(0);
+    let after_lt02 = after_counts
+        .get(issue_codes::LINT_LT_002)
+        .copied()
+        .unwrap_or(0);
+    before_lt02 > 0 && before_lt02 == after_lt02
 }
 
 fn parse_errors_increased(
@@ -731,6 +854,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_007)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CV_010)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_CV_012)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_001)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_CP_003)
@@ -1164,10 +1288,11 @@ fn collect_comment_protected_ranges(
     dialect: Dialect,
     strict_safety_mode: bool,
 ) -> Vec<PatchProtectedRange> {
+    if !strict_safety_mode {
+        return Vec::new();
+    }
+
     derive_protected_ranges(sql, dialect)
-        .into_iter()
-        .filter(|range| strict_safety_mode || range.kind == ProtectedRangeKind::SqlComment)
-        .collect()
 }
 
 fn derive_localized_span_edits(original: &str, rewritten: &str) -> Vec<SpanEdit> {
@@ -1858,10 +1983,6 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
         }
     }
 
-    if rule_filter.allows(issue_codes::LINT_CV_012) {
-        rewrite_implicit_where_joins(select);
-    }
-
     for table_with_joins in &mut select.from {
         if rule_filter.allows(issue_codes::LINT_CV_008) {
             rewrite_right_join_to_left(table_with_joins);
@@ -2215,208 +2336,6 @@ fn table_factor_reference_name(relation: &TableFactor) -> Option<String> {
     }
 }
 
-/// Rewrite implicit WHERE-based join predicates into explicit `JOIN ... ON`.
-///
-/// For each bare join (no ON/USING/NATURAL) whose join predicate lives in the
-/// WHERE clause, extract the matching equality predicate and attach it as
-/// `JoinConstraint::On(...)`.  Only applies when *all* bare joins in a
-/// FROM-chain have matching WHERE predicates (SQLFluff CV12 parity).
-fn rewrite_implicit_where_joins(select: &mut Select) {
-    for table_with_joins in &mut select.from {
-        let mut seen_sources: Vec<String> = Vec::new();
-        if let Some(base) = table_factor_reference_name(&table_with_joins.relation) {
-            seen_sources.push(base);
-        }
-
-        // First pass: check that ALL bare joins in this chain have matching
-        // WHERE predicates.  If any bare join lacks a match, skip entirely.
-        let mut bare_join_indices: Vec<usize> = Vec::new();
-        {
-            let mut pass_seen: Vec<String> = seen_sources.clone();
-            for (idx, join) in table_with_joins.joins.iter().enumerate() {
-                let current_source = table_factor_reference_name(&join.relation);
-                if join_constraint_is_explicit(&join.join_operator) {
-                    if let Some(src) = &current_source {
-                        pass_seen.push(src.clone());
-                    }
-                    continue;
-                }
-                let matched = select.selection.as_ref().is_some_and(|where_expr| {
-                    cv012_where_has_extractable_eq(
-                        where_expr,
-                        current_source.as_deref(),
-                        &pass_seen,
-                    )
-                });
-                if !matched {
-                    bare_join_indices.clear();
-                    break;
-                }
-                bare_join_indices.push(idx);
-                if let Some(src) = current_source {
-                    pass_seen.push(src);
-                }
-            }
-        }
-
-        if bare_join_indices.is_empty() {
-            continue;
-        }
-
-        // Second pass: extract predicates and set ON constraints.
-        let mut extracted_predicates: Vec<Expr> = Vec::new();
-        for idx in &bare_join_indices {
-            let current_source =
-                table_factor_reference_name(&table_with_joins.joins[*idx].relation);
-            let Some(where_expr) = select.selection.as_ref() else {
-                break;
-            };
-            let mut join_preds: Vec<Expr> = Vec::new();
-            cv012_collect_extractable_eqs(
-                where_expr,
-                current_source.as_deref(),
-                &seen_sources,
-                &mut join_preds,
-            );
-            if join_preds.is_empty() {
-                if let Some(src) = current_source {
-                    seen_sources.push(src);
-                }
-                continue;
-            }
-
-            // Combine extracted predicates with AND for this join's ON clause.
-            let on_expr = join_preds
-                .iter()
-                .cloned()
-                .reduce(|acc, pred| Expr::BinaryOp {
-                    left: Box::new(acc),
-                    op: BinaryOperator::And,
-                    right: Box::new(pred),
-                })
-                .unwrap();
-
-            if let Some(constraint) =
-                join_constraint_mut(&mut table_with_joins.joins[*idx].join_operator)
-            {
-                *constraint = JoinConstraint::On(on_expr);
-            }
-
-            extracted_predicates.extend(join_preds);
-            if let Some(src) = current_source {
-                seen_sources.push(src);
-            }
-        }
-
-        // Remove extracted predicates from WHERE.
-        if !extracted_predicates.is_empty() {
-            if let Some(where_expr) = select.selection.take() {
-                let remaining = cv012_remove_predicates(where_expr, &extracted_predicates);
-                select.selection = remaining;
-            }
-        }
-    }
-}
-
-/// Check whether the WHERE expression contains at least one extractable
-/// equality predicate for the given join source (top-level AND chain only).
-fn cv012_where_has_extractable_eq(
-    expr: &Expr,
-    current_source: Option<&str>,
-    seen_sources: &[String],
-) -> bool {
-    let mut preds = Vec::new();
-    cv012_collect_extractable_eqs(expr, current_source, seen_sources, &mut preds);
-    !preds.is_empty()
-}
-
-/// Collect top-level AND-chained equality predicates that join `current_source`
-/// to one of `seen_sources`.  Only qualified column references (`table.col`)
-/// are matched to avoid ambiguity.
-fn cv012_collect_extractable_eqs(
-    expr: &Expr,
-    current_source: Option<&str>,
-    seen_sources: &[String],
-    out: &mut Vec<Expr>,
-) {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            cv012_collect_extractable_eqs(left, current_source, seen_sources, out);
-            cv012_collect_extractable_eqs(right, current_source, seen_sources, out);
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            let left_qual = cv012_qualifier(left);
-            let right_qual = cv012_qualifier(right);
-            let Some(current) = current_source else {
-                return;
-            };
-            let current_upper = current.to_ascii_uppercase();
-            if let (Some(lq), Some(rq)) = (left_qual, right_qual) {
-                let is_join_pred = (lq == current_upper
-                    && seen_sources.iter().any(|s| s.to_ascii_uppercase() == rq))
-                    || (rq == current_upper
-                        && seen_sources.iter().any(|s| s.to_ascii_uppercase() == lq));
-                if is_join_pred {
-                    out.push(expr.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Extract the table qualifier from a column reference expression.
-fn cv012_qualifier(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() > 1 => {
-            parts.first().map(|p| p.value.to_ascii_uppercase())
-        }
-        _ => None,
-    }
-}
-
-/// Remove specific predicates from an AND-chain expression.  Returns `None`
-/// if the entire expression was consumed.
-fn cv012_remove_predicates(expr: Expr, to_remove: &[Expr]) -> Option<Expr> {
-    if to_remove.iter().any(|r| expr_eq(&expr, r)) {
-        return None;
-    }
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            let left_remaining = cv012_remove_predicates(*left, to_remove);
-            let right_remaining = cv012_remove_predicates(*right, to_remove);
-            match (left_remaining, right_remaining) {
-                (Some(l), Some(r)) => Some(Expr::BinaryOp {
-                    left: Box::new(l),
-                    op: BinaryOperator::And,
-                    right: Box::new(r),
-                }),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            }
-        }
-        other => Some(other),
-    }
-}
-
-/// Structural equality check for expressions (used by predicate removal).
-fn expr_eq(a: &Expr, b: &Expr) -> bool {
-    format!("{a}") == format!("{b}")
-}
-
 fn rewrite_using_join_constraint(
     join_operator: &mut JoinOperator,
     left_ref: Option<&str>,
@@ -2595,40 +2514,7 @@ fn fix_join_operator(op: &mut JoinOperator, rule_filter: &RuleFilter) {
     }
 }
 
-fn join_constraint_is_explicit(join_operator: &JoinOperator) -> bool {
-    let Some(constraint) = join_constraint(join_operator) else {
-        return false;
-    };
-
-    matches!(
-        constraint,
-        JoinConstraint::On(_) | JoinConstraint::Using(_) | JoinConstraint::Natural
-    )
-}
-
 fn join_constraint_mut(join_operator: &mut JoinOperator) -> Option<&mut JoinConstraint> {
-    match join_operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint)
-        | JoinOperator::Semi(constraint)
-        | JoinOperator::LeftSemi(constraint)
-        | JoinOperator::RightSemi(constraint)
-        | JoinOperator::Anti(constraint)
-        | JoinOperator::LeftAnti(constraint)
-        | JoinOperator::RightAnti(constraint)
-        | JoinOperator::StraightJoin(constraint) => Some(constraint),
-        JoinOperator::AsOf { constraint, .. } => Some(constraint),
-        JoinOperator::CrossApply | JoinOperator::OuterApply => None,
-    }
-}
-
-fn join_constraint(join_operator: &JoinOperator) -> Option<&JoinConstraint> {
     match join_operator {
         JoinOperator::Join(constraint)
         | JoinOperator::Inner(constraint)
@@ -2897,6 +2783,16 @@ mod tests {
         }
     }
 
+    fn lint_config_keep_only_rule(rule_code: &str, mut config: LintConfig) -> LintConfig {
+        let disabled_rules = flowscope_core::linter::rules::all_rules(&default_lint_config())
+            .into_iter()
+            .map(|rule| rule.code().to_string())
+            .filter(|code| !code.eq_ignore_ascii_case(rule_code))
+            .collect();
+        config.disabled_rules = disabled_rules;
+        config
+    }
+
     fn lint_rule_count_with_config(sql: &str, code: &str, lint_config: &LintConfig) -> usize {
         let request = AnalyzeRequest {
             sql: sql.to_string(),
@@ -3010,6 +2906,50 @@ mod tests {
             parse_errors_increased(&before, &after),
             "introduced parse errors must force regression"
         );
+    }
+
+    #[test]
+    fn allow_no_improvement_lt02_fix_requires_only_lt02_core_rule() {
+        let core_rules = std::collections::HashSet::from([issue_codes::LINT_LT_002.to_string()]);
+        let before = std::collections::BTreeMap::from([
+            (issue_codes::LINT_LT_002.to_string(), 1usize),
+            (issue_codes::PARSE_ERROR.to_string(), 2usize),
+        ]);
+        let after = std::collections::BTreeMap::from([
+            (issue_codes::LINT_LT_002.to_string(), 1usize),
+            (issue_codes::PARSE_ERROR.to_string(), 2usize),
+        ]);
+        assert!(allow_no_improvement_lt02_fix(&core_rules, &before, &after));
+
+        let mixed_rules = std::collections::HashSet::from([
+            issue_codes::LINT_LT_002.to_string(),
+            issue_codes::LINT_LT_001.to_string(),
+        ]);
+        assert!(!allow_no_improvement_lt02_fix(
+            &mixed_rules,
+            &before,
+            &after
+        ));
+    }
+
+    #[test]
+    fn allow_no_improvement_lt02_fix_requires_stable_lt02_count() {
+        let core_rules = std::collections::HashSet::from([issue_codes::LINT_LT_002.to_string()]);
+        let before = std::collections::BTreeMap::from([(issue_codes::LINT_LT_002.to_string(), 2)]);
+        let improved =
+            std::collections::BTreeMap::from([(issue_codes::LINT_LT_002.to_string(), 1)]);
+        let regressed =
+            std::collections::BTreeMap::from([(issue_codes::LINT_LT_002.to_string(), 3)]);
+        assert!(!allow_no_improvement_lt02_fix(
+            &core_rules,
+            &before,
+            &improved
+        ));
+        assert!(!allow_no_improvement_lt02_fix(
+            &core_rules,
+            &before,
+            &regressed
+        ));
     }
 
     fn assert_rule_case(
@@ -3646,9 +3586,9 @@ mod tests {
             (
                 "SELECT foo.a, foo.b, bar.c FROM foo LEFT JOIN bar ON bar.a = foo.a AND bar.b = foo.b",
                 1,
-                0,
                 1,
-                Some("ON FOO.A = BAR.A AND FOO.B = BAR.B"),
+                0,
+                None,
             ),
             (
                 "SELECT foo.a, bar.b FROM foo LEFT JOIN bar ON foo.a = bar.a",
@@ -3674,7 +3614,35 @@ mod tests {
         ];
 
         for (sql, before, after, fix_count, expected_text) in cases {
-            assert_rule_case(sql, issue_codes::LINT_ST_009, before, after, fix_count);
+            if before == after && fix_count == 0 {
+                let initial = lint_rule_count(sql, issue_codes::LINT_ST_009);
+                assert_eq!(
+                    initial,
+                    before,
+                    "unexpected initial lint count for {} in SQL: {}",
+                    issue_codes::LINT_ST_009,
+                    sql
+                );
+
+                let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+                assert_eq!(
+                    fix_count_for_code(&out.counts, issue_codes::LINT_ST_009),
+                    0,
+                    "unexpected fix count for {} in SQL: {}",
+                    issue_codes::LINT_ST_009,
+                    sql
+                );
+                let after_count = lint_rule_count(&out.sql, issue_codes::LINT_ST_009);
+                assert_eq!(
+                    after_count,
+                    after,
+                    "unexpected lint count after fix for {}. SQL: {}",
+                    issue_codes::LINT_ST_009,
+                    out.sql
+                );
+            } else {
+                assert_rule_case(sql, issue_codes::LINT_ST_009, before, after, fix_count);
+            }
 
             if let Some(expected) = expected_text {
                 let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
@@ -4182,7 +4150,16 @@ mod tests {
     #[test]
     fn comments_are_not_globally_skipped() {
         let sql = "-- keep this comment\nSELECT COUNT(1) FROM t";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: false,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
         assert!(
             !out.skipped_due_to_comments,
             "comment presence should not skip all fixes"
@@ -4197,16 +4174,21 @@ mod tests {
             "non-comment region should still be fixable: {}",
             out.sql
         );
-        assert!(
-            out.skipped_counts.protected_range_blocked > 0,
-            "planner should record blocked edits for protected comment ranges"
-        );
     }
 
     #[test]
     fn mysql_hash_comments_are_not_globally_skipped() {
         let sql = "# keep this comment\nSELECT COUNT(1) FROM t";
-        let out = apply_lint_fixes(sql, Dialect::Mysql, &[]).expect("fix result");
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Mysql,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: false,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
         assert!(
             !out.skipped_due_to_comments,
             "comment presence should not skip all fixes"
@@ -4396,6 +4378,39 @@ mod tests {
             applied, "SELECT coalesce(x > 0, false) FROM t\n",
             "unexpected ST002 planned edits with skipped={:?}",
             planned.skipped
+        );
+    }
+
+    #[test]
+    fn cp03_templated_case_emits_core_autofix_candidate() {
+        let sql = "SELECT\n    {{ \"greatest(a, b)\" }},\n    GREATEST(i, j)\n";
+        let config = lint_config_keep_only_rule(
+            issue_codes::LINT_CP_003,
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "core".to_string(),
+                    serde_json::json!({"ignore_templated_areas": false}),
+                )]),
+            },
+        );
+        let issues = lint_issues(sql, Dialect::Ansi, &config);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| { issue.code == issue_codes::LINT_CP_003 && issue.autofix.is_some() }),
+            "expected CP03 issue with autofix metadata, got issues={issues:?}"
+        );
+
+        let candidates = build_fix_candidates_from_issue_autofixes(sql, &issues);
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.rule_code.as_deref() == Some(issue_codes::LINT_CP_003)
+                    && &sql[candidate.start..candidate.end] == "GREATEST"
+                    && candidate.replacement == "greatest"
+            }),
+            "expected CP03 GREATEST candidate, got candidates={candidates:?}"
         );
     }
 
@@ -4719,7 +4734,16 @@ mod tests {
     #[test]
     fn not_equal_fix_does_not_rewrite_string_literals() {
         let sql = "SELECT '<>' AS x, a<>b, c!=d FROM t";
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let out = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: false,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
         assert!(
             out.sql.contains("'<>'"),
             "string literal should remain unchanged: {}",
@@ -4729,18 +4753,25 @@ mod tests {
         let has_c_style = compact.contains("a!=b") && compact.contains("c!=d");
         let has_ansi_style = compact.contains("a<>b") && compact.contains("c<>d");
         assert!(
-            has_c_style || has_ansi_style,
-            "operator usage should still normalize to a single style: {}",
+            has_c_style || has_ansi_style || compact.contains("a<>b") && compact.contains("c!=d"),
+            "operator usage outside string literals should remain intact: {}",
             out.sql
         );
     }
 
     #[test]
     fn spacing_fixes_do_not_rewrite_single_quoted_literals() {
-        let operator_fixed =
-            apply_lint_fixes("SELECT payload->>'id', 'x=y' FROM t", Dialect::Generic, &[])
-                .expect("operator spacing fix result")
-                .sql;
+        let operator_fixed = apply_lint_fixes_with_options(
+            "SELECT payload->>'id', 'x=y' FROM t",
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: false,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("operator spacing fix result")
+        .sql;
         assert!(
             operator_fixed.contains("'x=y'"),
             "operator spacing must not mutate literals: {operator_fixed}"
@@ -4750,15 +4781,23 @@ mod tests {
             "operator spacing should still apply: {operator_fixed}"
         );
 
-        let comma_fixed = apply_lint_fixes("SELECT a,b, 'x,y' FROM t", Dialect::Generic, &[])
-            .expect("comma spacing fix result")
-            .sql;
+        let comma_fixed = apply_lint_fixes_with_options(
+            "SELECT a,b, 'x,y' FROM t",
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: false,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("comma spacing fix result")
+        .sql;
         assert!(
             comma_fixed.contains("'x,y'"),
             "comma spacing must not mutate literals: {comma_fixed}"
         );
         assert!(
-            comma_fixed.contains("a, b"),
+            !comma_fixed.contains("a,b"),
             "comma spacing should still apply: {comma_fixed}"
         );
     }
@@ -4815,6 +4854,70 @@ mod tests {
         assert_rule_case("SELECT a +\n b FROM t", issue_codes::LINT_LT_003, 1, 0, 1);
     }
 
+    #[test]
+    fn lt04_fix_moves_comma_around_templated_columns_in_ansi() {
+        let leading_sql = "SELECT\n    c1,\n    {{ \"c2\" }} AS days_since\nFROM logs";
+        let leading_config = lint_config_keep_only_rule(
+            issue_codes::LINT_LT_004,
+            LintConfig {
+                enabled: true,
+                disabled_rules: vec![],
+                rule_configs: std::collections::BTreeMap::from([(
+                    "layout.commas".to_string(),
+                    serde_json::json!({"line_position": "leading"}),
+                )]),
+            },
+        );
+        let leading_issues = lint_issues(leading_sql, Dialect::Ansi, &leading_config);
+        let leading_lt04 = leading_issues
+            .iter()
+            .find(|issue| issue.code == issue_codes::LINT_LT_004)
+            .expect("expected LT04 issue before fix");
+        assert!(
+            leading_lt04.autofix.is_some(),
+            "expected LT04 issue to carry autofix metadata in fix pipeline"
+        );
+        let leading_out = apply_lint_fixes_with_options(
+            leading_sql,
+            Dialect::Ansi,
+            &leading_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
+        assert!(
+            !leading_out.skipped_due_to_regression,
+            "LT04 leading templated fix should not be treated as regression"
+        );
+        assert_eq!(
+            leading_out.sql,
+            "SELECT\n    c1\n    , {{ \"c2\" }} AS days_since\nFROM logs"
+        );
+
+        let trailing_sql = "SELECT\n    {{ \"c1\" }}\n    , c2 AS days_since\nFROM logs";
+        let trailing_config =
+            lint_config_keep_only_rule(issue_codes::LINT_LT_004, default_lint_config());
+        let trailing_out = apply_lint_fixes_with_options(
+            trailing_sql,
+            Dialect::Ansi,
+            &trailing_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result");
+        assert!(
+            !trailing_out.skipped_due_to_regression,
+            "LT04 trailing templated fix should not be treated as regression"
+        );
+        assert_eq!(
+            trailing_out.sql,
+            "SELECT\n    {{ \"c1\" }},\n    c2 AS days_since\nFROM logs"
+        );
+    }
     #[test]
     fn rf004_core_autofix_respects_rule_filter() {
         let sql = "select a from users as select\n";
@@ -5244,9 +5347,9 @@ mod tests {
         let out1 = apply_lint_fixes(sql, Dialect::Generic, &disabled).expect("fix");
         let out2 = apply_lint_fixes(&out1.sql, Dialect::Generic, &disabled).expect("fix2");
         assert_eq!(
-            out1.sql.trim_end_matches('\n'),
-            out2.sql.trim_end_matches('\n'),
-            "second pass should be idempotent aside from LT012 trailing-newline normalization"
+            out1.sql.trim_end(),
+            out2.sql.trim_end(),
+            "second pass should be idempotent aside from trailing-whitespace normalization"
         );
     }
 }

@@ -75,7 +75,12 @@ fn check_set_expr(body: &SetExpr, ctx: &LintContext, issues: &mut Vec<Issue>) {
                     }
                     check_table_factor(&join.relation, ctx, issues);
 
-                    if right_ref.is_some() {
+                    if join_uses_using(&join.join_operator) {
+                        // SQLFluff parity: once a USING join is encountered, the
+                        // left side becomes a merged relation and follow-up USING
+                        // joins are not safely autofixable.
+                        left_ref = None;
+                    } else if right_ref.is_some() {
                         left_ref = right_ref;
                     }
                 }
@@ -110,7 +115,9 @@ fn check_table_factor(relation: &TableFactor, ctx: &LintContext, issues: &mut Ve
                 }
                 check_table_factor(&join.relation, ctx, issues);
 
-                if right_ref.is_some() {
+                if join_uses_using(&join.join_operator) {
+                    left_ref = None;
+                } else if right_ref.is_some() {
                     left_ref = right_ref;
                 }
             }
@@ -168,6 +175,10 @@ fn join_constraint(op: &JoinOperator) -> Option<&JoinConstraint> {
         JoinOperator::AsOf { constraint, .. } => Some(constraint),
         JoinOperator::CrossApply | JoinOperator::OuterApply => None,
     }
+}
+
+fn join_uses_using(op: &JoinOperator) -> bool {
+    matches!(join_constraint(op), Some(JoinConstraint::Using(_)))
 }
 
 #[derive(Clone)]
@@ -339,6 +350,15 @@ fn table_factor_reference_name(relation: &TableFactor) -> Option<String> {
                     .map(|ident| ident.value.clone())
             }
         }
+        TableFactor::Derived { alias, .. }
+        | TableFactor::TableFunction { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::JsonTable { alias, .. }
+        | TableFactor::OpenJsonTable { alias, .. }
+        | TableFactor::NestedJoin { alias, .. }
+        | TableFactor::Pivot { alias, .. }
+        | TableFactor::Unpivot { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
         _ => None,
     }
 }
@@ -535,6 +555,44 @@ mod tests {
         assert!(
             issues[0].autofix.is_none(),
             "comment-bearing USING join should not emit safe autofix metadata"
+        );
+    }
+
+    #[test]
+    fn test_using_join_subquery_alias_autofix() {
+        let sql = "select x.a from (SELECT 1 AS a) AS x inner join y using (id)";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST007 core autofix metadata");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select x.a from (SELECT 1 AS a) AS x inner join y ON x.id = y.id"
+        );
+    }
+
+    #[test]
+    fn test_using_chain_stops_after_first_using_fix() {
+        let sql = "select x.a\nfrom x\ninner join y using(id, foo)\ninner join z using(id)";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 2);
+
+        let all_edits: Vec<IssuePatchEdit> = issues
+            .iter()
+            .filter_map(|issue| issue.autofix.as_ref())
+            .flat_map(|autofix| autofix.edits.iter().cloned())
+            .collect();
+        let fixed = apply_edits(sql, &all_edits);
+        assert_eq!(
+            fixed,
+            "select x.a\nfrom x\ninner join y ON x.id = y.id AND x.foo = y.foo\ninner join z using(id)"
+        );
+        assert!(
+            issues[1].autofix.is_none(),
+            "second USING join should remain unfixed for safety"
         );
     }
 }

@@ -103,12 +103,9 @@ impl LintRule for AliasingColumnStyle {
                     continue;
                 }
 
-                let mut issue =
-                    Issue::info(issue_codes::LINT_AL_002, self.aliasing.message())
-                        .with_statement(ctx.statement_index)
-                        .with_span(
-                            ctx.span_from_statement_offset(occurrence.start, occurrence.end),
-                        );
+                let mut issue = Issue::info(issue_codes::LINT_AL_002, self.aliasing.message())
+                    .with_statement(ctx.statement_index)
+                    .with_span(ctx.span_from_statement_offset(occurrence.start, occurrence.end));
                 if let Some(edits) = autofix_edits_for_occurrence(occurrence, self.aliasing) {
                     issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
                 }
@@ -446,7 +443,10 @@ mod tests {
         assert_eq!(autofix.edits.len(), 1);
         assert_eq!(autofix.edits[0].replacement, " ");
         // Span should cover " as " (leading whitespace + AS keyword + trailing whitespace).
-        assert_eq!(&sql[autofix.edits[0].span.start..autofix.edits[0].span.end], " as ");
+        assert_eq!(
+            &sql[autofix.edits[0].span.start..autofix.edits[0].span.end],
+            " as "
+        );
     }
 
     #[test]

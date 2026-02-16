@@ -4,7 +4,8 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use crate::parser::parse_sql_with_dialect;
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{Query, Select, SetExpr, Statement, TableFactor};
 use std::collections::HashSet;
 
@@ -100,16 +101,20 @@ impl LintRule for StructureSubquery {
             return Vec::new();
         }
 
-        let autofix_edits =
-            st005_subquery_to_cte_rewrite(ctx.statement_sql(), statement, self.forbid_subquery_in)
-                .filter(|rewritten| rewritten != ctx.statement_sql())
-                .map(|rewritten| {
-                    vec![IssuePatchEdit::new(
-                        ctx.span_from_statement_offset(0, ctx.statement_sql().len()),
-                        rewritten,
-                    )]
-                })
-                .unwrap_or_default();
+        let autofix_edits = st005_subquery_to_cte_rewrite(
+            ctx.statement_sql(),
+            statement,
+            self.forbid_subquery_in,
+            ctx.dialect(),
+        )
+        .filter(|rewritten| rewritten != ctx.statement_sql())
+        .map(|rewritten| {
+            vec![IssuePatchEdit::new(
+                ctx.span_from_statement_offset(0, ctx.statement_sql().len()),
+                rewritten,
+            )]
+        })
+        .unwrap_or_default();
 
         (0..violations)
             .map(|index| {
@@ -153,21 +158,51 @@ fn st005_subquery_to_cte_rewrite(
     sql: &str,
     stmt: &Statement,
     forbid_subquery_in: ForbidSubqueryIn,
+    dialect: Dialect,
 ) -> Option<String> {
-    // Collect all non-correlated subqueries from the AST.
-    let mut subquery_aliases: Vec<(String, bool)> = Vec::new();
-    collect_extractable_subqueries(stmt, forbid_subquery_in, &mut subquery_aliases);
-    if subquery_aliases.is_empty() {
-        return None;
+    const MAX_REWRITE_PASSES: usize = 8;
+
+    let mut current_sql = sql.to_string();
+    let mut current_stmt = stmt.clone();
+    let mut changed = false;
+
+    for _ in 0..MAX_REWRITE_PASSES {
+        // Collect all non-correlated subqueries from the current AST.
+        let mut subquery_aliases: Vec<(String, bool)> = Vec::new();
+        collect_extractable_subqueries(&current_stmt, forbid_subquery_in, &mut subquery_aliases);
+        if subquery_aliases.is_empty() {
+            break;
+        }
+
+        // Find subquery positions in the current SQL text.
+        let extractions =
+            find_subquery_positions(&current_sql, forbid_subquery_in, &subquery_aliases);
+        if extractions.is_empty() {
+            break;
+        }
+
+        let Some(rewritten) = apply_cte_extractions(&current_sql, &extractions, dialect) else {
+            break;
+        };
+        if rewritten == current_sql {
+            break;
+        }
+
+        changed = true;
+        current_sql = rewritten;
+
+        // Re-parse the rewritten SQL so later passes can extract newly-exposed
+        // nested subqueries (e.g. inside extracted CTE bodies).
+        let Ok(mut reparsed) = parse_sql_with_dialect(&current_sql, dialect) else {
+            break;
+        };
+        let Some(next_stmt) = (reparsed.len() == 1).then(|| reparsed.remove(0)) else {
+            break;
+        };
+        current_stmt = next_stmt;
     }
 
-    // Find subquery positions in the SQL text using the AST-derived alias info.
-    let extractions = find_subquery_positions(sql, forbid_subquery_in, &subquery_aliases);
-    if extractions.is_empty() {
-        return None;
-    }
-
-    apply_cte_extractions(sql, &extractions)
+    changed.then_some(current_sql)
 }
 
 /// Walk the AST to collect info about each extractable (non-correlated) subquery.
@@ -239,15 +274,20 @@ fn find_subquery_positions(
     let mut extractions = Vec::new();
     let mut ast_idx = 0usize;
     let mut auto_name_counter = 0usize;
-    // Collect all used names to avoid clashes.
-    let mut used_names: HashSet<String> = HashSet::new();
+    // Collect all names to avoid clashes.
+    let mut existing_cte_names: HashSet<String> = HashSet::new();
+    collect_existing_cte_names(sql, &mut existing_cte_names);
+
+    // Names reserved for generated prep_N CTEs.
+    let mut used_names: HashSet<String> = existing_cte_names.clone();
     for (alias, _) in ast_aliases {
         if !alias.is_empty() {
             used_names.insert(alias.to_ascii_uppercase());
         }
     }
-    // Also collect CTE names from existing WITH clause.
-    collect_existing_cte_names(sql, &mut used_names);
+
+    // Names already claimed by explicit/auto extractions in this pass.
+    let mut claimed_names: HashSet<String> = existing_cte_names;
 
     let mut pos = 0usize;
     while pos < bytes.len() {
@@ -309,9 +349,20 @@ fn find_subquery_positions(
 
                         let alias = if ast_alias.is_empty() {
                             let name = generate_prep_name(&mut auto_name_counter, &used_names);
-                            used_names.insert(name.to_ascii_uppercase());
+                            let name_key = name.to_ascii_uppercase();
+                            used_names.insert(name_key.clone());
+                            claimed_names.insert(name_key);
                             name
                         } else {
+                            let alias_key = ast_alias.to_ascii_uppercase();
+                            // If the alias would clash with an existing/previous CTE
+                            // name, leave this subquery in place (SQLFluff parity).
+                            if claimed_names.contains(&alias_key) {
+                                pos = close + 1;
+                                continue;
+                            }
+                            claimed_names.insert(alias_key.clone());
+                            used_names.insert(alias_key);
                             ast_alias.clone()
                         };
 
@@ -511,7 +562,11 @@ fn is_clause_keyword(word: &[u8]) -> bool {
 
 /// Apply the subquery extractions: build CTE definitions, replace subqueries
 /// with alias references, and insert the WITH clause.
-fn apply_cte_extractions(sql: &str, extractions: &[SubqueryExtraction]) -> Option<String> {
+fn apply_cte_extractions(
+    sql: &str,
+    extractions: &[SubqueryExtraction],
+    dialect: Dialect,
+) -> Option<String> {
     if extractions.is_empty() {
         return None;
     }
@@ -551,7 +606,15 @@ fn apply_cte_extractions(sql: &str, extractions: &[SubqueryExtraction]) -> Optio
             insert_before: containing_cte,
         });
 
-        replacements.push((ext.open_paren, ext.alias_region_end, ext.alias.clone()));
+        let mut replacement = ext.alias.clone();
+        if ext.open_paren > 0 {
+            let prev = sql.as_bytes()[ext.open_paren - 1];
+            if !prev.is_ascii_whitespace() {
+                replacement.insert(0, ' ');
+            }
+        }
+
+        replacements.push((ext.open_paren, ext.alias_region_end, replacement));
     }
 
     // Apply text replacements in reverse order to preserve positions.
@@ -587,7 +650,7 @@ fn apply_cte_extractions(sql: &str, extractions: &[SubqueryExtraction]) -> Optio
     }
 
     // Simple case: just insert/append new CTEs.
-    insert_cte_clause(&result, &top_level_defs, case_pref)
+    insert_cte_clause(&result, &top_level_defs, case_pref, dialect)
 }
 
 /// Range info for an existing CTE in the WITH clause.
@@ -819,7 +882,12 @@ fn detect_case_preference(sql: &str) -> CasePref {
 
 /// Insert CTE definitions into the SQL, handling existing WITH clauses,
 /// INSERT...SELECT, and CTAS patterns.
-fn insert_cte_clause(sql: &str, cte_defs: &[String], case_pref: CasePref) -> Option<String> {
+fn insert_cte_clause(
+    sql: &str,
+    cte_defs: &[String],
+    case_pref: CasePref,
+    dialect: Dialect,
+) -> Option<String> {
     let bytes = sql.as_bytes();
     let with_kw = if case_pref == CasePref::Upper {
         "WITH"
@@ -832,15 +900,29 @@ fn insert_cte_clause(sql: &str, cte_defs: &[String], case_pref: CasePref) -> Opt
 
     let is_insert = match_ascii_keyword_at(bytes, scan_pos, b"INSERT").is_some();
     let is_create = match_ascii_keyword_at(bytes, scan_pos, b"CREATE").is_some();
-    let is_tsql_insert = is_insert && sql_appears_tsql_insert(sql);
+    let is_tsql_insert = is_insert && dialect == Dialect::Mssql;
 
     if is_tsql_insert {
         // T-SQL: WITH goes before INSERT.
-        return Some(insert_with_before_position(sql, 0, cte_defs, with_kw));
+        let insert_pos = skip_ascii_whitespace(bytes, 0);
+        return Some(insert_with_before_position(
+            sql, insert_pos, cte_defs, with_kw,
+        ));
     }
 
-    if is_insert || is_create {
-        // For non-TSQL INSERT/CREATE: find where SELECT starts and insert WITH there.
+    if is_create {
+        if let Some(body_pos) = find_create_as_body_position(sql) {
+            return insert_with_at_select(sql, body_pos, cte_defs, with_kw);
+        }
+        // Fallback for unusual CREATE syntaxes.
+        if let Some(pos) = find_main_select_position(sql) {
+            return insert_with_at_select(sql, pos, cte_defs, with_kw);
+        }
+        return None;
+    }
+
+    if is_insert {
+        // For non-TSQL INSERT: find where SELECT/WITH starts and insert there.
         let select_pos = find_main_select_position(sql);
         if let Some(pos) = select_pos {
             return insert_with_at_select(sql, pos, cte_defs, with_kw);
@@ -859,6 +941,60 @@ fn insert_cte_clause(sql: &str, cte_defs: &[String], case_pref: CasePref) -> Opt
     Some(insert_with_before_position(
         sql, insert_pos, cte_defs, with_kw,
     ))
+}
+
+/// Find the start of a CREATE ... AS body (typically SELECT or WITH).
+fn find_create_as_body_position(sql: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut pos = skip_ascii_whitespace(bytes, 0);
+    let create_end = match_ascii_keyword_at(bytes, pos, b"CREATE")?;
+    pos = create_end;
+
+    let mut depth = 0usize;
+    while pos < bytes.len() {
+        if let Some(end) = skip_quoted_region(bytes, pos) {
+            pos = end;
+            continue;
+        }
+        if bytes[pos] == b'-' && bytes.get(pos + 1) == Some(&b'-') {
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+            pos += 2;
+            while pos + 1 < bytes.len() {
+                if bytes[pos] == b'*' && bytes[pos + 1] == b'/' {
+                    pos += 2;
+                    break;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+
+        if bytes[pos] == b'(' {
+            depth += 1;
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b')' {
+            depth = depth.saturating_sub(1);
+            pos += 1;
+            continue;
+        }
+
+        if depth == 0 {
+            if let Some(as_end) = match_ascii_keyword_at(bytes, pos, b"AS") {
+                return Some(skip_ascii_whitespace(bytes, as_end));
+            }
+        }
+
+        pos += 1;
+    }
+
+    None
 }
 
 struct ExistingWithInfo {
@@ -1088,33 +1224,6 @@ fn find_main_select_position(sql: &str) -> Option<usize> {
         pos += 1;
     }
     None
-}
-
-/// Check if an INSERT statement appears to be TSQL-style (no WITH between INSERT and SELECT).
-fn sql_appears_tsql_insert(sql: &str) -> bool {
-    let bytes = sql.as_bytes();
-    let pos = skip_ascii_whitespace(bytes, 0);
-
-    // Must start with WITH (existing CTEs before INSERT = TSQL pattern)
-    // or INSERT.
-    if match_ascii_keyword_at(bytes, pos, b"WITH").is_some() {
-        // WITH ... INSERT pattern = TSQL
-        return true;
-    }
-
-    if match_ascii_keyword_at(bytes, pos, b"INSERT").is_none() {
-        return false;
-    }
-
-    // TSQL insert: the SELECT is at depth 0 without a WITH between INSERT and SELECT.
-    // Non-TSQL (postgres, mariadb): INSERT ... WITH sub AS (...) SELECT ...
-    // We detect TSQL by checking the dialect hint in the SQL context.
-    // Since we don't have dialect info here, we use a heuristic:
-    // If there's no WITH keyword between INSERT and the main SELECT, it's potentially TSQL.
-    // But actually, for the parity fixtures, TSQL cases explicitly use the tsql dialect.
-    // Since the check() function passes the statement, not the dialect, we'll handle this
-    // by just checking if there's an existing WITH before INSERT.
-    false
 }
 
 /// Skip a quoted region (single quote, double quote, backtick, bracket).

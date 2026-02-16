@@ -150,8 +150,29 @@ impl Linter {
                         }
 
                         for statement in &document.statements {
-                            let (ctx_sql, ctx_statement_range) =
-                                if rule.code() == crate::types::issue_codes::LINT_LT_007 {
+                            let (ctx_sql, ctx_statement_range) = if matches!(
+                                rule.code(),
+                                crate::types::issue_codes::LINT_LT_002
+                                    | crate::types::issue_codes::LINT_LT_005
+                                    | crate::types::issue_codes::LINT_LT_004
+                                    | crate::types::issue_codes::LINT_LT_007
+                                    | crate::types::issue_codes::LINT_LT_012
+                                    | crate::types::issue_codes::LINT_LT_013
+                                    | crate::types::issue_codes::LINT_CV_009
+                                    | crate::types::issue_codes::LINT_CV_010
+                                    | crate::types::issue_codes::LINT_ST_004
+                            ) {
+                                if matches!(
+                                    rule.code(),
+                                    crate::types::issue_codes::LINT_LT_012
+                                        | crate::types::issue_codes::LINT_LT_013
+                                ) {
+                                    if let Some(source_sql) = document.source_sql {
+                                        (source_sql, 0..source_sql.len())
+                                    } else {
+                                        (document.sql, statement.statement_range.clone())
+                                    }
+                                } else {
                                     match (
                                         document.source_sql,
                                         document
@@ -164,24 +185,52 @@ impl Linter {
                                         }
                                         _ => (document.sql, statement.statement_range.clone()),
                                     }
-                                } else if rule.code() == crate::types::issue_codes::LINT_LT_001 {
-                                    // LT01 needs trailing whitespace visible so it can
-                                    // detect and fix trailing spaces/tabs on lines.
-                                    // The normal statement range trims whitespace, so
-                                    // extend it to include trailing whitespace up to
-                                    // the next newline (inclusive).
-                                    let range = extend_range_with_trailing_whitespace(
-                                        document.sql,
-                                        &statement.statement_range,
-                                        next_statement_start(
-                                            &document.statements,
-                                            statement.statement_index,
-                                        ),
-                                    );
-                                    (document.sql, range)
-                                } else {
-                                    (document.sql, statement.statement_range.clone())
-                                };
+                                }
+                            } else if rule.code() == crate::types::issue_codes::LINT_LT_001 {
+                                // LT01 needs trailing whitespace visible so it can
+                                // detect and fix trailing spaces/tabs on lines.
+                                // The normal statement range trims whitespace, so
+                                // extend it to include trailing whitespace up to
+                                // the next newline (inclusive).
+                                let lt01_ignore_templated = self
+                                    .config
+                                    .core_option_bool("ignore_templated_areas")
+                                    .unwrap_or(true);
+                                match (
+                                    document.source_sql,
+                                    document
+                                        .source_statement_ranges
+                                        .get(statement.statement_index)
+                                        .and_then(|range| range.clone()),
+                                ) {
+                                    (Some(source_sql), Some(source_statement_range))
+                                        if lt01_ignore_templated =>
+                                    {
+                                        let range = extend_range_with_trailing_whitespace(
+                                            source_sql,
+                                            &source_statement_range,
+                                            next_source_statement_start(
+                                                &document.source_statement_ranges,
+                                                statement.statement_index,
+                                            ),
+                                        );
+                                        (source_sql, range)
+                                    }
+                                    _ => {
+                                        let range = extend_range_with_trailing_whitespace(
+                                            document.sql,
+                                            &statement.statement_range,
+                                            next_statement_start(
+                                                &document.statements,
+                                                statement.statement_index,
+                                            ),
+                                        );
+                                        (document.sql, range)
+                                    }
+                                }
+                            } else {
+                                (document.sql, statement.statement_range.clone())
+                            };
 
                             let ctx = LintContext {
                                 sql: ctx_sql,
@@ -272,6 +321,20 @@ fn next_statement_start(statements: &[LintStatement], current_index: usize) -> O
         .iter()
         .find(|s| s.statement_index == current_index + 1)
         .map(|s| s.statement_range.start)
+}
+
+fn next_source_statement_start(
+    source_statement_ranges: &[Option<std::ops::Range<usize>>],
+    current_index: usize,
+) -> Option<usize> {
+    source_statement_ranges
+        .iter()
+        .enumerate()
+        .find_map(|(index, range)| {
+            (index > current_index)
+                .then(|| range.as_ref().map(|value| value.start))
+                .flatten()
+        })
 }
 
 fn normalize_issues(mut issues: Vec<Issue>) -> Vec<Issue> {
@@ -434,11 +497,25 @@ fn rule_uses_document_scope(code: &str) -> bool {
 fn rule_supports_statementless_fallback(code: &str) -> bool {
     matches!(
         code,
-        crate::types::issue_codes::LINT_LT_005
+        crate::types::issue_codes::LINT_LT_001
+            | crate::types::issue_codes::LINT_LT_002
+            | crate::types::issue_codes::LINT_LT_003
+            | crate::types::issue_codes::LINT_LT_005
+            | crate::types::issue_codes::LINT_LT_012
+            | crate::types::issue_codes::LINT_AL_007
+            | crate::types::issue_codes::LINT_AL_008
+            | crate::types::issue_codes::LINT_AM_004
+            | crate::types::issue_codes::LINT_CV_001
+            | crate::types::issue_codes::LINT_RF_006
+            | crate::types::issue_codes::LINT_ST_002
+            | crate::types::issue_codes::LINT_TQ_001
+            | crate::types::issue_codes::LINT_TQ_002
             | crate::types::issue_codes::LINT_CP_001
+            | crate::types::issue_codes::LINT_CP_002
             | crate::types::issue_codes::LINT_CP_003
             | crate::types::issue_codes::LINT_CP_004
             | crate::types::issue_codes::LINT_CP_005
+            | crate::types::issue_codes::LINT_ST_004
     )
 }
 
@@ -458,6 +535,14 @@ fn document_scope_sql_for_rule<'a>(
             return Cow::Borrowed(source_sql);
         }
         return Cow::Borrowed(document.sql);
+    }
+
+    // CP03 must apply patches against the original source text so fix spans
+    // remain valid when templated regions expand/contract during rendering.
+    if code == crate::types::issue_codes::LINT_CP_003 {
+        if let Some(source_sql) = document.source_sql {
+            return Cow::Borrowed(source_sql);
+        }
     }
 
     if !config

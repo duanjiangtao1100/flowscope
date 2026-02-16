@@ -111,6 +111,7 @@ pub(crate) fn collect_identifier_candidates(statement: &Statement) -> Vec<Identi
     collect_show_statement_identifiers(statement, &mut candidates);
     collect_assignment_target_identifiers(statement, &mut candidates);
     collect_create_table_column_identifiers(statement, &mut candidates);
+    collect_copy_statement_identifiers(statement, &mut candidates);
     candidates
 }
 
@@ -242,6 +243,40 @@ fn collect_assignment_targets(
                 }
             }
         }
+    }
+}
+
+fn collect_copy_statement_identifiers(
+    statement: &Statement,
+    candidates: &mut Vec<IdentifierCandidate>,
+) {
+    match statement {
+        Statement::Copy { source, target, .. } => {
+            match source {
+                sqlparser::ast::CopySource::Table { table_name, .. } => {
+                    collect_object_name_idents(table_name, IdentifierKind::Other, candidates)
+                }
+                sqlparser::ast::CopySource::Query(query) => {
+                    collect_cte_identifiers_in_query(query, candidates)
+                }
+            }
+            let _ = target;
+        }
+        Statement::CopyIntoSnowflake {
+            into,
+            from_obj,
+            from_query,
+            ..
+        } => {
+            collect_object_name_idents(into, IdentifierKind::Other, candidates);
+            if let Some(from_obj) = from_obj {
+                collect_object_name_idents(from_obj, IdentifierKind::Other, candidates);
+            }
+            if let Some(from_query) = from_query {
+                collect_cte_identifiers_in_query(from_query, candidates);
+            }
+        }
+        _ => {}
     }
 }
 

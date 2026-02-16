@@ -88,7 +88,14 @@ fn check_query(
             check_query(&cte.query, ctx, allow_scalar, issues, cte_has_columns);
         }
     }
-    check_set_expr(&query.body, ctx, allow_scalar, issues, false, has_cte_column_list);
+    check_set_expr(
+        &query.body,
+        ctx,
+        allow_scalar,
+        issues,
+        false,
+        has_cte_column_list,
+    );
 }
 
 fn check_set_expr(
@@ -183,9 +190,7 @@ fn contains_columns_macro(expr: &Expr) -> bool {
             }
             if let FunctionArguments::List(ref arg_list) = func.args {
                 arg_list.args.iter().any(|arg| match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        contains_columns_macro(e)
-                    }
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => contains_columns_macro(e),
                     _ => false,
                 })
             } else {

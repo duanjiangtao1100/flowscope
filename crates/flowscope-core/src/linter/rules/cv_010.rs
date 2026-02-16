@@ -9,6 +9,7 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
+use std::ops::Range;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -93,7 +94,15 @@ impl LintRule for ConventionQuotedLiterals {
         }
 
         let sql = ctx.statement_sql();
-        let literals = scan_string_literals(sql);
+        let masked_sql = contains_template_tags(sql).then(|| mask_templated_areas(sql));
+        let scan_sql = masked_sql.as_deref().unwrap_or(sql);
+        let literals = scan_string_literals(scan_sql);
+        let template_ranges = template_tag_ranges(ctx.sql);
+        if template_ranges.iter().any(|range| {
+            ctx.statement_range.start >= range.start && ctx.statement_range.end <= range.end
+        }) {
+            return Vec::new();
+        }
 
         if literals.is_empty() {
             return Vec::new();
@@ -119,38 +128,48 @@ impl LintRule for ConventionQuotedLiterals {
             PreferredStyle::Consistent => unreachable!(),
         };
 
-        let mut edits: Vec<IssuePatchEdit> = Vec::new();
-        let mut any_violation = false;
-
-        for lit in &literals {
-            let normalized = normalize_literal(sql, lit, pref_char, alt_char);
-            if let Some(replacement) = normalized {
-                any_violation = true;
-                edits.push(IssuePatchEdit::new(
-                    ctx.span_from_statement_offset(lit.start, lit.end),
-                    replacement,
-                ));
-            }
-        }
-
-        if !any_violation {
-            return Vec::new();
-        }
-
         let message = match preferred {
             PreferredStyle::SingleQuotes => "Use single quotes for quoted literals.",
             PreferredStyle::DoubleQuotes => "Use double quotes for quoted literals.",
             PreferredStyle::Consistent => unreachable!(),
         };
 
-        let mut issue =
-            Issue::info(issue_codes::LINT_CV_010, message).with_statement(ctx.statement_index);
+        let mut issues = Vec::new();
+        for lit in &literals {
+            let absolute_start = ctx.statement_range.start + lit.start;
+            let absolute_end = ctx.statement_range.start + lit.end;
+            if template_ranges
+                .iter()
+                .any(|range| absolute_start >= range.start && absolute_end <= range.end)
+            {
+                continue;
+            }
 
-        if !edits.is_empty() {
-            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+            let replacement = normalize_literal(sql, lit, pref_char, alt_char);
+            let mismatch = lit.quote_char != pref_char;
+            let template_mismatch = mismatch && literal_contains_template(sql, lit);
+            if replacement.is_none() && !template_mismatch {
+                continue;
+            }
+
+            let mut issue = Issue::info(issue_codes::LINT_CV_010, message)
+                .with_statement(ctx.statement_index)
+                .with_span(ctx.span_from_statement_offset(lit.start, lit.end));
+
+            if let Some(replacement) = replacement {
+                issue = issue.with_autofix_edits(
+                    IssueAutofixApplicability::Safe,
+                    vec![IssuePatchEdit::new(
+                        ctx.span_from_statement_offset(lit.start, lit.end),
+                        replacement,
+                    )],
+                );
+            }
+
+            issues.push(issue);
         }
 
-        vec![issue]
+        issues
     }
 }
 
@@ -183,6 +202,12 @@ fn scan_string_literals(sql: &str) -> Vec<StringLiteral> {
     let mut i = 0;
 
     while i < len {
+        // Skip Jinja templated tags.
+        if let Some(close_marker) = template_close_marker_at(bytes, i) {
+            i = skip_template_tag(bytes, i, close_marker);
+            continue;
+        }
+
         // Skip line comments.
         if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
             i += 2;
@@ -268,6 +293,10 @@ fn scan_string_literals(sql: &str) -> Vec<StringLiteral> {
                     i = len;
                     break;
                 }
+                if let Some(close_marker) = template_close_marker_at(bytes, j) {
+                    j = skip_template_tag(bytes, j, close_marker);
+                    continue;
+                }
                 if bytes[j] == q && bytes[j + 1] == q && bytes[j + 2] == q {
                     let end = j + 3;
                     result.push(StringLiteral {
@@ -289,6 +318,10 @@ fn scan_string_literals(sql: &str) -> Vec<StringLiteral> {
             // Single-quoted literal.
             let mut j = quote_start + 1;
             while j < len {
+                if let Some(close_marker) = template_close_marker_at(bytes, j) {
+                    j = skip_template_tag(bytes, j, close_marker);
+                    continue;
+                }
                 if bytes[j] == b'\\' {
                     j += 2;
                     continue;
@@ -321,6 +354,94 @@ fn scan_string_literals(sql: &str) -> Vec<StringLiteral> {
     }
 
     result
+}
+
+fn literal_contains_template(sql: &str, lit: &StringLiteral) -> bool {
+    let raw = &sql[lit.start..lit.end];
+    raw.contains("{{") || raw.contains("{%") || raw.contains("{#")
+}
+
+fn contains_template_tags(sql: &str) -> bool {
+    sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
+}
+
+fn mask_templated_areas(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0usize;
+
+    while let Some((open_index, close_marker)) = find_next_template_open(sql, index) {
+        out.push_str(&sql[index..open_index]);
+        let marker_start = open_index + 2;
+        if let Some(close_offset) = sql[marker_start..].find(close_marker) {
+            let close_index = marker_start + close_offset + close_marker.len();
+            out.push_str(&mask_non_newlines(&sql[open_index..close_index]));
+            index = close_index;
+        } else {
+            out.push_str(&mask_non_newlines(&sql[open_index..]));
+            return out;
+        }
+    }
+
+    out.push_str(&sql[index..]);
+    out
+}
+
+fn find_next_template_open(sql: &str, from: usize) -> Option<(usize, &'static str)> {
+    let rest = sql.get(from..)?;
+    let candidates = [("{{", "}}"), ("{%", "%}"), ("{#", "#}")];
+
+    candidates
+        .into_iter()
+        .filter_map(|(open, close)| rest.find(open).map(|offset| (from + offset, close)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn mask_non_newlines(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|ch| if ch == '\n' { '\n' } else { ' ' })
+        .collect()
+}
+
+fn template_tag_ranges(sql: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+
+    while let Some((open_index, close_marker)) = find_next_template_open(sql, index) {
+        let marker_start = open_index + 2;
+        let end = if let Some(close_offset) = sql[marker_start..].find(close_marker) {
+            marker_start + close_offset + close_marker.len()
+        } else {
+            sql.len()
+        };
+        ranges.push(open_index..end);
+        index = end;
+    }
+
+    ranges
+}
+
+fn template_close_marker_at(bytes: &[u8], index: usize) -> Option<&'static [u8]> {
+    if index + 1 >= bytes.len() || bytes[index] != b'{' {
+        return None;
+    }
+    match bytes[index + 1] {
+        b'{' => Some(b"}}"),
+        b'%' => Some(b"%}"),
+        b'#' => Some(b"#}"),
+        _ => None,
+    }
+}
+
+fn skip_template_tag(bytes: &[u8], start: usize, close_marker: &[u8]) -> usize {
+    let mut i = start + 2; // skip opening "{x"
+    while i + close_marker.len() <= bytes.len() {
+        if bytes[i..].starts_with(close_marker) {
+            return i + close_marker.len();
+        }
+        i += 1;
+    }
+    bytes.len()
 }
 
 /// Check if position `pos` is preceded by a type keyword like DATE, TIME,
@@ -382,26 +503,16 @@ fn normalize_literal(
         // Body is between the triple quotes.
         let body = &value_part[3..value_part.len() - 3];
 
-        // For triple-quoted strings, we don't modify escapes inside the body
-        // (matching SQLFluff behavior).  But we need to handle edge cases
-        // where the body ends with the preferred quote char.
-        let mut new_body = body.to_string();
-
-        // Edge case: if body ends with pref_char, we need to escape it
-        // so it doesn't merge with the closing triple.
-        if new_body.ends_with(pref_char) && !new_body.ends_with(&format!("\\{}", pref_char)) {
-            // Check if there's a space after the trailing pref_char --
-            // if the body ends with "pref_char " we don't need to escape.
-            // Actually, check if the last char IS pref_char (no trailing space).
-            let trimmed_body = new_body.trim_end_matches(pref_char);
-            let trailing_count = new_body.len() - trimmed_body.len();
-            if trailing_count > 0 {
-                // Escape the last pref_char.
-                new_body = format!("{}\\{}", &new_body[..new_body.len() - 1], pref_char);
-            }
+        // Converting triple quotes can require extra escaping; avoid fixes
+        // that introduce escapes compared to the original.
+        if body.ends_with(pref_char) {
+            return None;
+        }
+        if body.contains(&pref_triple) {
+            return None;
         }
 
-        let result = format!("{}{}{}{}", prefix_str, pref_triple, new_body, pref_triple);
+        let result = format!("{}{}{}{}", prefix_str, pref_triple, body, pref_triple);
         if result == raw {
             return None;
         }
@@ -637,6 +748,21 @@ mod tests {
         Some(out)
     }
 
+    fn apply_all_issue_autofixes(sql: &str, issues: &[Issue]) -> String {
+        let mut out = sql.to_string();
+        let mut edits = Vec::new();
+        for issue in issues {
+            if let Some(autofix) = &issue.autofix {
+                edits.extend(autofix.edits.clone());
+            }
+        }
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        out
+    }
+
     fn make_config(style: &str) -> LintConfig {
         LintConfig {
             enabled: true,
@@ -792,8 +918,8 @@ mod tests {
         let config = make_config("double_quotes");
         let sql = "SELECT\n    r'some_string',\n    b'some_string',\n    R'some_string',\n    B'some_string'";
         let issues = run_with_config(sql, Dialect::Bigquery, &config);
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(issues.len(), 4);
+        let fixed = apply_all_issue_autofixes(sql, &issues);
         assert_eq!(
             fixed,
             "SELECT\n    r\"some_string\",\n    b\"some_string\",\n    R\"some_string\",\n    B\"some_string\""
@@ -818,7 +944,7 @@ mod tests {
         let sql =
             "SELECT\n    'unnecessary \\\"\\\"escaping',\n    \"unnecessary \\'\\' escaping\"";
         let issues = run_with_config(sql, Dialect::Bigquery, &config);
-        assert_eq!(issues.len(), 1);
+        assert_eq!(issues.len(), 2);
     }
 
     // --- Hive, MySQL, SparkSQL dialects ---
@@ -862,5 +988,61 @@ mod tests {
         assert_eq!(issues.len(), 1);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
         assert_eq!(fixed, "SELECT \"\"\"some_string\"\"\"");
+    }
+
+    #[test]
+    fn scanner_ignores_quotes_inside_fully_templated_tags() {
+        let literals = scan_string_literals("SELECT {{ \"'a_non_lintable_string'\" }}");
+        assert!(literals.is_empty());
+    }
+
+    #[test]
+    fn scanner_keeps_outer_literal_when_template_is_inside_literal() {
+        let literals = scan_string_literals("SELECT '{{ \"a string\" }}'");
+        assert_eq!(literals.len(), 1);
+        assert_eq!(literals[0].quote_char, '\'');
+    }
+
+    #[test]
+    fn emits_per_literal_issues_for_partially_fixable_raw_literals() {
+        let config = make_config("double_quotes");
+        let sql = "SELECT\n    r'Tricky \"quote',\n    r'Not-so-tricky \\\"quote'";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        let fixable: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.autofix.is_some())
+            .collect();
+        assert_eq!(fixable.len(), 1);
+        let fixed = apply_issue_autofix(sql, fixable[0]).expect("autofix");
+        assert_eq!(
+            fixed,
+            "SELECT\n    r'Tricky \"quote',\n    r\"Not-so-tricky \\\"quote\""
+        );
+    }
+
+    #[test]
+    fn templated_mismatch_is_reported_even_when_unfixable() {
+        let config = make_config("double_quotes");
+        let sql = "SELECT '{{ \"a string\" }}'";
+        let issues = run_with_config(sql, Dialect::Bigquery, &config);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].autofix.is_none());
+    }
+
+    #[test]
+    fn triple_quote_fix_skips_literals_that_require_extra_escape() {
+        let sql = "SELECT\n    '''abc\"''',\n    '''abc\" '''";
+        let literals = scan_string_literals(sql);
+        assert_eq!(literals.len(), 2);
+
+        let first = normalize_literal(sql, &literals[0], '"', '\'');
+        let second = normalize_literal(sql, &literals[1], '"', '\'');
+
+        assert!(
+            first.is_none(),
+            "first triple literal should stay unfixable"
+        );
+        assert_eq!(second.as_deref(), Some("\"\"\"abc\" \"\"\""));
     }
 }

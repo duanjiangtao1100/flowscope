@@ -145,24 +145,29 @@ fn check_table_factor_joins(
         }
 
         let join_name = table_factor_reference_name(&join.relation);
-        let previous_source = seen_sources.last().cloned();
+        if let (Some(current), Some(on_expr)) =
+            (join_name.as_ref(), join_on_expr(&join.join_operator))
+        {
+            let matching_previous = seen_sources
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    let left = preference.left_source(current, candidate.as_str());
+                    let right = preference.right_source(current, candidate.as_str());
+                    has_join_pair(on_expr, left, right)
+                })
+                .cloned();
 
-        if let (Some(current), Some(previous), Some(on_expr)) = (
-            join_name.as_ref(),
-            previous_source.as_ref(),
-            join_on_expr(&join.join_operator),
-        ) {
-            let left = preference.left_source(current, previous);
-            let right = preference.right_source(current, previous);
-            if has_join_pair(on_expr, left, right) {
+            if let Some(previous) = matching_previous {
+                let left = preference.left_source(current, previous.as_str());
+                let right = preference.right_source(current, previous.as_str());
                 let mut issue = Issue::info(
                     issue_codes::LINT_ST_009,
                     "Join condition ordering appears inconsistent with configured preference.",
                 )
                 .with_statement(ctx.statement_index);
 
-                if let Some((span, replacement)) =
-                    join_condition_autofix(ctx, on_expr, left, right)
+                if let Some((span, replacement)) = join_condition_autofix(ctx, on_expr, left, right)
                 {
                     issue = issue.with_span(span).with_autofix_edits(
                         IssueAutofixApplicability::Safe,
@@ -265,7 +270,7 @@ fn join_condition_autofix(
 
     // Collect text-level edits for each reversed pair.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    collect_reversed_pair_edits(sql, on_expr, current_source, previous_source, &mut edits);
+    collect_reversed_pair_edits(ctx, on_expr, current_source, previous_source, &mut edits);
 
     if edits.is_empty() {
         return None;
@@ -277,6 +282,9 @@ fn join_condition_autofix(
     // Build replacement by applying text edits to the overall ON expression
     // source span.
     let (expr_start, expr_end) = expr_statement_offsets(ctx, on_expr)?;
+    if expr_start > expr_end || expr_end > sql.len() {
+        return None;
+    }
     let expr_span = ctx.span_from_statement_offset(expr_start, expr_end);
 
     let source = &sql[expr_start..expr_end];
@@ -284,13 +292,20 @@ fn join_condition_autofix(
     let mut cursor = expr_start;
 
     for (edit_start, edit_end, replacement) in &edits {
-        if *edit_start < cursor {
+        if *edit_start < expr_start
+            || *edit_end > expr_end
+            || *edit_start > *edit_end
+            || *edit_start < cursor
+        {
             // Overlapping edits — bail out to avoid corruption.
             return None;
         }
         result.push_str(&sql[cursor..*edit_start]);
         result.push_str(replacement);
         cursor = *edit_end;
+    }
+    if cursor > expr_end {
+        return None;
     }
     result.push_str(&sql[cursor..expr_end]);
 
@@ -301,12 +316,14 @@ fn join_condition_autofix(
 /// pair. Each edit replaces `left op right` with `right flipped_op left`
 /// using the original source text for both operands.
 fn collect_reversed_pair_edits(
-    sql: &str,
+    ctx: &LintContext,
     expr: &Expr,
     current_source: &str,
     previous_source: &str,
     edits: &mut Vec<(usize, usize, String)>,
 ) {
+    let sql = ctx.statement_sql();
+
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if is_comparison_operator(op) {
@@ -317,31 +334,36 @@ fn collect_reversed_pair_edits(
                 {
                     // Extract source text for left and right operands.
                     if let (Some((l_start, l_end)), Some((r_start, r_end))) = (
-                        expr_span_offsets(sql, left),
-                        expr_span_offsets(sql, right),
+                        expr_statement_offsets(ctx, left),
+                        expr_statement_offsets(ctx, right),
                     ) {
-                        let gap = &sql[l_end..r_start];
-                        // Skip if the gap contains a comment — swapping could
-                        // misplace or corrupt it.
-                        if gap.contains("--") || gap.contains("/*") {
-                            return;
-                        }
-                        let left_text = &sql[l_start..l_end];
-                        let right_text = &sql[r_start..r_end];
-                        let op_text = flip_operator_text(gap, op);
+                        if l_start <= l_end
+                            && l_end <= r_start
+                            && r_start <= r_end
+                            && r_end <= sql.len()
+                        {
+                            let gap = &sql[l_end..r_start];
+                            // Skip if the gap contains a comment — swapping could
+                            // misplace or corrupt it.
+                            if gap.contains("--") || gap.contains("/*") {
+                                return;
+                            }
+                            let left_text = &sql[l_start..l_end];
+                            let right_text = &sql[r_start..r_end];
+                            let op_text = flip_operator_text(gap, op);
 
-                        // Replace the entire `left op right` span with `right op left`.
-                        let replacement =
-                            format!("{right_text}{op_text}{left_text}");
-                        edits.push((l_start, r_end, replacement));
-                        return; // Don't recurse into children we just handled.
+                            // Replace the entire `left op right` span with `right op left`.
+                            let replacement = format!("{right_text}{op_text}{left_text}");
+                            edits.push((l_start, r_end, replacement));
+                            return; // Don't recurse into children we just handled.
+                        }
                     }
                 }
             }
 
             // Recurse into children for logical connectives (AND, OR).
-            collect_reversed_pair_edits(sql, left, current_source, previous_source, edits);
-            collect_reversed_pair_edits(sql, right, current_source, previous_source, edits);
+            collect_reversed_pair_edits(ctx, left, current_source, previous_source, edits);
+            collect_reversed_pair_edits(ctx, right, current_source, previous_source, edits);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::Nested(inner)
@@ -354,14 +376,14 @@ fn collect_reversed_pair_edits(
         | Expr::IsUnknown(inner)
         | Expr::IsNotUnknown(inner)
         | Expr::Cast { expr: inner, .. } => {
-            collect_reversed_pair_edits(sql, inner, current_source, previous_source, edits)
+            collect_reversed_pair_edits(ctx, inner, current_source, previous_source, edits)
         }
         Expr::InList {
             expr: target, list, ..
         } => {
-            collect_reversed_pair_edits(sql, target, current_source, previous_source, edits);
+            collect_reversed_pair_edits(ctx, target, current_source, previous_source, edits);
             for item in list {
-                collect_reversed_pair_edits(sql, item, current_source, previous_source, edits);
+                collect_reversed_pair_edits(ctx, item, current_source, previous_source, edits);
             }
         }
         Expr::Between {
@@ -370,9 +392,9 @@ fn collect_reversed_pair_edits(
             high,
             ..
         } => {
-            collect_reversed_pair_edits(sql, target, current_source, previous_source, edits);
-            collect_reversed_pair_edits(sql, low, current_source, previous_source, edits);
-            collect_reversed_pair_edits(sql, high, current_source, previous_source, edits);
+            collect_reversed_pair_edits(ctx, target, current_source, previous_source, edits);
+            collect_reversed_pair_edits(ctx, low, current_source, previous_source, edits);
+            collect_reversed_pair_edits(ctx, high, current_source, previous_source, edits);
         }
         Expr::Case {
             operand,
@@ -381,18 +403,18 @@ fn collect_reversed_pair_edits(
             ..
         } => {
             if let Some(operand) = operand {
-                collect_reversed_pair_edits(sql, operand, current_source, previous_source, edits);
+                collect_reversed_pair_edits(ctx, operand, current_source, previous_source, edits);
             }
             for case_when in conditions {
                 collect_reversed_pair_edits(
-                    sql,
+                    ctx,
                     &case_when.condition,
                     current_source,
                     previous_source,
                     edits,
                 );
                 collect_reversed_pair_edits(
-                    sql,
+                    ctx,
                     &case_when.result,
                     current_source,
                     previous_source,
@@ -401,7 +423,7 @@ fn collect_reversed_pair_edits(
             }
             if let Some(else_result) = else_result {
                 collect_reversed_pair_edits(
-                    sql,
+                    ctx,
                     else_result,
                     current_source,
                     previous_source,
@@ -419,9 +441,7 @@ fn collect_reversed_pair_edits(
 fn flip_operator_text(gap: &str, op: &BinaryOperator) -> String {
     match op {
         // Symmetric operators — no change needed.
-        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Spaceship => {
-            gap.to_string()
-        }
+        BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Spaceship => gap.to_string(),
         // Directional operators — flip the operator while preserving surrounding whitespace.
         BinaryOperator::Lt => gap.replacen('<', ">", 1),
         BinaryOperator::Gt => gap.replacen('>', "<", 1),
@@ -430,7 +450,6 @@ fn flip_operator_text(gap: &str, op: &BinaryOperator) -> String {
         _ => gap.to_string(),
     }
 }
-
 
 fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usize)> {
     if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
@@ -710,6 +729,25 @@ mod tests {
         assert_eq!(
             fixed,
             "select\n    \"foo\".\"a\",\n    \"bar\".\"b\"\nfrom foo\nleft join \"bar\"\n    on \"foo\".\"a\" = \"bar\".\"a\"\n    and foo.\"b\" = \"bar\".\"b\"\n"
+        );
+    }
+
+    #[test]
+    fn autofix_reorders_join_conditions_against_any_seen_source_in_chain() {
+        // SQLFluff: test_fail_later_table_first_multiple_comparison_operators
+        let sql = "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on bar.a != foo.a\n    and bar.b > foo.b\n    and bar.c <= foo.c\nleft join baz\n    on baz.a <> foo.a\n    and baz.b >= foo.b\n    and baz.c < foo.c\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 2);
+        let mut edits: Vec<IssuePatchEdit> = issues
+            .iter()
+            .filter_map(|issue| issue.autofix.as_ref())
+            .flat_map(|autofix| autofix.edits.iter().cloned())
+            .collect();
+        edits.sort_by_key(|edit| edit.span.start);
+        let fixed = apply_edits(sql, &edits);
+        assert_eq!(
+            fixed,
+            "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on foo.a != bar.a\n    and foo.b < bar.b\n    and foo.c >= bar.c\nleft join baz\n    on foo.a <> baz.a\n    and foo.b <= baz.b\n    and foo.c > baz.c\n"
         );
     }
 }

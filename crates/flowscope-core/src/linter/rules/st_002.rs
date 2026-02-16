@@ -16,8 +16,10 @@
 use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::visit;
 use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
+use regex::Regex;
 use sqlparser::ast::{Expr, Spanned, Statement, Value};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
+use std::sync::OnceLock;
 
 pub struct StructureSimpleCase;
 
@@ -48,14 +50,24 @@ impl LintRule for StructureSimpleCase {
             )
             .with_statement(ctx.statement_index);
 
-            if let Some((span, edits)) = build_autofix(ctx, expr, &rewrite) {
+            if let Some((span, applicability, edits)) = build_autofix(ctx, expr, &rewrite) {
                 issue = issue
                     .with_span(span)
-                    .with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+                    .with_autofix_edits(applicability, edits);
             }
 
             issues.push(issue);
         });
+
+        if issues.is_empty() && statementless_template_case_requires_st02(ctx.statement_sql()) {
+            issues.push(
+                Issue::info(
+                    issue_codes::LINT_ST_002,
+                    "Unnecessary CASE statement. Use COALESCE function or simple column reference.",
+                )
+                .with_statement(ctx.statement_index),
+            );
+        }
 
         issues
     }
@@ -196,6 +208,30 @@ fn is_null_text(s: &str) -> bool {
     s.eq_ignore_ascii_case("NULL")
 }
 
+fn statementless_template_case_requires_st02(sql: &str) -> bool {
+    if !contains_template_tags(sql) {
+        return false;
+    }
+
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let pattern = RE.get_or_init(|| {
+        Regex::new(
+            r"(?is)\bcase\b.*?\bwhen\b\s+([a-zA-Z_][\w\.]*)\s+is\s+null\s+then\s+(\{\{.*?\}\})\s+else\s+([a-zA-Z_][\w\.]*)\s+end\b",
+        )
+        .expect("valid ST02 template fallback regex")
+    });
+
+    pattern.captures(sql).is_some_and(|caps| {
+        let checked = caps.get(1).map_or("", |m| m.as_str());
+        let else_expr = caps.get(3).map_or("", |m| m.as_str());
+        !checked.is_empty() && checked.eq_ignore_ascii_case(else_expr)
+    })
+}
+
+fn contains_template_tags(sql: &str) -> bool {
+    sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
+}
+
 // ---------------------------------------------------------------------------
 // Autofix
 // ---------------------------------------------------------------------------
@@ -204,13 +240,15 @@ fn build_autofix(
     ctx: &LintContext,
     expr: &Expr,
     rewrite: &UnnecessaryCaseKind,
-) -> Option<(Span, Vec<IssuePatchEdit>)> {
+) -> Option<(Span, IssueAutofixApplicability, Vec<IssuePatchEdit>)> {
     let (expr_start, expr_end) = expr_statement_offsets(ctx, expr)?;
     let expr_span = ctx.span_from_statement_offset(expr_start, expr_end);
 
-    if span_contains_comment(ctx, expr_span) {
-        return None;
-    }
+    let applicability = if span_contains_comment(ctx, expr_span) {
+        IssueAutofixApplicability::Unsafe
+    } else {
+        IssueAutofixApplicability::Safe
+    };
 
     let Expr::Case {
         conditions,
@@ -233,7 +271,8 @@ fn build_autofix(
             format!("not coalesce({cond_text}, false)")
         }
         UnnecessaryCaseKind::NullCoalesce => {
-            let (checked_expr, fallback_expr) = null_coalesce_operands(condition, &when.result, else_result.as_deref())?;
+            let (checked_expr, fallback_expr) =
+                null_coalesce_operands(condition, &when.result, else_result.as_deref())?;
             let checked_text = source_text_for_expr(ctx, checked_expr)?;
             let fallback_text = source_text_for_expr(ctx, fallback_expr)?;
             format!("coalesce({checked_text}, {fallback_text})")
@@ -244,7 +283,11 @@ fn build_autofix(
         }
     };
 
-    Some((expr_span, vec![IssuePatchEdit::new(expr_span, replacement)]))
+    Some((
+        expr_span,
+        applicability,
+        vec![IssuePatchEdit::new(expr_span, replacement)],
+    ))
 }
 
 /// Extract the original source text for an expression, preserving keyword case.
@@ -253,10 +296,25 @@ fn build_autofix(
 /// does not capture the full expression text (e.g. sqlparser omits unary
 /// operator keywords like `NOT` from span calculations).
 fn source_text_for_expr(ctx: &LintContext, expr: &Expr) -> Option<String> {
-    let (start, end) = expr_statement_offsets(ctx, expr)?;
+    let display_text = format!("{expr}");
+
+    let Some((start, end)) = expr_statement_offsets(ctx, expr) else {
+        return if display_text.is_empty() {
+            None
+        } else {
+            Some(normalize_keywords_to_match_source(
+                ctx.statement_sql(),
+                &display_text,
+            ))
+        };
+    };
     let sql = ctx.statement_sql();
     if end > sql.len() || start > end {
-        return None;
+        return if display_text.is_empty() {
+            None
+        } else {
+            Some(normalize_keywords_to_match_source(sql, &display_text))
+        };
     }
 
     let source = &sql[start..end];
@@ -264,7 +322,6 @@ fn source_text_for_expr(ctx: &LintContext, expr: &Expr) -> Option<String> {
     // Validate that the source text is correct by checking the AST Display
     // output length.  When sqlparser's Spanned impl omits a keyword prefix
     // (e.g. NOT in UnaryOp), the source text will be too short.
-    let display_text = format!("{expr}");
     if source.len() >= display_text.len() {
         return Some(source.to_string());
     }
@@ -277,10 +334,6 @@ fn source_text_for_expr(ctx: &LintContext, expr: &Expr) -> Option<String> {
 
 /// Normalise SQL keywords in `text` to match the case used in `context_sql`.
 fn normalize_keywords_to_match_source(context_sql: &str, text: &str) -> String {
-    let lower = context_sql.to_ascii_lowercase();
-    let uses_lowercase =
-        lower.contains(" and ") || lower.contains(" or ") || lower.contains(" not ");
-
     // Check if the source SQL actually uses lowercase keywords by comparing
     // against the original (non-lowered) text.
     let source_uses_lower = context_sql.contains(" and ")
@@ -289,10 +342,14 @@ fn normalize_keywords_to_match_source(context_sql: &str, text: &str) -> String {
         || context_sql.contains("when not ")
         || context_sql.contains("when ");
 
-    if uses_lowercase && source_uses_lower {
+    if source_uses_lower {
         text.replace(" AND ", " and ")
             .replace(" OR ", " or ")
             .replace("NOT ", "not ")
+            .replace(" IS NOT NULL", " is not null")
+            .replace(" IS NULL", " is null")
+            .replace(" TRUE", " true")
+            .replace(" FALSE", " false")
     } else {
         text.to_string()
     }
@@ -780,14 +837,53 @@ mod tests {
     }
 
     #[test]
-    fn comment_in_case_blocks_safe_autofix() {
+    fn comment_in_case_downgrades_autofix_to_unsafe() {
         let sql =
             "select case when fab > 0 /*keep*/ then true else false end as is_fab from fancy_table";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Unsafe);
+    }
+
+    #[test]
+    fn autofix_comment_after_case_keyword_uses_display_fallback() {
+        let sql = "select\n    subscriptions_xf.metadata_migrated,\n\n    case  -- BEFORE ST02 FIX\n        when perks.perk is null then false\n        else true\n    end as perk_redeemed,\n\n    perks.received_at as perk_received_at\n\nfrom subscriptions_xf\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Unsafe);
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select\n    subscriptions_xf.metadata_migrated,\n\n    not coalesce(perks.perk is null, false) as perk_redeemed,\n\n    perks.received_at as perk_received_at\n\nfrom subscriptions_xf\n"
+        );
+    }
+
+    #[test]
+    fn statementless_template_case_is_still_reported_without_autofix() {
+        let sql = "select\n    foo,\n    case\n        when\n            bar is null then {{ result }}\n        else bar\n    end as test\nfrom baz;\n";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = StructureSimpleCase;
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_ST_002);
         assert!(
             issues[0].autofix.is_none(),
-            "comment-bearing CASE expression should not receive safe patch metadata"
+            "template fallback should report detection-only without copying templated code"
         );
     }
 }

@@ -108,9 +108,27 @@ impl LintRule for ReferencesQuoting {
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let dialect = ctx.dialect();
 
-        let has_violation = collect_identifier_candidates(statement)
+        let ast_has_violation = collect_identifier_candidates(statement)
             .into_iter()
             .any(|candidate| candidate_triggers_rule(&candidate, self, dialect));
+
+        let mut autofix_edits_raw =
+            unnecessary_quoted_identifier_edits(ctx.statement_sql(), self, dialect);
+        if is_spark_insert_overwrite_directory_options(ctx.statement_sql(), dialect) {
+            autofix_edits_raw.extend(spark_options_unquote_key_edits(ctx.statement_sql(), self));
+            autofix_edits_raw.sort_by_key(|edit| (edit.start, edit.end));
+            autofix_edits_raw.dedup_by(|left, right| {
+                left.start == right.start
+                    && left.end == right.end
+                    && left.replacement == right.replacement
+            });
+        }
+
+        let fallback_has_violation =
+            is_spark_insert_overwrite_directory_options(ctx.statement_sql(), dialect)
+                && !autofix_edits_raw.is_empty();
+
+        let has_violation = ast_has_violation || fallback_has_violation;
 
         if !has_violation {
             return Vec::new();
@@ -124,7 +142,7 @@ impl LintRule for ReferencesQuoting {
         let mut issue =
             Issue::info(issue_codes::LINT_RF_006, message).with_statement(ctx.statement_index);
 
-        let autofix_edits = unnecessary_quoted_identifier_edits(ctx.statement_sql(), self, dialect)
+        let autofix_edits = autofix_edits_raw
             .into_iter()
             .map(|edit| {
                 IssuePatchEdit::new(
@@ -139,6 +157,85 @@ impl LintRule for ReferencesQuoting {
 
         vec![issue]
     }
+}
+
+fn is_spark_insert_overwrite_directory_options(sql: &str, dialect: Dialect) -> bool {
+    if !matches!(dialect, Dialect::Databricks) {
+        return false;
+    }
+    let upper = sql.to_ascii_uppercase();
+    upper.contains("INSERT OVERWRITE DIRECTORY")
+        && upper.contains("USING")
+        && upper.contains("OPTIONS")
+}
+
+fn spark_options_unquote_key_edits(sql: &str, rule: &ReferencesQuoting) -> Vec<Rf006AutofixEdit> {
+    if rule.prefer_quoted_identifiers || !rule.quoted_policy.allows(IdentifierKind::Other) {
+        return Vec::new();
+    }
+
+    let bytes = sql.as_bytes();
+    let mut edits = Vec::new();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        let ident_start = index;
+        while index < bytes.len() && bytes[index] != b'"' {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let ident_end = index;
+        let end = index + 1;
+
+        let Some(ident) = sql.get(ident_start..ident_end) else {
+            index = end;
+            continue;
+        };
+        if ident.is_empty() {
+            index = end;
+            continue;
+        }
+        if is_keyword(ident) || is_ignored_token(ident, rule) || !is_valid_bare_identifier(ident) {
+            index = end;
+            continue;
+        }
+
+        let mut prev = start;
+        while prev > 0 && bytes[prev - 1].is_ascii_whitespace() {
+            prev -= 1;
+        }
+        if prev == 0 || !matches!(bytes[prev - 1], b'(' | b',') {
+            index = end;
+            continue;
+        }
+
+        let mut probe = end;
+        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+            probe += 1;
+        }
+        if probe >= bytes.len() || bytes[probe] != b'=' {
+            index = end;
+            continue;
+        }
+
+        edits.push(Rf006AutofixEdit {
+            start,
+            end,
+            replacement: ident.to_string(),
+        });
+        index = end;
+    }
+
+    edits
 }
 
 struct Rf006AutofixEdit {
@@ -466,7 +563,9 @@ fn is_keyword(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
+    use crate::types::Dialect;
     use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
@@ -684,5 +783,31 @@ mod tests {
     fn does_not_flag_datetime_keyword_identifier() {
         let issues = run("SELECT \"datetime\" FROM t");
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn sparksql_insert_overwrite_directory_options_uses_fallback_detection_and_fix() {
+        let sql = "INSERT OVERWRITE DIRECTORY '/tmp/destination'\nUSING PARQUET\nOPTIONS (\"col1\" = \"1\", \"col2\" = \"2\", \"col3\" = 'test', \"user\" = \"a person\")\nSELECT a FROM test_table;";
+        let statements = parse_sql("SELECT 1").expect("synthetic parse");
+        let rule = ReferencesQuoting::default();
+
+        let issues = with_active_dialect(Dialect::Databricks, || {
+            rule.check(
+                &statements[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        });
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "INSERT OVERWRITE DIRECTORY '/tmp/destination'\nUSING PARQUET\nOPTIONS (col1 = \"1\", col2 = \"2\", col3 = 'test', \"user\" = \"a person\")\nSELECT a FROM test_table;"
+        );
     }
 }

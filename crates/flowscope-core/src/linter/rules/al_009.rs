@@ -6,6 +6,7 @@ use crate::generated::NormalizationStrategy;
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
+use regex::Regex;
 use sqlparser::ast::{Expr, Ident, SelectItem, Statement};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -101,6 +102,27 @@ impl LintRule for AliasingSelfAliasColumn {
         let mut autofix_candidates = al009_autofix_candidates_for_context(ctx, &violating_aliases);
         autofix_candidates.sort_by_key(|candidate| candidate.span.start);
         let candidates_align = autofix_candidates.len() == violation_count;
+        let legacy_candidates =
+            legacy_self_alias_candidates_for_context(ctx, self.alias_case_check, strategy);
+        if !legacy_candidates.is_empty()
+            && (violation_count == 0
+                || !candidates_align
+                || contains_assignment_alias_pattern(ctx.statement_sql()))
+        {
+            return vec![Issue::info(
+                issue_codes::LINT_AL_009,
+                "Column aliases should not alias to itself.",
+            )
+            .with_statement(ctx.statement_index)
+            .with_span(legacy_candidates[0].span)
+            .with_autofix_edits(
+                IssueAutofixApplicability::Safe,
+                legacy_candidates
+                    .into_iter()
+                    .flat_map(|candidate| candidate.edits)
+                    .collect(),
+            )];
+        }
 
         (0..violation_count)
             .map(|index| {
@@ -452,6 +474,190 @@ fn normalize_name_for_mode(name_ref: NameRef<'_>, mode: AliasCaseCheck) -> Strin
     }
 }
 
+fn legacy_self_alias_candidates_for_context(
+    ctx: &LintContext,
+    alias_case_check: AliasCaseCheck,
+    dialect_strategy: Option<NormalizationStrategy>,
+) -> Vec<Al009AutofixCandidate> {
+    let sql = ctx.statement_sql();
+    let Ok(select_clause_regex) = Regex::new(r"(?is)\bselect\b(?P<clause>.*?)\bfrom\b") else {
+        return Vec::new();
+    };
+    let Some(captures) = select_clause_regex.captures(sql) else {
+        return Vec::new();
+    };
+    let Some(clause) = captures.name("clause") else {
+        return Vec::new();
+    };
+
+    let clause_start = clause.start();
+    let clause_sql = clause.as_str();
+    let mut line_offset = 0usize;
+    let mut candidates = Vec::new();
+
+    for line in clause_sql.split_inclusive('\n') {
+        let line_no_newline = line.strip_suffix('\n').unwrap_or(line);
+        let mut content_start = 0usize;
+        while content_start < line_no_newline.len()
+            && line_no_newline.as_bytes()[content_start].is_ascii_whitespace()
+        {
+            content_start += 1;
+        }
+
+        let mut content_end = line_no_newline.len();
+        while content_end > content_start
+            && line_no_newline.as_bytes()[content_end - 1].is_ascii_whitespace()
+        {
+            content_end -= 1;
+        }
+        if content_end > content_start && line_no_newline.as_bytes()[content_end - 1] == b',' {
+            content_end -= 1;
+        }
+        while content_end > content_start
+            && line_no_newline.as_bytes()[content_end - 1].is_ascii_whitespace()
+        {
+            content_end -= 1;
+        }
+        if content_end <= content_start {
+            line_offset += line.len();
+            continue;
+        }
+
+        let content = &line_no_newline[content_start..content_end];
+        let Some(replacement) = legacy_self_alias_replacement(
+            content,
+            ctx.dialect(),
+            alias_case_check,
+            dialect_strategy,
+        ) else {
+            line_offset += line.len();
+            continue;
+        };
+        if replacement == content {
+            line_offset += line.len();
+            continue;
+        }
+
+        let edit_start = clause_start + line_offset + content_start;
+        let edit_end = clause_start + line_offset + content_end;
+        let span = ctx.span_from_statement_offset(edit_start, edit_end);
+        candidates.push(Al009AutofixCandidate {
+            span,
+            edits: vec![IssuePatchEdit::new(span, replacement)],
+        });
+
+        line_offset += line.len();
+    }
+
+    candidates
+}
+
+fn legacy_self_alias_replacement(
+    target: &str,
+    dialect: crate::types::Dialect,
+    alias_case_check: AliasCaseCheck,
+    dialect_strategy: Option<NormalizationStrategy>,
+) -> Option<String> {
+    if dialect == crate::types::Dialect::Bigquery
+        && target.starts_with('`')
+        && target.ends_with('`')
+    {
+        let inner = &target[1..target.len().saturating_sub(1)];
+        if let Some(split_at) = inner.find("``") {
+            let left = &inner[..split_at];
+            let right = &inner[split_at + 2..];
+            if !left.is_empty() && left == right {
+                return Some(format!("`{left}`"));
+            }
+        }
+    }
+
+    if let Some(eq_pos) = target.find('=') {
+        let prev = eq_pos
+            .checked_sub(1)
+            .and_then(|idx| target.as_bytes().get(idx).copied());
+        let next = target.as_bytes().get(eq_pos + 1).copied();
+        if !matches!(prev, Some(b'!') | Some(b'<') | Some(b'>')) && !matches!(next, Some(b'=')) {
+            let alias_raw = target[..eq_pos].trim();
+            let expr_raw = target[eq_pos + 1..].trim();
+            if let (Some(expr_name), Some(alias_name)) = (
+                parse_identifier_name(expr_raw),
+                parse_identifier_name(alias_raw),
+            ) {
+                if names_match(expr_name, alias_name, alias_case_check, dialect_strategy) {
+                    return Some(expr_raw.to_string());
+                }
+            }
+        }
+    }
+
+    let upper = target.to_ascii_uppercase();
+    if let Some(as_pos) = upper.find(" AS ") {
+        let expr_raw = target[..as_pos].trim();
+        let alias_raw = target[as_pos + 4..].trim();
+        if let (Some(expr_name), Some(alias_name)) = (
+            parse_identifier_name(expr_raw),
+            parse_identifier_name(alias_raw),
+        ) {
+            if names_match(expr_name, alias_name, alias_case_check, dialect_strategy) {
+                return Some(expr_raw.to_string());
+            }
+        }
+    }
+
+    let mut parts = target.split_whitespace();
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if parts.next().is_none() {
+        if let (Some(expr_name), Some(alias_name)) =
+            (parse_identifier_name(first), parse_identifier_name(second))
+        {
+            if names_match(expr_name, alias_name, alias_case_check, dialect_strategy) {
+                return Some(first.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_identifier_name(raw: &str) -> Option<NameRef<'_>> {
+    if raw.len() >= 2 {
+        let bytes = raw.as_bytes();
+        if (bytes[0] == b'"' && bytes[raw.len() - 1] == b'"')
+            || (bytes[0] == b'`' && bytes[raw.len() - 1] == b'`')
+            || (bytes[0] == b'[' && bytes[raw.len() - 1] == b']')
+        {
+            return Some(NameRef {
+                name: &raw[1..raw.len() - 1],
+                quoted: true,
+            });
+        }
+    }
+
+    let mut chars = raw.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')) {
+        return None;
+    }
+    Some(NameRef {
+        name: raw,
+        quoted: false,
+    })
+}
+
+fn contains_assignment_alias_pattern(sql: &str) -> bool {
+    let Ok(pattern) =
+        Regex::new(r"(?im)^\s*[A-Za-z_][A-Za-z0-9_$]*\s*=\s*[A-Za-z_][A-Za-z0-9_$]*\s*,?\s*$")
+    else {
+        return false;
+    };
+    pattern.is_match(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +701,17 @@ mod tests {
             }
         });
         issues
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     #[test]
@@ -725,5 +942,60 @@ mod tests {
         let sql = "SELECT `col`as`col` FROM clients as c";
         let issues = run_in_dialect(sql, Dialect::Bigquery);
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn tsql_self_alias_assignments_use_legacy_fallback_fix() {
+        let sql = "select\n    this_alias_is_fine = col_a,\n    col_b = col_b,\n    COL_C AS COL_C,\n    Col_D = Col_D,\n    col_e col_e,\n    COL_F COL_F,\n    Col_G Col_G\nfrom foo";
+        let statements = parse_sql("SELECT 1").expect("synthetic parse");
+        let rule = AliasingSelfAliasColumn::default();
+        let issues = with_active_dialect(Dialect::Mssql, || {
+            rule.check(
+                &statements[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        });
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "select\n    this_alias_is_fine = col_a,\n    col_b,\n    COL_C,\n    Col_D,\n    col_e,\n    COL_F,\n    Col_G\nfrom foo"
+        );
+    }
+
+    #[test]
+    fn bigquery_adjacent_backtick_self_alias_uses_legacy_fallback_fix() {
+        let sql = "SELECT `col``col`\nFROM clients as c";
+        let statements = parse_sql("SELECT 1").expect("synthetic parse");
+        let rule = AliasingSelfAliasColumn::default();
+        let issues = with_active_dialect(Dialect::Bigquery, || {
+            rule.check(
+                &statements[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        });
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT `col`\nFROM clients as c");
+    }
+
+    #[test]
+    fn tsql_parsed_statement_still_gets_self_alias_autofix() {
+        let sql = "select\n    this_alias_is_fine = col_a,\n    col_b = col_b,\n    COL_C AS COL_C,\n    Col_D = Col_D,\n    col_e col_e,\n    COL_F COL_F,\n    Col_G Col_G\nfrom foo";
+        let issues = run_in_dialect(sql, Dialect::Mssql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "select\n    this_alias_is_fine = col_a,\n    col_b,\n    COL_C,\n    Col_D,\n    col_e,\n    COL_F,\n    Col_G\nfrom foo"
+        );
     }
 }

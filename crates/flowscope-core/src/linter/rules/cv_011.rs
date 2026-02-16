@@ -249,23 +249,169 @@ fn collect_cast_instances(statement: &Statement, sql: &str) -> Vec<CastInstance>
         }
     });
 
+    // Parser span extraction can miss parenthesized shorthand casts in some
+    // Snowflake semi-structured forms. Add a lightweight lexical fallback.
+    for (start, end) in scan_parenthesized_shorthand_cast_spans(sql) {
+        if casts.iter().any(|cast| {
+            cast.start == start && cast.end == end && cast.style == CastStyle::DoubleColon
+        }) {
+            continue;
+        }
+        let text = &sql[start..end];
+        casts.push(CastInstance {
+            style: CastStyle::DoubleColon,
+            start,
+            end,
+            has_comments: text.contains("--") || text.contains("/*"),
+            is_3arg_convert: false,
+        });
+    }
+
     // Sort by position so first-seen logic works correctly.
     casts.sort_by_key(|c| c.start);
 
     // Deduplicate: remove entries whose ranges are fully contained within
     // another entry's range (handles chained :: where both outer and inner
-    // are collected by the visitor).
-    let mut deduped = Vec::with_capacity(casts.len());
+    // are collected by the visitor). For overlapping shorthand casts, keep
+    // the wider range so we don't emit conflicting nested edits.
+    let mut deduped: Vec<CastInstance> = Vec::with_capacity(casts.len());
     for cast in casts {
-        let dominated = deduped
-            .iter()
-            .any(|other: &CastInstance| other.start <= cast.start && other.end >= cast.end);
-        if !dominated {
+        let mut dominated = false;
+        let mut replace_index = None;
+
+        for (index, other) in deduped.iter().enumerate() {
+            if other.start <= cast.start && other.end >= cast.end {
+                dominated = true;
+                break;
+            }
+            if cast.start <= other.start && cast.end >= other.end {
+                replace_index = Some(index);
+                break;
+            }
+            if cast.style == other.style
+                && spans_overlap(cast.start, cast.end, other.start, other.end)
+            {
+                let cast_len = cast.end.saturating_sub(cast.start);
+                let other_len = other.end.saturating_sub(other.start);
+                if cast_len > other_len {
+                    replace_index = Some(index);
+                } else {
+                    dominated = true;
+                }
+                break;
+            }
+        }
+
+        if dominated {
+            continue;
+        }
+
+        if let Some(index) = replace_index {
+            deduped[index] = cast;
+        } else {
             deduped.push(cast);
         }
     }
 
+    deduped.sort_by_key(|cast| (cast.start, cast.end, cast.style as u8));
+    deduped.dedup_by(|left, right| left.start == right.start && left.end == right.end);
     deduped
+}
+
+fn spans_overlap(left_start: usize, left_end: usize, right_start: usize, right_end: usize) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn scan_parenthesized_shorthand_cast_spans(sql: &str) -> Vec<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0usize;
+
+    while index + 1 < bytes.len() {
+        if bytes[index] != b':' || bytes[index + 1] != b':' {
+            index += 1;
+            continue;
+        }
+
+        let mut lhs_end = index;
+        while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
+            lhs_end -= 1;
+        }
+        if lhs_end == 0 || bytes[lhs_end - 1] != b')' {
+            index += 2;
+            continue;
+        }
+        let close_paren = lhs_end - 1;
+        let Some(open_paren) = find_matching_open_paren(bytes, close_paren) else {
+            index += 2;
+            continue;
+        };
+
+        let Some(type_end) = scan_parenthesized_shorthand_type_end(bytes, index + 2) else {
+            index += 2;
+            continue;
+        };
+
+        out.push((open_paren, type_end));
+        index = type_end;
+    }
+
+    out
+}
+
+fn scan_parenthesized_shorthand_type_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start;
+    let mut depth = 0i32;
+    let mut saw_any = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => {
+                depth += 1;
+                saw_any = true;
+                index += 1;
+            }
+            b')' if depth > 0 => {
+                depth -= 1;
+                index += 1;
+            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' => {
+                saw_any = true;
+                index += 1;
+            }
+            b',' if depth > 0 => index += 1,
+            b' ' | b'\t' | b'\n' | b'\r' if depth > 0 => index += 1,
+            _ => break,
+        }
+    }
+
+    if saw_any {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn find_matching_open_paren(bytes: &[u8], close_paren: usize) -> Option<usize> {
+    if bytes.get(close_paren).copied() != Some(b')') {
+        return None;
+    }
+    let mut depth = 1i32;
+    let mut cursor = close_paren;
+    while cursor > 0 {
+        cursor -= 1;
+        match bytes[cursor] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Find the full source span of a CAST/:: expression.
@@ -546,7 +692,7 @@ fn shorthand_to_cast(shorthand_text: &str) -> Option<String> {
     if parts.len() < 2 {
         return None;
     }
-    let mut result = parts[0].to_string();
+    let mut result = rewrite_nested_simple_shorthand_to_cast(parts[0]);
     for type_part in &parts[1..] {
         result = format!("cast({result} as {type_part})");
     }
@@ -606,6 +752,70 @@ fn split_shorthand_chain(text: &str) -> Option<Vec<&str>> {
     } else {
         None
     }
+}
+
+/// Rewrites simple nested shorthand fragments in an expression, e.g.
+/// `value:Longitude::varchar` -> `cast(value:Longitude as varchar)`.
+/// This is intentionally conservative: it only rewrites contiguous identifier
+/// chains and leaves complex nested expressions to the outer conversion pass.
+fn rewrite_nested_simple_shorthand_to_cast(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut index = 0usize;
+    let mut out = String::with_capacity(expr.len() + 16);
+
+    while index < bytes.len() {
+        let Some(rel_dc) = expr[index..].find("::") else {
+            out.push_str(&expr[index..]);
+            break;
+        };
+        let dc = index + rel_dc;
+
+        let mut lhs_start = dc;
+        while lhs_start > 0 && is_simple_shorthand_lhs_char(bytes[lhs_start - 1]) {
+            lhs_start -= 1;
+        }
+        if lhs_start == dc {
+            out.push_str(&expr[index..dc + 2]);
+            index = dc + 2;
+            continue;
+        }
+
+        let mut rhs_end = dc + 2;
+        while rhs_end < bytes.len() && is_simple_type_char(bytes[rhs_end]) {
+            rhs_end += 1;
+        }
+        if rhs_end == dc + 2 {
+            out.push_str(&expr[index..dc + 2]);
+            index = dc + 2;
+            continue;
+        }
+
+        out.push_str(&expr[index..lhs_start]);
+        out.push_str("cast(");
+        out.push_str(&expr[lhs_start..dc]);
+        out.push_str(" as ");
+        out.push_str(&expr[dc + 2..rhs_end]);
+        out.push(')');
+        index = rhs_end;
+    }
+
+    out
+}
+
+fn is_simple_shorthand_lhs_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'_' | b'.' | b':' | b'$' | b'@' | b'"' | b'`' | b'[' | b']'
+        )
+}
+
+fn is_simple_type_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'_' | b' ' | b'\t' | b'\n' | b'\r' | b'(' | b')' | b','
+        )
 }
 
 /// Parse interior of `CONVERT(type, expr)`. Returns `(type_text, expr_text)`.
@@ -1086,6 +1296,19 @@ mod tests {
         assert_eq!(
             fixed,
             "select\n    100::int::text,\n    126::int as bar,\n    cast(\n    1 /* cast the value\n        to an integer\n      */ as int) as coo\nfrom foo;"
+        );
+    }
+
+    #[test]
+    fn shorthand_to_cast_rewrites_nested_snowflake_path_casts() {
+        let fixed = shorthand_to_cast("(trim(value:Longitude::varchar))::double").expect("rewrite");
+        assert_eq!(
+            fixed,
+            "cast((trim(cast(value:Longitude as varchar))) as double)"
+        );
+        assert_eq!(
+            shorthand_to_cast("col:a.b:c::varchar").expect("rewrite"),
+            "cast(col:a.b:c as varchar)"
         );
     }
 }

@@ -402,8 +402,8 @@ fn build_multiline_newline_fix(
     // the comment token — safe for zero-width inserts.
     // Single-line comment tokens include their trailing \n, so skip the
     // extra \n prefix when the anchor already ends with one.
-    let anchor_has_newline = anchor_end > 0
-        && matches!(ctx.sql.as_bytes().get(anchor_end - 1), Some(b'\n'));
+    let anchor_has_newline =
+        anchor_end > 0 && matches!(ctx.sql.as_bytes().get(anchor_end - 1), Some(b'\n'));
     let mut replacement = String::new();
     if !anchor_has_newline {
         replacement.push('\n');
@@ -489,8 +489,8 @@ fn build_require_final_semicolon_edits(
         // Single-line comment tokens include their trailing \n in the span.
         // If the anchor already ends with \n, use just indent + ; to avoid
         // a double newline.
-        let anchor_has_newline = anchor_end > 0
-            && matches!(ctx.sql.as_bytes().get(anchor_end - 1), Some(b'\n'));
+        let anchor_has_newline =
+            anchor_end > 0 && matches!(ctx.sql.as_bytes().get(anchor_end - 1), Some(b'\n'));
 
         let mut replacement = String::new();
         if !anchor_has_newline {
@@ -1457,7 +1457,10 @@ mod tests {
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         // Semicolon inserted before block comment. The old semicolon deletion
         // may leave a trailing \n; the parity report normalizes whitespace.
-        assert_eq!(fixed, "SELECT foo\nFROM bar\n;\n/* multiline\ncomment\n*/\n\n");
+        assert_eq!(
+            fixed,
+            "SELECT foo\nFROM bar\n;\n/* multiline\ncomment\n*/\n\n"
+        );
     }
 
     #[test]
@@ -1487,7 +1490,10 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CV_006);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT foo\nFROM bar\n; /* multiline\ncomment\n*/\n\n");
+        assert_eq!(
+            fixed,
+            "SELECT foo\nFROM bar\n; /* multiline\ncomment\n*/\n\n"
+        );
     }
 
     #[test]

@@ -71,38 +71,30 @@ impl LintRule for LayoutCommas {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let has_remaining_non_whitespace = ctx.sql[ctx.statement_range.end..]
+            .chars()
+            .any(|ch| !ch.is_whitespace());
+        let parser_fragment_fallback = ctx.statement_index == 0
+            && ctx.statement_range.start == 0
+            && ctx.statement_range.end < ctx.sql.len()
+            && has_remaining_non_whitespace;
+
+        if parser_fragment_fallback {
+            let full_ctx = LintContext {
+                sql: ctx.sql,
+                statement_range: 0..ctx.sql.len(),
+                statement_index: ctx.statement_index,
+            };
+            let full_violations = comma_spacing_violations(&full_ctx, self.line_position);
+            if let Some(issue) = issue_from_violations(&full_ctx, &full_violations) {
+                return vec![issue];
+            }
+        }
+
         let violations = comma_spacing_violations(ctx, self.line_position);
-        if violations.is_empty() {
-            return Vec::new();
-        }
-
-        // Merge all violation edits into a single issue anchored at the first
-        // comma, so the fix engine can apply them in one pass.
-        let ((start, end), _) = &violations[0];
-        let all_edits: Vec<Lt04AutofixEdit> = violations
-            .iter()
-            .flat_map(|(_, edits)| edits.iter().cloned())
-            .collect();
-
-        let mut issue = Issue::info(
-            issue_codes::LINT_LT_004,
-            "Comma spacing appears inconsistent.",
-        )
-        .with_statement(ctx.statement_index)
-        .with_span(ctx.span_from_statement_offset(*start, *end));
-        if !all_edits.is_empty() {
-            let edits = all_edits
-                .into_iter()
-                .map(|(edit_start, edit_end, replacement)| {
-                    IssuePatchEdit::new(
-                        ctx.span_from_statement_offset(edit_start, edit_end),
-                        replacement,
-                    )
-                })
-                .collect();
-            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
-        }
-        vec![issue]
+        issue_from_violations(ctx, &violations)
+            .map(|issue| vec![issue])
+            .unwrap_or_default()
     }
 }
 
@@ -110,12 +102,49 @@ type Lt04Span = (usize, usize);
 type Lt04AutofixEdit = (usize, usize, String);
 type Lt04Violation = (Lt04Span, Vec<Lt04AutofixEdit>);
 
+fn issue_from_violations(ctx: &LintContext, violations: &[Lt04Violation]) -> Option<Issue> {
+    if violations.is_empty() {
+        return None;
+    }
+
+    // Merge all violation edits into a single issue anchored at the first
+    // comma, so the fix engine can apply them in one pass.
+    let ((start, end), _) = &violations[0];
+    let all_edits: Vec<Lt04AutofixEdit> = violations
+        .iter()
+        .flat_map(|(_, edits)| edits.iter().cloned())
+        .collect();
+
+    let mut issue = Issue::info(
+        issue_codes::LINT_LT_004,
+        "Comma spacing appears inconsistent.",
+    )
+    .with_statement(ctx.statement_index)
+    .with_span(ctx.span_from_statement_offset(*start, *end));
+    if !all_edits.is_empty() {
+        let edits = all_edits
+            .into_iter()
+            .map(|(edit_start, edit_end, replacement)| {
+                IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit_start, edit_end),
+                    replacement,
+                )
+            })
+            .collect();
+        issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+    }
+    Some(issue)
+}
+
 fn comma_spacing_violations(
     ctx: &LintContext,
     line_position: CommaLinePosition,
 ) -> Vec<Lt04Violation> {
+    // Prefer direct tokenization of the statement slice. Document-token spans
+    // can come from parser-recovery fragments and occasionally lose reliable
+    // line-shape information around template markers.
     let tokens =
-        tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
+        tokenized(ctx.statement_sql(), ctx.dialect()).or_else(|| tokenized_for_context(ctx));
     let Some(tokens) = tokens else {
         return Vec::new();
     };
@@ -146,11 +175,21 @@ fn comma_spacing_violations(
             continue;
         };
 
-        let comma_line = token.span.start.line;
-        let prev_line = tokens[prev_sig_idx].span.end.line;
-        let next_line = tokens[next_sig_idx].span.start.line;
-        let line_break_before = prev_line < comma_line;
-        let line_break_after = next_line > comma_line;
+        let Some((_, prev_end)) = token_with_span_offsets(sql, &tokens[prev_sig_idx]) else {
+            continue;
+        };
+        let Some((next_start, _)) = token_with_span_offsets(sql, &tokens[next_sig_idx]) else {
+            continue;
+        };
+        if prev_end > comma_start || comma_end > next_start || next_start > sql.len() {
+            continue;
+        }
+
+        // Use byte-gaps rather than token line metadata. In parser-recovery and
+        // template-heavy inputs, token line numbers can drift while offsets
+        // remain reliable.
+        let line_break_before = gap_has_newline(&sql[prev_end..comma_start]);
+        let line_break_after = gap_has_newline(&sql[comma_end..next_start]);
 
         let line_position_violation = match line_position {
             CommaLinePosition::Trailing => line_break_before && !line_break_after,
@@ -165,6 +204,7 @@ fn comma_spacing_violations(
                 next_sig_idx,
                 line_position,
             )
+            .or_else(|| fallback_comma_line_move_edits(sql, comma_start, comma_end, line_position))
             .unwrap_or_default();
             violations.push(((comma_start, comma_end), edits));
             continue;
@@ -174,7 +214,7 @@ fn comma_spacing_violations(
         let mut violation = false;
 
         // Inline comma cases should have no pre-comma spacing.
-        let has_pre_inline_space = prev_line == comma_line
+        let has_pre_inline_space = !line_break_before
             && tokens[prev_sig_idx + 1..index]
                 .iter()
                 .any(|candidate| is_inline_space_token(&candidate.token));
@@ -198,7 +238,7 @@ fn comma_spacing_violations(
             CommaLinePosition::Trailing => line_break_after,
         };
         let missing_post_inline_space = !comma_in_preferred_position
-            && next_line == comma_line
+            && !line_break_after
             && !tokens[index + 1..next_sig_idx]
                 .iter()
                 .any(|candidate| is_inline_space_token(&candidate.token));
@@ -242,10 +282,19 @@ fn safe_comma_line_move_edits(
         return None;
     }
 
+    // Template delimiters are tokenized as punctuation, so "previous
+    // significant token" can land inside a tag. Fall back to raw line-based
+    // movement for leading-comma→trailing-comma rewrites near templates.
+    if matches!(line_position, CommaLinePosition::Trailing) {
+        let context_start = line_start_after_newline(sql, prev_end);
+        if gap_has_template_marker(&sql[context_start..comma_start]) {
+            return None;
+        }
+    }
+
     let before_gap = &sql[prev_end..comma_start];
     let after_gap = &sql[comma_end..next_start];
-    let has_comments =
-        gap_has_comment(before_gap) || gap_has_comment(after_gap);
+    let has_comments = gap_has_comment(before_gap) || gap_has_comment(after_gap);
 
     if !has_comments {
         // Simple case: no comments in either gap.
@@ -324,18 +373,80 @@ fn safe_comma_line_move_edits(
     }
 }
 
+fn fallback_comma_line_move_edits(
+    sql: &str,
+    comma_start: usize,
+    comma_end: usize,
+    line_position: CommaLinePosition,
+) -> Option<Vec<Lt04AutofixEdit>> {
+    if comma_start >= comma_end || comma_end > sql.len() {
+        return None;
+    }
+
+    match line_position {
+        CommaLinePosition::Leading => {
+            let newline_idx = sql[comma_end..].find('\n').map(|idx| comma_end + idx)?;
+            let line_start = newline_idx + 1;
+            let mut insert_pos = line_start;
+            let bytes = sql.as_bytes();
+            while insert_pos < bytes.len()
+                && (bytes[insert_pos] == b' ' || bytes[insert_pos] == b'\t')
+            {
+                insert_pos += 1;
+            }
+
+            let delete_end = skip_inline_whitespace(sql, comma_end);
+            let indent = &sql[line_start..insert_pos];
+            Some(vec![
+                (comma_start, delete_end, String::new()),
+                (line_start, insert_pos, format!("{indent}, ")),
+            ])
+        }
+        CommaLinePosition::Trailing => {
+            let line_start = line_start_after_newline(sql, comma_start);
+            if line_start == 0 {
+                return None;
+            }
+
+            let mut insert_pos = line_start - 1; // newline between previous/current lines
+            let bytes = sql.as_bytes();
+            while insert_pos > 0
+                && (bytes[insert_pos - 1] == b' ' || bytes[insert_pos - 1] == b'\t')
+            {
+                insert_pos -= 1;
+            }
+
+            let delete_end = skip_inline_whitespace(sql, comma_end);
+            Some(vec![
+                (insert_pos, insert_pos, ",".to_string()),
+                (comma_start, delete_end, String::new()),
+            ])
+        }
+    }
+}
+
 /// Check if a gap string contains a comment.
 fn gap_has_comment(gap: &str) -> bool {
     gap.contains("--") || gap.contains("/*")
 }
 
+fn gap_has_template_marker(gap: &str) -> bool {
+    gap.contains("{{")
+        || gap.contains("{%")
+        || gap.contains("{#")
+        || gap.contains("}}")
+        || gap.contains("%}")
+        || gap.contains("#}")
+}
+
+fn gap_has_newline(gap: &str) -> bool {
+    gap.contains('\n') || gap.contains('\r')
+}
+
 /// Return the position right after the last newline before `offset`, i.e. the
 /// start of the line containing `offset`.
 fn line_start_after_newline(sql: &str, offset: usize) -> usize {
-    sql[..offset]
-        .rfind('\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0)
+    sql[..offset].rfind('\n').map(|pos| pos + 1).unwrap_or(0)
 }
 
 /// Skip inline whitespace (spaces and tabs) starting at `offset`.
@@ -361,10 +472,7 @@ fn whitespace_before_on_same_line(sql: &str, offset: usize, floor: usize) -> usi
 
 /// Extract the leading whitespace (indent) for the line containing `offset`.
 fn line_indent_at(sql: &str, offset: usize) -> &str {
-    let line_start = sql[..offset]
-        .rfind('\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
+    let line_start = sql[..offset].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
     let indent_end = sql[line_start..]
         .find(|ch: char| !ch.is_whitespace() || ch == '\n')
         .map(|pos| line_start + pos)
@@ -602,6 +710,16 @@ mod tests {
         Some(out)
     }
 
+    fn apply_raw_edits(sql: &str, edits: &[(usize, usize, String)]) -> String {
+        let mut out = sql.to_string();
+        let mut ordered = edits.to_vec();
+        ordered.sort_by_key(|(start, end, _)| (*start, *end));
+        for (start, end, replacement) in ordered.into_iter().rev() {
+            out.replace_range(start..end, &replacement);
+        }
+        out
+    }
+
     #[test]
     fn flags_tight_comma_spacing() {
         let sql = "SELECT a,b FROM t";
@@ -726,6 +844,51 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(issues[0].autofix.is_some(), "autofix metadata");
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT\n    field_1,\n    field_2,\n    field_3\nFROM a");
+        assert_eq!(
+            fixed,
+            "SELECT\n    field_1,\n    field_2,\n    field_3\nFROM a"
+        );
+    }
+
+    #[test]
+    fn leading_mode_templated_column_emits_line_move_edits() {
+        let sql = "SELECT\n    c1,\n    {{ \"c2\" }} AS days_since\nFROM logs";
+        let ctx = LintContext {
+            sql,
+            statement_range: 0..sql.len(),
+            statement_index: 0,
+        };
+        let violations = comma_spacing_violations(&ctx, CommaLinePosition::Leading);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            !violations[0].1.is_empty(),
+            "expected templated leading-mode violation to produce edits"
+        );
+        let fixed = apply_raw_edits(sql, &violations[0].1);
+        assert_eq!(
+            fixed,
+            "SELECT\n    c1\n    , {{ \"c2\" }} AS days_since\nFROM logs"
+        );
+    }
+
+    #[test]
+    fn trailing_mode_templated_column_emits_line_move_edits() {
+        let sql = "SELECT\n    {{ \"c1\" }}\n    , c2 AS days_since\nFROM logs";
+        let ctx = LintContext {
+            sql,
+            statement_range: 0..sql.len(),
+            statement_index: 0,
+        };
+        let violations = comma_spacing_violations(&ctx, CommaLinePosition::Trailing);
+        assert_eq!(violations.len(), 1);
+        assert!(
+            !violations[0].1.is_empty(),
+            "expected templated trailing-mode violation to produce edits"
+        );
+        let fixed = apply_raw_edits(sql, &violations[0].1);
+        assert_eq!(
+            fixed,
+            "SELECT\n    {{ \"c1\" }},\n    c2 AS days_since\nFROM logs"
+        );
     }
 }

@@ -5,10 +5,9 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{
-    issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span,
-};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{Ident, Select, Statement, TableFactor, TableWithJoins};
+use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::collections::HashMap;
 
@@ -55,21 +54,165 @@ impl LintRule for AliasingForbidSingleTable {
         visit_selects_in_statement(statement, &mut |select| {
             let aliases = collect_unnecessary_aliases(select);
             for alias_info in &aliases {
-                let edits =
-                    build_autofix_edits(alias_info, &aliases, ctx, tokens.as_deref());
+                let edits = build_autofix_edits(alias_info, &aliases, ctx, tokens.as_deref());
                 let mut issue =
                     Issue::info(issue_codes::LINT_AL_007, "Avoid unnecessary table aliases.")
                         .with_statement(ctx.statement_index);
                 if !edits.is_empty() {
-                    issue =
-                        issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
                 }
                 issues.push(issue);
             }
         });
 
+        if issues.is_empty() {
+            if let Some(issue) = fallback_single_from_alias_issue(ctx, tokens.as_deref()) {
+                issues.push(issue);
+            }
+        }
+
         issues
     }
+}
+
+#[derive(Clone)]
+struct FallbackAliasCandidate {
+    table_name: String,
+    alias_name: String,
+    alias_start: usize,
+    alias_end: usize,
+}
+
+fn fallback_single_from_alias_issue(
+    ctx: &LintContext,
+    tokens: Option<&[LocatedToken]>,
+) -> Option<Issue> {
+    if ctx.dialect() != Dialect::Mssql {
+        return None;
+    }
+    let tokens = tokens?;
+    if tokens.is_empty() || contains_join_keyword(tokens) {
+        return None;
+    }
+
+    let candidate = fallback_single_from_alias_candidate(tokens, ctx.statement_sql())?;
+    let mut edits = Vec::new();
+
+    if let Some(delete_span) =
+        alias_declaration_delete_span(tokens, candidate.alias_start, candidate.alias_end)
+    {
+        edits.push(IssuePatchEdit::new(
+            ctx.span_from_statement_offset(delete_span.start, delete_span.end),
+            "",
+        ));
+    }
+
+    for (ref_start, ref_end) in find_qualified_alias_references(tokens, &candidate.alias_name, &[])
+    {
+        edits.push(IssuePatchEdit::new(
+            ctx.span_from_statement_offset(ref_start, ref_end),
+            candidate.table_name.clone(),
+        ));
+    }
+
+    let mut issue = Issue::info(issue_codes::LINT_AL_007, "Avoid unnecessary table aliases.")
+        .with_statement(ctx.statement_index)
+        .with_span(ctx.span_from_statement_offset(candidate.alias_start, candidate.alias_end));
+
+    if !edits.is_empty() {
+        issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+    }
+
+    Some(issue)
+}
+
+fn fallback_single_from_alias_candidate(
+    tokens: &[LocatedToken],
+    sql: &str,
+) -> Option<FallbackAliasCandidate> {
+    for (index, token) in tokens.iter().enumerate() {
+        if !token_is_keyword(&token.token, "FROM") {
+            continue;
+        }
+
+        let table_start_idx = next_non_trivia_index(tokens, index + 1)?;
+        if !is_identifier_token(&tokens[table_start_idx].token) {
+            continue;
+        }
+
+        let mut table_end_idx = table_start_idx;
+        loop {
+            let Some(dot_idx) = next_non_trivia_index(tokens, table_end_idx + 1) else {
+                break;
+            };
+            if !matches!(tokens[dot_idx].token, Token::Period) {
+                break;
+            }
+            let Some(next_part_idx) = next_non_trivia_index(tokens, dot_idx + 1) else {
+                break;
+            };
+            if !is_identifier_token(&tokens[next_part_idx].token) {
+                break;
+            }
+            table_end_idx = next_part_idx;
+        }
+
+        let alias_idx = next_non_trivia_index(tokens, table_end_idx + 1)?;
+        let Token::Word(alias_word) = &tokens[alias_idx].token else {
+            continue;
+        };
+        if alias_word.keyword != Keyword::NoKeyword {
+            continue;
+        }
+
+        let table_start = tokens[table_start_idx].start;
+        let table_end = tokens[table_end_idx].end;
+        if table_start >= table_end || table_end > sql.len() {
+            continue;
+        }
+
+        return Some(FallbackAliasCandidate {
+            table_name: sql[table_start..table_end].to_string(),
+            alias_name: alias_word.value.clone(),
+            alias_start: tokens[alias_idx].start,
+            alias_end: tokens[alias_idx].end,
+        });
+    }
+
+    None
+}
+
+fn token_is_keyword(token: &Token, keyword: &str) -> bool {
+    matches!(token, Token::Word(word) if word.value.eq_ignore_ascii_case(keyword))
+}
+
+fn is_identifier_token(token: &Token) -> bool {
+    matches!(token, Token::Word(_) | Token::Placeholder(_))
+}
+
+fn next_non_trivia_index(tokens: &[LocatedToken], mut index: usize) -> Option<usize> {
+    while index < tokens.len() {
+        if !is_trivia_token(&tokens[index].token) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn contains_join_keyword(tokens: &[LocatedToken]) -> bool {
+    tokens.iter().any(|token| {
+        matches!(
+            &token.token,
+            Token::Word(word)
+                if word.value.eq_ignore_ascii_case("JOIN")
+                    || word.value.eq_ignore_ascii_case("LEFT")
+                    || word.value.eq_ignore_ascii_case("RIGHT")
+                    || word.value.eq_ignore_ascii_case("FULL")
+                    || word.value.eq_ignore_ascii_case("INNER")
+                    || word.value.eq_ignore_ascii_case("CROSS")
+        )
+    })
 }
 
 /// Information about a single unnecessary alias.
@@ -126,9 +269,9 @@ fn collect_unnecessary_aliases(select: &Select) -> Vec<UnnecessaryAlias> {
 }
 
 type AliasCandidate = (
-    String,       // canonical name (uppercase)
-    bool,         // has_alias
-    String,       // original table name as written
+    String,        // canonical name (uppercase)
+    bool,          // has_alias
+    String,        // original table name as written
     Option<Ident>, // alias ident
 );
 
@@ -210,8 +353,7 @@ fn build_autofix_edits(
     let mut edits = Vec::new();
 
     // Find the extent to delete: look back from alias for AS keyword + whitespace.
-    if let Some(delete_span) =
-        alias_declaration_delete_span(tokens, rel_alias_start, rel_alias_end)
+    if let Some(delete_span) = alias_declaration_delete_span(tokens, rel_alias_start, rel_alias_end)
     {
         edits.push(IssuePatchEdit::new(
             ctx.span_from_statement_offset(delete_span.start, delete_span.end),
@@ -313,9 +455,7 @@ fn find_qualified_alias_references(
             continue;
         }
         // Must be followed by a dot to be a qualified reference.
-        let next_non_trivia = tokens[i + 1..]
-            .iter()
-            .find(|t| !is_trivia_token(&t.token));
+        let next_non_trivia = tokens[i + 1..].iter().find(|t| !is_trivia_token(&t.token));
         if !next_non_trivia.is_some_and(|t| matches!(t.token, Token::Period)) {
             continue;
         }
@@ -462,7 +602,9 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
+    use crate::types::Dialect;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
@@ -481,6 +623,40 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn run_force_enabled_statementless_mssql(sql: &str) -> Vec<Issue> {
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "aliasing.forbid".to_string(),
+                serde_json::json!({"force_enable": true}),
+            )]),
+        };
+        let rule = AliasingForbidSingleTable::from_config(&config);
+        with_active_dialect(Dialect::Mssql, || {
+            rule.check(
+                &synthetic[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        })
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut out = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
     }
 
     fn run_force_enabled(sql: &str) -> Vec<Issue> {
@@ -593,7 +769,11 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("expected autofix");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         // Should have: 1 delete (alias decl) + 1 replace (u.id → users.id)
-        assert!(autofix.edits.len() >= 2, "expected at least 2 edits, got: {:?}", autofix.edits);
+        assert!(
+            autofix.edits.len() >= 2,
+            "expected at least 2 edits, got: {:?}",
+            autofix.edits
+        );
     }
 
     #[test]
@@ -602,10 +782,19 @@ mod tests {
         let issues = run_force_enabled(sql);
         assert_eq!(issues.len(), 2);
         for issue in &issues {
-            assert!(
-                issue.autofix.is_some(),
-                "expected autofix on AL07 issue"
-            );
+            assert!(issue.autofix.is_some(), "expected autofix on AL07 issue");
         }
+    }
+
+    #[test]
+    fn statementless_tsql_create_table_as_alias_fallback_detects_and_fixes() {
+        let sql = "DECLARE @VariableE date = GETDATE()\n\nCREATE TABLE #TempTable\nAS\n(\n  Select ColumnD\n  from SchemaA.TableB AliasC\n  where ColumnD  >= @VariableE\n)\n";
+        let issues = run_force_enabled_statementless_mssql(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("autofix");
+        assert_eq!(
+            fixed,
+            "DECLARE @VariableE date = GETDATE()\n\nCREATE TABLE #TempTable\nAS\n(\n  Select ColumnD\n  from SchemaA.TableB\n  where ColumnD  >= @VariableE\n)\n"
+        );
     }
 }

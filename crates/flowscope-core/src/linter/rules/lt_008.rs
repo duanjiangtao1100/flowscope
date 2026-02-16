@@ -3,12 +3,56 @@
 //! SQLFluff LT08 parity (current scope): require a blank line between CTE body
 //! closing parenthesis and following query/CTE text.
 
+use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
-pub struct LayoutCteNewline;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommaLinePosition {
+    Leading,
+    Trailing,
+}
+
+impl CommaLinePosition {
+    fn from_config(config: &LintConfig) -> Self {
+        let Some(layout_commas) = config.config_section_object("layout.commas") else {
+            return Self::Trailing;
+        };
+
+        match layout_commas
+            .get("line_position")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("trailing")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "leading" => Self::Leading,
+            _ => Self::Trailing,
+        }
+    }
+}
+
+pub struct LayoutCteNewline {
+    comma_line_position: CommaLinePosition,
+}
+
+impl LayoutCteNewline {
+    pub fn from_config(config: &LintConfig) -> Self {
+        Self {
+            comma_line_position: CommaLinePosition::from_config(config),
+        }
+    }
+}
+
+impl Default for LayoutCteNewline {
+    fn default() -> Self {
+        Self {
+            comma_line_position: CommaLinePosition::Trailing,
+        }
+    }
+}
 
 impl LintRule for LayoutCteNewline {
     fn code(&self) -> &'static str {
@@ -24,7 +68,7 @@ impl LintRule for LayoutCteNewline {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        lt08_violation_spans(statement, ctx)
+        lt08_violation_spans(statement, ctx, self.comma_line_position)
             .into_iter()
             .map(|((start, end), fix_span)| {
                 let mut issue = Issue::info(
@@ -59,7 +103,11 @@ type Lt08Span = (usize, usize);
 type Lt08AutofixSpan = (usize, usize);
 type Lt08Violation = (Lt08Span, Option<Lt08AutofixSpan>);
 
-fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<Lt08Violation> {
+fn lt08_violation_spans(
+    statement: &Statement,
+    ctx: &LintContext,
+    comma_line_position: CommaLinePosition,
+) -> Vec<Lt08Violation> {
     let Statement::Query(query) = statement else {
         return Vec::new();
     };
@@ -101,6 +149,14 @@ fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<Lt08Vio
                         autofix_span =
                             Some((gap_start - statement_start, next_start - statement_start));
                     }
+                } else if gap_start == next_start
+                    && matches!(comma_line_position, CommaLinePosition::Leading)
+                {
+                    let next_token = &ctx.sql[next_start..next_end];
+                    if next_token == "," {
+                        autofix_span =
+                            Some((gap_start - statement_start, gap_start - statement_start));
+                    }
                 }
 
                 spans.push((
@@ -111,7 +167,114 @@ fn lt08_violation_spans(statement: &Statement, ctx: &LintContext) -> Vec<Lt08Vio
         }
     }
 
+    if matches!(comma_line_position, CommaLinePosition::Leading) {
+        if let Some(comma_abs) = find_oneline_leading_cte_comma(
+            ctx.sql,
+            ctx.statement_range.start,
+            ctx.statement_range.end,
+        ) {
+            let relative = comma_abs - statement_start;
+            let has_existing = spans
+                .iter()
+                .any(|((start, end), _)| *start <= relative && relative < *end);
+            if !has_existing {
+                spans.push(((relative, relative + 1), Some((relative, relative))));
+            }
+        }
+    }
+
     spans
+}
+
+fn find_oneline_leading_cte_comma(
+    sql: &str,
+    statement_start: usize,
+    statement_end: usize,
+) -> Option<usize> {
+    let statement_sql = &sql[statement_start..statement_end];
+    if !statement_sql
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("with")
+    {
+        return None;
+    }
+
+    let bytes = statement_sql.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b',' {
+            continue;
+        }
+
+        // Look backwards for `)` with only horizontal whitespace in between.
+        let mut probe = index;
+        while probe > 0 && matches!(bytes[probe - 1], b' ' | b'\t') {
+            probe -= 1;
+        }
+        if probe == 0 || bytes[probe - 1] != b')' {
+            continue;
+        }
+        if statement_sql[probe - 1..index].contains('\n')
+            || statement_sql[probe - 1..index].contains('\r')
+        {
+            continue;
+        }
+
+        // Look forwards for `<cte_name> AS (` with only horizontal whitespace
+        // around separators.
+        let mut next = index + 1;
+        while next < bytes.len() && matches!(bytes[next], b' ' | b'\t') {
+            next += 1;
+        }
+        if next >= bytes.len() || !is_identifier_start(bytes[next]) {
+            continue;
+        }
+        next += 1;
+        while next < bytes.len() && is_identifier_part(bytes[next]) {
+            next += 1;
+        }
+
+        let mut saw_space = false;
+        while next < bytes.len() && matches!(bytes[next], b' ' | b'\t') {
+            saw_space = true;
+            next += 1;
+        }
+        if !saw_space {
+            continue;
+        }
+        if !starts_with_ascii_case_insensitive(bytes, next, b"AS") {
+            continue;
+        }
+        next += 2;
+        while next < bytes.len() && matches!(bytes[next], b' ' | b'\t') {
+            next += 1;
+        }
+        if next >= bytes.len() || bytes[next] != b'(' {
+            continue;
+        }
+
+        return Some(statement_start + index);
+    }
+
+    None
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_identifier_part(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
+    if start + needle.len() > haystack.len() {
+        return false;
+    }
+    haystack[start..start + needle.len()]
+        .iter()
+        .zip(needle.iter())
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 fn tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LocatedToken>> {
@@ -296,12 +459,13 @@ fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::config::LintConfig;
     use crate::parser::parse_sql;
     use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
-        let rule = LayoutCteNewline;
+        let rule = LayoutCteNewline::default();
         statements
             .iter()
             .enumerate()
@@ -371,5 +535,52 @@ SELECT * FROM b");
     #[test]
     fn comment_only_line_is_not_a_blank_line_separator() {
         assert!(!run("WITH cte AS (SELECT 1)\n-- separator\nSELECT * FROM cte").is_empty());
+    }
+
+    #[test]
+    fn leading_comma_oneline_cte_autofix_inserts_blank_line_before_comma() {
+        let sql =
+            "with my_cte as (select 1), other_cte as (select 1) select * from my_cte\ncross join other_cte\n";
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.commas".to_string(),
+                serde_json::json!({"line_position": "leading"}),
+            )]),
+        };
+        let rule = LayoutCteNewline::from_config(&config);
+        let statements = parse_sql(sql).expect("parse");
+        let issues = statements
+            .iter()
+            .enumerate()
+            .flat_map(|(index, statement)| {
+                rule.check(
+                    statement,
+                    &LintContext {
+                        sql,
+                        statement_range: 0..sql.len(),
+                        statement_index: index,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let fixed = issues.iter().fold(sql.to_string(), |current, issue| {
+            let Some(autofix) = issue.autofix.as_ref() else {
+                return current;
+            };
+            let mut edits = autofix.edits.clone();
+            edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+            let mut updated = current;
+            for edit in edits.into_iter().rev() {
+                updated.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+            }
+            updated
+        });
+        assert_eq!(
+            fixed,
+            "with my_cte as (select 1)\n\n, other_cte as (select 1)\n\nselect * from my_cte\ncross join other_cte\n"
+        );
     }
 }

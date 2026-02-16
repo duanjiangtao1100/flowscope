@@ -22,6 +22,7 @@ pub struct CapitalisationFunctions {
     policy: CapitalisationPolicy,
     ignore_words: HashSet<String>,
     ignore_words_regex: Option<Regex>,
+    ignore_templated_areas: bool,
 }
 
 impl CapitalisationFunctions {
@@ -34,6 +35,9 @@ impl CapitalisationFunctions {
             ),
             ignore_words: ignored_words_from_config(config, issue_codes::LINT_CP_003),
             ignore_words_regex: ignored_words_regex_from_config(config, issue_codes::LINT_CP_003),
+            ignore_templated_areas: config
+                .core_option_bool("ignore_templated_areas")
+                .unwrap_or(false),
         }
     }
 }
@@ -44,6 +48,7 @@ impl Default for CapitalisationFunctions {
             policy: CapitalisationPolicy::Consistent,
             ignore_words: HashSet::new(),
             ignore_words_regex: None,
+            ignore_templated_areas: false,
         }
     }
 }
@@ -71,13 +76,30 @@ impl LintRule for CapitalisationFunctions {
             return Vec::new();
         }
 
-        let function_tokens = functions
+        let mut function_tokens = functions
             .iter()
             .map(|candidate| candidate.value.clone())
             .collect::<Vec<_>>();
+        if ctx.is_templated() && !self.ignore_templated_areas {
+            if let Some(rendered_tokens) = rendered_function_values_for_context(
+                ctx,
+                &self.ignore_words,
+                self.ignore_words_regex.as_ref(),
+            ) {
+                if !rendered_tokens.is_empty() {
+                    function_tokens = rendered_tokens;
+                }
+            }
+        }
         if !tokens_violate_policy(&function_tokens, self.policy) {
             return Vec::new();
         }
+
+        let resolved_policy = if self.policy == CapitalisationPolicy::Consistent {
+            resolve_consistent_policy_from_values(&function_tokens)
+        } else {
+            self.policy
+        };
 
         let mut issue = Issue::info(
             issue_codes::LINT_CP_003,
@@ -85,7 +107,7 @@ impl LintRule for CapitalisationFunctions {
         )
         .with_statement(ctx.statement_index);
 
-        let autofix_edits = function_autofix_edits(ctx, &functions, self.policy);
+        let autofix_edits = function_autofix_edits(ctx, &functions, resolved_policy);
         if !autofix_edits.is_empty() {
             issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
         }
@@ -94,7 +116,7 @@ impl LintRule for CapitalisationFunctions {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FunctionCandidate {
     value: String,
     start: usize,
@@ -111,7 +133,9 @@ fn function_candidates_for_context(
         return Vec::new();
     };
 
-    function_candidates(sql, &tokens, ignore_words, ignore_words_regex)
+    let mut candidates = function_candidates(sql, &tokens, ignore_words, ignore_words_regex);
+    candidates.sort_by_key(|candidate| (candidate.start, candidate.end));
+    candidates
 }
 
 fn function_candidates(
@@ -170,18 +194,14 @@ fn function_candidates(
 fn function_autofix_edits(
     ctx: &LintContext,
     functions: &[FunctionCandidate],
-    policy: CapitalisationPolicy,
+    resolved_policy: CapitalisationPolicy,
 ) -> Vec<IssuePatchEdit> {
-    // For consistent mode, resolve to the first-seen concrete style.
-    let resolved_policy = if policy == CapitalisationPolicy::Consistent {
-        resolve_consistent_policy(functions)
-    } else {
-        policy
-    };
+    let mut ordered_functions = functions.to_vec();
+    ordered_functions.sort_by_key(|candidate| (candidate.start, candidate.end));
 
     let mut edits = Vec::new();
 
-    for candidate in functions {
+    for candidate in &ordered_functions {
         let Some(replacement) =
             function_case_replacement(candidate.value.as_str(), resolved_policy)
         else {
@@ -221,10 +241,7 @@ fn function_case_replacement(value: &str, policy: CapitalisationPolicy) -> Optio
     }
 }
 
-/// Determine the concrete capitalisation style using SQLFluff's cumulative
-/// refutation algorithm (same as CP01). Refuted cases accumulate across
-/// function names: the first function that fully determines a style wins.
-fn resolve_consistent_policy(functions: &[FunctionCandidate]) -> CapitalisationPolicy {
+fn resolve_consistent_policy_from_values(values: &[String]) -> CapitalisationPolicy {
     const UPPER: u8 = 0b001;
     const LOWER: u8 = 0b010;
     const CAPITALISE: u8 = 0b100;
@@ -232,8 +249,8 @@ fn resolve_consistent_policy(functions: &[FunctionCandidate]) -> CapitalisationP
     let mut refuted: u8 = 0;
     let mut latest_possible = CapitalisationPolicy::Upper; // default
 
-    for func in functions {
-        let v = func.value.as_str();
+    for v in values {
+        let v = v.as_str();
 
         let first_is_lower = v
             .chars()
@@ -270,6 +287,67 @@ fn resolve_consistent_policy(functions: &[FunctionCandidate]) -> CapitalisationP
     }
 
     latest_possible
+}
+
+fn rendered_function_values_for_context(
+    ctx: &LintContext,
+    ignore_words: &HashSet<String>,
+    ignore_words_regex: Option<&Regex>,
+) -> Option<Vec<String>> {
+    ctx.with_document_tokens(|tokens| {
+        if tokens.is_empty() {
+            return None;
+        }
+        Some(function_token_values(
+            tokens,
+            ignore_words,
+            ignore_words_regex,
+        ))
+    })
+}
+
+fn function_token_values(
+    tokens: &[TokenWithSpan],
+    ignore_words: &HashSet<String>,
+    ignore_words_regex: Option<&Regex>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+
+        if token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex) {
+            continue;
+        }
+
+        if index > 0 && matches!(tokens[index - 1].token, Token::Period) {
+            continue;
+        }
+
+        if is_data_type_keyword(word.value.as_str()) {
+            continue;
+        }
+
+        let next_index = next_non_trivia_index(tokens, index + 1);
+        let is_regular_function_call = next_index
+            .map(|idx| matches!(tokens[idx].token, Token::LParen))
+            .unwrap_or(false);
+        let is_bare_function = is_bare_function_keyword(word.value.as_str());
+        if !is_regular_function_call && !is_bare_function {
+            continue;
+        }
+
+        out.push((
+            token.span.start.line,
+            token.span.start.column,
+            word.value.clone(),
+        ));
+    }
+
+    out.sort_by_key(|(line, column, _)| (*line, *column));
+    out.into_iter().map(|(_, _, value)| value).collect()
 }
 
 fn capitalise_ascii_token(value: &str) -> String {
@@ -409,6 +487,7 @@ fn is_data_type_keyword(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
+    use crate::linter::rule::{with_active_document_tokens, with_active_is_templated};
     use crate::parser::parse_sql;
     use crate::types::IssueAutofixApplicability;
 
@@ -628,5 +707,82 @@ mod tests {
         let issues = run("SELECT CURRENT_TIMESTAMP, current_timestamp FROM t");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CP_003);
+    }
+
+    #[test]
+    fn consistent_policy_autofix_uses_source_order_even_when_candidates_are_unsorted() {
+        let sql = "SELECT greatest(x), GREATEST(y) FROM t";
+        let ctx = LintContext {
+            sql,
+            statement_range: 0..sql.len(),
+            statement_index: 0,
+        };
+
+        let upper_start = sql.find("GREATEST").expect("uppercase function position");
+        let lower_start = sql.find("greatest").expect("lowercase function position");
+        let unsorted = vec![
+            FunctionCandidate {
+                value: "GREATEST".to_string(),
+                start: upper_start,
+                end: upper_start + "GREATEST".len(),
+            },
+            FunctionCandidate {
+                value: "greatest".to_string(),
+                start: lower_start,
+                end: lower_start + "greatest".len(),
+            },
+        ];
+
+        let edits = function_autofix_edits(&ctx, &unsorted, CapitalisationPolicy::Consistent);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].span.start, upper_start);
+        assert_eq!(edits[0].span.end, upper_start + "GREATEST".len());
+        assert_eq!(edits[0].replacement, "greatest");
+    }
+
+    #[test]
+    fn templated_policy_tokens_drive_source_mapped_autofix_when_not_ignored() {
+        let source_sql = "SELECT\n    {{ \"greatest(a, b)\" }},\n    GREATEST(i, j)\n";
+        let rendered_sql = "SELECT\n    greatest(a, b),\n    GREATEST(i, j)\n";
+        let rendered_tokens = tokenized(rendered_sql, Dialect::Ansi).expect("rendered tokens");
+        let statements = parse_sql("SELECT 1").expect("synthetic parse");
+        let rule = CapitalisationFunctions::from_config(&LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "core".to_string(),
+                serde_json::json!({"ignore_templated_areas": false}),
+            )]),
+        });
+
+        let issues = with_active_is_templated(true, || {
+            with_active_document_tokens(&rendered_tokens, || {
+                rule.check(
+                    &statements[0],
+                    &LintContext {
+                        sql: source_sql,
+                        statement_range: 0..source_sql.len(),
+                        statement_index: 0,
+                    },
+                )
+            })
+        });
+
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected autofix metadata");
+        assert!(
+            autofix
+                .edits
+                .iter()
+                .any(
+                    |edit| &source_sql[edit.span.start..edit.span.end] == "GREATEST"
+                        && edit.replacement == "greatest"
+                ),
+            "expected source-mapped GREATEST fix, got edits={:?}",
+            autofix.edits
+        );
     }
 }

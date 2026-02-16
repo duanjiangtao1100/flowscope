@@ -14,6 +14,7 @@ use std::ops::Range;
 pub struct LayoutNewlines {
     maximum_empty_lines_inside_statements: usize,
     maximum_empty_lines_between_statements: usize,
+    maximum_empty_lines_between_batches: Option<usize>,
 }
 
 impl LayoutNewlines {
@@ -31,6 +32,10 @@ impl LayoutNewlines {
                     "maximum_empty_lines_between_statements",
                 )
                 .unwrap_or(1),
+            maximum_empty_lines_between_batches: config.rule_option_usize(
+                issue_codes::LINT_LT_015,
+                "maximum_empty_lines_between_batches",
+            ),
         }
     }
 }
@@ -40,6 +45,7 @@ impl Default for LayoutNewlines {
         Self {
             maximum_empty_lines_inside_statements: 1,
             maximum_empty_lines_between_statements: 1,
+            maximum_empty_lines_between_batches: None,
         }
     }
 }
@@ -60,9 +66,17 @@ impl LintRule for LayoutNewlines {
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let (inside_range, statement_sql) = trimmed_statement_range_and_sql(ctx);
         let inside_tokens = tokenized_for_range(ctx, inside_range.clone());
-        let excessive_inside =
+        let effective_batch_limit = self
+            .maximum_empty_lines_between_batches
+            .unwrap_or(self.maximum_empty_lines_between_statements);
+        let inside_blank_run = if ctx.dialect() == Dialect::Mssql
+            && contains_tsql_batch_separator_line(statement_sql)
+        {
+            max_consecutive_blank_lines_in_tsql_batches(statement_sql)
+        } else {
             max_consecutive_blank_lines(statement_sql, ctx.dialect(), inside_tokens.as_deref())
-                > self.maximum_empty_lines_inside_statements;
+        };
+        let excessive_inside = inside_blank_run > self.maximum_empty_lines_inside_statements;
 
         let mut gap_range = None;
         let excessive_between = if ctx.statement_index > 0 {
@@ -70,8 +84,15 @@ impl LintRule for LayoutNewlines {
             let gap_sql = &ctx.sql[range.clone()];
             let gap_tokens = tokenized_for_range(ctx, range.clone());
             gap_range = Some(range);
-            max_consecutive_blank_lines(gap_sql, ctx.dialect(), gap_tokens.as_deref())
-                > self.maximum_empty_lines_between_statements
+            if ctx.dialect() == Dialect::Mssql && contains_tsql_batch_separator_line(gap_sql) {
+                max_blank_lines_around_tsql_batch_separator(gap_sql) > effective_batch_limit
+            } else if ctx.dialect() == Dialect::Mssql {
+                blank_lines_in_inter_statement_gap(gap_sql, gap_tokens.as_deref())
+                    > self.maximum_empty_lines_between_statements
+            } else {
+                max_consecutive_blank_lines(gap_sql, ctx.dialect(), gap_tokens.as_deref())
+                    > self.maximum_empty_lines_between_statements
+            }
         } else {
             false
         };
@@ -87,10 +108,15 @@ impl LintRule for LayoutNewlines {
             }
             if excessive_between {
                 if let Some(range) = gap_range {
+                    let max_gap_lines = if ctx.dialect() == Dialect::Mssql {
+                        effective_batch_limit
+                    } else {
+                        self.maximum_empty_lines_between_statements
+                    };
                     edits.extend(excessive_blank_line_edits_for_range(
                         ctx.sql,
                         range,
-                        self.maximum_empty_lines_between_statements,
+                        max_gap_lines,
                     ));
                 }
             }
@@ -226,6 +252,9 @@ fn max_consecutive_blank_lines_tokenized(
             non_blank_lines.insert(line);
         }
     }
+    if dialect == Dialect::Mssql {
+        mark_tsql_batch_separator_lines(sql, &mut non_blank_lines);
+    }
 
     let mut blank_run = 0usize;
     let mut max_run = 0usize;
@@ -241,6 +270,109 @@ fn max_consecutive_blank_lines_tokenized(
     }
 
     max_run
+}
+
+fn contains_tsql_batch_separator_line(sql: &str) -> bool {
+    sql.lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("GO"))
+}
+
+fn max_consecutive_blank_lines_in_tsql_batches(sql: &str) -> usize {
+    let mut batches = Vec::<String>::new();
+    let mut current = String::new();
+
+    for line in sql.split_inclusive('\n') {
+        if line
+            .trim_end_matches(['\n', '\r'])
+            .trim()
+            .eq_ignore_ascii_case("GO")
+        {
+            batches.push(std::mem::take(&mut current));
+        } else {
+            current.push_str(line);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+
+    if batches.is_empty() {
+        return 0;
+    }
+
+    batches
+        .iter()
+        .map(|batch| {
+            let (start, end) = trim_ascii_whitespace_bounds(batch);
+            if start >= end {
+                0
+            } else {
+                max_consecutive_blank_lines(&batch[start..end], Dialect::Mssql, None)
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn max_blank_lines_around_tsql_batch_separator(gap_sql: &str) -> usize {
+    let lines: Vec<&str> = gap_sql.split('\n').collect();
+    let mut max_blank = 0usize;
+
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim().eq_ignore_ascii_case("GO") {
+            continue;
+        }
+
+        let mut before = 0usize;
+        let mut cursor = index;
+        while cursor > 0 {
+            let prev = lines[cursor - 1].trim_end_matches('\r');
+            if !prev.trim().is_empty() {
+                break;
+            }
+            before += 1;
+            cursor -= 1;
+        }
+
+        let mut after = 0usize;
+        let mut cursor = index + 1;
+        while cursor < lines.len() {
+            let next = lines[cursor].trim_end_matches('\r');
+            if !next.trim().is_empty() {
+                break;
+            }
+            after += 1;
+            cursor += 1;
+        }
+
+        max_blank = max_blank.max(before.saturating_sub(1));
+        max_blank = max_blank.max(after.saturating_sub(1));
+    }
+
+    max_blank
+}
+
+fn blank_lines_in_inter_statement_gap(gap_sql: &str, tokens: Option<&[TokenWithSpan]>) -> usize {
+    if gap_sql.is_empty() {
+        return 0;
+    }
+
+    if gap_sql.chars().all(|ch| ch.is_ascii_whitespace()) {
+        return count_line_breaks(gap_sql).saturating_sub(1);
+    }
+
+    max_consecutive_blank_lines(gap_sql, Dialect::Mssql, tokens)
+}
+
+fn mark_tsql_batch_separator_lines(
+    sql: &str,
+    non_blank_lines: &mut std::collections::BTreeSet<usize>,
+) {
+    for (line_index, line) in sql.lines().enumerate() {
+        if line.trim().eq_ignore_ascii_case("GO") {
+            non_blank_lines.insert(line_index + 1);
+        }
+    }
 }
 
 fn line_count_from_tokens_or_sql(sql: &str, tokens: &[TokenWithSpan]) -> usize {
@@ -493,6 +625,7 @@ fn relative_location(
 mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
     use crate::types::IssueAutofixApplicability;
 
@@ -546,6 +679,24 @@ mod tests {
 
     fn run(sql: &str) -> Vec<Issue> {
         run_with_rule(sql, &LayoutNewlines::default())
+    }
+
+    fn run_statementless_with_rule_in_dialect(
+        sql: &str,
+        rule: &LayoutNewlines,
+        dialect: Dialect,
+    ) -> Vec<Issue> {
+        let placeholder = parse_sql("SELECT 1").expect("parse placeholder");
+        with_active_dialect(dialect, || {
+            rule.check(
+                &placeholder[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        })
     }
 
     fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
@@ -651,5 +802,75 @@ mod tests {
     fn trim_ascii_whitespace_bounds_handles_all_whitespace_input() {
         let (start, end) = trim_ascii_whitespace_bounds(" \t\r\n ");
         assert_eq!((start, end), (5, 5));
+    }
+
+    #[test]
+    fn mssql_go_batch_separator_breaks_blank_line_runs() {
+        let sql = "SELECT 1;\n\nGO\n\nSELECT 2;\n";
+        let max = max_consecutive_blank_lines(sql, Dialect::Mssql, None);
+        assert_eq!(
+            max, 1,
+            "GO should be treated as a non-blank batch separator line",
+        );
+    }
+
+    #[test]
+    fn mssql_go_batch_separator_with_two_blank_lines_still_flags() {
+        let sql = "SELECT 1;\n\nGO\n\n\nSELECT 2;\n";
+        let max = max_consecutive_blank_lines(sql, Dialect::Mssql, None);
+        assert_eq!(max, 2);
+    }
+
+    #[test]
+    fn mssql_between_statement_gap_counts_empty_lines_not_line_breaks() {
+        assert_eq!(blank_lines_in_inter_statement_gap("\n\n", None), 1);
+        assert_eq!(blank_lines_in_inter_statement_gap("\n\n\n", None), 2);
+    }
+
+    #[test]
+    fn mssql_passes_single_empty_line_between_batches() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.newlines".to_string(),
+                serde_json::json!({"maximum_empty_lines_between_batches": 1}),
+            )]),
+        };
+        let sql = "SELECT 1;\n\nGO\n\nSELECT 2;\n";
+        let issues = run_statementless_with_rule_in_dialect(
+            sql,
+            &LayoutNewlines::from_config(&config),
+            Dialect::Mssql,
+        );
+        assert!(
+            issues.is_empty(),
+            "mssql GO batch with one empty line should pass"
+        );
+    }
+
+    #[test]
+    fn mssql_passes_inside_batch_statement_limit_before_go() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "layout.newlines".to_string(),
+                serde_json::json!({
+                    "maximum_empty_lines_inside_statements": 1,
+                    "maximum_empty_lines_between_statements": 1
+                }),
+            )]),
+        };
+        let sql = "SELECT 1;\n\nSELECT 2;\n\nGO\n";
+        let issues = run_statementless_with_rule_in_dialect(
+            sql,
+            &LayoutNewlines::from_config(&config),
+            Dialect::Mssql,
+        );
+        assert!(
+            issues.is_empty(),
+            "inside-batch statement spacing should be evaluated independently of GO separator"
+        );
     }
 }

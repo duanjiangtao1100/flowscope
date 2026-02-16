@@ -8,7 +8,7 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use regex::Regex;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ObjectName, Statement};
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -72,12 +72,29 @@ impl LintRule for CapitalisationIdentifiers {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let identifiers = identifier_tokens(
+        if databricks_case_sensitive_set_property(statement, ctx.dialect()) {
+            return Vec::new();
+        }
+
+        let ast_identifiers = identifier_tokens(
             statement,
             self.unquoted_policy,
             &self.ignore_words,
             self.ignore_words_regex.as_ref(),
         );
+        let use_lexical_fallback =
+            ast_identifiers.is_empty() && self.unquoted_policy == IdentifierPolicy::All;
+        let identifiers = if use_lexical_fallback {
+            lexical_identifier_tokens(
+                ctx.statement_sql(),
+                ctx.dialect(),
+                &self.ignore_words,
+                self.ignore_words_regex.as_ref(),
+            )
+        } else {
+            ast_identifiers
+        };
+
         if !tokens_violate_policy(&identifiers, self.policy) {
             return Vec::new();
         }
@@ -88,23 +105,35 @@ impl LintRule for CapitalisationIdentifiers {
         )
         .with_statement(ctx.statement_index);
 
-        let autofix_edits = identifier_autofix_edits(
-            ctx.statement_sql(),
-            ctx.dialect(),
-            self.policy,
-            self.unquoted_policy,
-            &self.ignore_words,
-            self.ignore_words_regex.as_ref(),
-            statement,
-        )
-        .into_iter()
-        .map(|edit| {
-            IssuePatchEdit::new(
-                ctx.span_from_statement_offset(edit.start, edit.end),
-                edit.replacement,
+        let autofix_edits = if use_lexical_fallback {
+            lexical_identifier_autofix_edits(
+                ctx.statement_sql(),
+                ctx.dialect(),
+                self.policy,
+                &self.ignore_words,
+                self.ignore_words_regex.as_ref(),
             )
-        })
-        .collect::<Vec<_>>();
+        } else {
+            identifier_autofix_edits(
+                ctx.statement_sql(),
+                ctx.dialect(),
+                self.policy,
+                self.unquoted_policy,
+                &self.ignore_words,
+                self.ignore_words_regex.as_ref(),
+                statement,
+            )
+        };
+
+        let autofix_edits = autofix_edits
+            .into_iter()
+            .map(|edit| {
+                IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit.start, edit.end),
+                    edit.replacement,
+                )
+            })
+            .collect::<Vec<_>>();
         if !autofix_edits.is_empty() {
             issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
         }
@@ -300,6 +329,256 @@ fn identifier_autofix_edits(
     }
 
     edits
+}
+
+fn lexical_identifier_tokens(
+    sql: &str,
+    dialect: Dialect,
+    ignore_words: &HashSet<String>,
+    ignore_words_regex: Option<&Regex>,
+) -> Vec<String> {
+    let Some(tokens) = tokenized(sql, dialect) else {
+        return Vec::new();
+    };
+    lexical_identifier_values_from_tokens(&tokens, ignore_words, ignore_words_regex)
+}
+
+fn lexical_identifier_autofix_edits(
+    sql: &str,
+    dialect: Dialect,
+    policy: CapitalisationPolicy,
+    ignore_words: &HashSet<String>,
+    ignore_words_regex: Option<&Regex>,
+) -> Vec<Cp002AutofixEdit> {
+    let Some(tokens) = tokenized(sql, dialect) else {
+        return Vec::new();
+    };
+    let lexical_identifiers =
+        lexical_identifier_values_from_tokens(&tokens, ignore_words, ignore_words_regex);
+    if lexical_identifiers.is_empty() {
+        return Vec::new();
+    }
+
+    let relevant_idents = lexical_identifiers.into_iter().collect::<HashSet<_>>();
+    let effective_policy = if policy == CapitalisationPolicy::Consistent {
+        resolve_consistent_policy(&tokens, ignore_words, ignore_words_regex, &relevant_idents)
+    } else {
+        policy
+    };
+
+    let mut edits = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if !is_lexical_identifier_candidate(&tokens, index, ignore_words, ignore_words_regex) {
+            continue;
+        }
+
+        let Some(replacement) = identifier_case_replacement(word.value.as_str(), effective_policy)
+        else {
+            continue;
+        };
+        if replacement == word.value {
+            continue;
+        }
+
+        let Some((start, end)) = token_offsets(sql, token) else {
+            continue;
+        };
+        edits.push(Cp002AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+
+    edits
+}
+
+fn lexical_identifier_values_from_tokens(
+    tokens: &[TokenWithSpan],
+    ignore_words: &HashSet<String>,
+    ignore_words_regex: Option<&Regex>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if !is_lexical_identifier_candidate(tokens, index, ignore_words, ignore_words_regex) {
+            continue;
+        }
+        out.push(word.value.clone());
+    }
+    out
+}
+
+fn is_lexical_identifier_candidate(
+    tokens: &[TokenWithSpan],
+    index: usize,
+    ignore_words: &HashSet<String>,
+    ignore_words_regex: Option<&Regex>,
+) -> bool {
+    let Token::Word(word) = &tokens[index].token else {
+        return false;
+    };
+    if word.quote_style.is_some() || word.keyword != Keyword::NoKeyword {
+        return false;
+    }
+    if token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex) {
+        return false;
+    }
+    if is_placeholder_variable_word(tokens, index) {
+        return false;
+    }
+    if token_has_div_neighbor(tokens, index) {
+        return false;
+    }
+    if is_create_task_option_name(tokens, index) {
+        return false;
+    }
+
+    let next_index = next_non_trivia_index(tokens, index + 1);
+    if next_index
+        .map(|next| matches!(tokens[next].token, Token::LParen))
+        .unwrap_or(false)
+        && !is_copy_into_target_name(tokens, index)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn token_has_div_neighbor(tokens: &[TokenWithSpan], index: usize) -> bool {
+    prev_non_trivia_index(tokens, index)
+        .map(|prev| matches!(tokens[prev].token, Token::Div))
+        .unwrap_or(false)
+        || next_non_trivia_index(tokens, index + 1)
+            .map(|next| matches!(tokens[next].token, Token::Div))
+            .unwrap_or(false)
+}
+
+fn is_placeholder_variable_word(tokens: &[TokenWithSpan], index: usize) -> bool {
+    let prev = prev_non_trivia_index(tokens, index).map(|idx| &tokens[idx].token);
+    let next = next_non_trivia_index(tokens, index + 1).map(|idx| &tokens[idx].token);
+
+    matches!(
+        prev,
+        Some(Token::Placeholder(_) | Token::Char('$') | Token::LBrace)
+    ) || matches!(next, Some(Token::RBrace))
+}
+
+fn is_copy_into_target_name(tokens: &[TokenWithSpan], word_index: usize) -> bool {
+    let mut cursor = word_index;
+    let mut steps = 0usize;
+
+    while let Some(prev_idx) = prev_non_trivia_index(tokens, cursor) {
+        match &tokens[prev_idx].token {
+            Token::Word(word) if word.keyword == Keyword::INTO => {
+                let Some(copy_idx) = prev_non_trivia_index(tokens, prev_idx) else {
+                    return false;
+                };
+                return matches!(
+                    &tokens[copy_idx].token,
+                    Token::Word(copy_word) if copy_word.keyword == Keyword::COPY
+                );
+            }
+            Token::Word(word)
+                if matches!(
+                    word.keyword,
+                    Keyword::FROM
+                        | Keyword::SELECT
+                        | Keyword::WHERE
+                        | Keyword::JOIN
+                        | Keyword::ON
+                        | Keyword::HAVING
+                ) =>
+            {
+                return false;
+            }
+            Token::SemiColon | Token::Comma | Token::LParen | Token::RParen => return false,
+            _ => {}
+        }
+
+        cursor = prev_idx;
+        steps += 1;
+        if steps > 48 {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn is_create_task_option_name(tokens: &[TokenWithSpan], word_index: usize) -> bool {
+    let Some(next_idx) = next_non_trivia_index(tokens, word_index + 1) else {
+        return false;
+    };
+    if !matches!(tokens[next_idx].token, Token::Eq) {
+        return false;
+    }
+
+    let mut cursor = word_index;
+    let mut saw_task = false;
+    let mut steps = 0usize;
+
+    while let Some(prev_idx) = prev_non_trivia_index(tokens, cursor) {
+        match &tokens[prev_idx].token {
+            // CREATE TASK option keys are before the AS clause.
+            Token::Word(word) if word.keyword == Keyword::AS => return false,
+            Token::Word(word) if word.keyword == Keyword::TASK => saw_task = true,
+            Token::Word(word) if saw_task && word.keyword == Keyword::CREATE => return true,
+            Token::SemiColon => return false,
+            _ => {}
+        }
+
+        cursor = prev_idx;
+        steps += 1;
+        if steps > 128 {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn databricks_case_sensitive_set_property(statement: &Statement, dialect: Dialect) -> bool {
+    if dialect != Dialect::Databricks {
+        return false;
+    }
+
+    let Statement::Set(set_stmt) = statement else {
+        return false;
+    };
+
+    match set_stmt {
+        sqlparser::ast::Set::SingleAssignment { variable, .. } => {
+            is_databricks_delta_property_key(variable)
+        }
+        sqlparser::ast::Set::MultipleAssignments { assignments } => assignments
+            .iter()
+            .any(|assignment| is_databricks_delta_property_key(&assignment.name)),
+        _ => false,
+    }
+}
+
+fn is_databricks_delta_property_key(name: &ObjectName) -> bool {
+    let mut parts = Vec::with_capacity(name.0.len());
+    for part in &name.0 {
+        let Some(ident) = part.as_ident() else {
+            return false;
+        };
+        parts.push(ident.value.as_str());
+    }
+
+    // spark.databricks.delta.properties.<scope>.<property_name>
+    parts.len() >= 5
+        && parts[0].eq_ignore_ascii_case("spark")
+        && parts[1].eq_ignore_ascii_case("databricks")
+        && parts[2].eq_ignore_ascii_case("delta")
+        && parts[3].eq_ignore_ascii_case("properties")
 }
 
 fn identifier_case_replacement(value: &str, policy: CapitalisationPolicy) -> Option<String> {
@@ -701,7 +980,8 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
-    use crate::parser::parse_sql_with_dialect;
+    use crate::linter::rule::with_active_dialect;
+    use crate::parser::{parse_sql, parse_sql_with_dialect};
     use crate::types::Dialect;
     use crate::types::IssueAutofixApplicability;
 
@@ -716,20 +996,41 @@ mod tests {
     fn run_with_config_in_dialect(sql: &str, dialect: Dialect, config: LintConfig) -> Vec<Issue> {
         let statements = parse_sql_with_dialect(sql, dialect).expect("parse");
         let rule = CapitalisationIdentifiers::from_config(&config);
-        statements
-            .iter()
-            .enumerate()
-            .flat_map(|(index, statement)| {
-                rule.check(
-                    statement,
-                    &LintContext {
-                        sql,
-                        statement_range: 0..sql.len(),
-                        statement_index: index,
-                    },
-                )
-            })
-            .collect()
+        with_active_dialect(dialect, || {
+            statements
+                .iter()
+                .enumerate()
+                .flat_map(|(index, statement)| {
+                    rule.check(
+                        statement,
+                        &LintContext {
+                            sql,
+                            statement_range: 0..sql.len(),
+                            statement_index: index,
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn run_statementless_with_config_in_dialect(
+        sql: &str,
+        dialect: Dialect,
+        config: LintConfig,
+    ) -> Vec<Issue> {
+        let placeholder = parse_sql("SELECT 1").expect("parse placeholder");
+        let rule = CapitalisationIdentifiers::from_config(&config);
+        with_active_dialect(dialect, || {
+            rule.check(
+                &placeholder[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        })
     }
 
     fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
@@ -899,6 +1200,19 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CP_002);
+    }
+
+    #[test]
+    fn databricks_set_delta_property_key_is_ignored() {
+        let issues = run_with_config_in_dialect(
+            "SET spark.databricks.delta.properties.defaults.enableChangeDataFeed = true;",
+            Dialect::Databricks,
+            LintConfig::default(),
+        );
+        assert!(
+            issues.is_empty(),
+            "databricks property keys are case-sensitive"
+        );
     }
 
     #[test]
@@ -1154,5 +1468,42 @@ mod tests {
         assert_eq!(issues.len(), 1);
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert!(!autofix.edits.is_empty(), "should emit autofix edits");
+    }
+
+    #[test]
+    fn statementless_fallback_fixes_copy_into_identifier_case() {
+        let sql = "create task ${env}_ENT_LANDING.SCHEMA_NAME.TASK_NAME\nas\n    COPY INTO ${env}_ENT_LANDING.SCHEMA_NAME.ProblemHere(\n        ONE_OR_MORE_COLUMN_NAMES_HERE\n    )\n    FROM @${env}_ENT_COMMON.GLOBAL.FILEINGESTION_STAGE/file\n";
+        let issues = run_statementless_with_config_in_dialect(
+            sql,
+            Dialect::Snowflake,
+            LintConfig::default(),
+        );
+        assert!(!issues.is_empty(), "expected CP02 fallback issue");
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert!(fixed.contains(".PROBLEMHERE("), "fixed: {fixed}");
+        assert!(
+            fixed.contains("/file"),
+            "path segment casing should be preserved: {fixed}"
+        );
+    }
+
+    #[test]
+    fn statementless_fallback_keeps_create_task_option_name_case() {
+        let sql = "create task ${env}_ENT_LANDING.SCHEMA_NAME.TASK_NAME\n    schedule='${repl_cdc_schedule}'\nas\n    COPY INTO ${env}_ENT_LANDING.SCHEMA_NAME.ProblemHere(\n        ONE_OR_MORE_COLUMN_NAMES_HERE\n    )\n    FROM @${env}_ENT_COMMON.GLOBAL.FILEINGESTION_STAGE/file\n";
+        let issues = run_statementless_with_config_in_dialect(
+            sql,
+            Dialect::Snowflake,
+            LintConfig::default(),
+        );
+        assert!(!issues.is_empty(), "expected CP02 fallback issue");
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert!(
+            fixed.contains("schedule='${repl_cdc_schedule}'"),
+            "CREATE TASK option key should not be uppercased: {fixed}"
+        );
+        assert!(
+            fixed.contains(".PROBLEMHERE("),
+            "identifier case fix should still apply to COPY INTO target: {fixed}"
+        );
     }
 }

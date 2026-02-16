@@ -12,6 +12,7 @@ pub struct LayoutLongLines {
     max_line_length: Option<usize>,
     ignore_comment_lines: bool,
     ignore_comment_clauses: bool,
+    trailing_comments_after: bool,
 }
 
 impl LayoutLongLines {
@@ -47,6 +48,9 @@ impl LayoutLongLines {
             ignore_comment_clauses: config
                 .rule_option_bool(issue_codes::LINT_LT_005, "ignore_comment_clauses")
                 .unwrap_or(false),
+            trailing_comments_after: config
+                .section_option_str("indentation", "trailing_comments")
+                .is_some_and(|value| value.eq_ignore_ascii_case("after")),
         }
     }
 }
@@ -57,6 +61,7 @@ impl Default for LayoutLongLines {
             max_line_length: Some(80),
             ignore_comment_lines: false,
             ignore_comment_clauses: false,
+            trailing_comments_after: false,
         }
     }
 }
@@ -105,7 +110,8 @@ impl LintRule for LayoutLongLines {
             })
             .collect();
 
-        let autofix_edits = long_line_autofix_edits(ctx.sql);
+        let autofix_edits =
+            long_line_autofix_edits(ctx.sql, max_line_length, self.trailing_comments_after);
         if let Some(first_issue) = issues.first_mut() {
             if !autofix_edits.is_empty() {
                 *first_issue = first_issue
@@ -162,14 +168,56 @@ fn long_line_overflow_spans(
     ignore_comment_clauses: bool,
     dialect: Dialect,
 ) -> Vec<(usize, usize)> {
-    long_line_overflow_spans_tokenized(
+    if let Some(spans) = long_line_overflow_spans_tokenized(
         sql,
         max_len,
         ignore_comment_lines,
         ignore_comment_clauses,
         dialect,
-    )
-    .unwrap_or_default()
+    ) {
+        return spans;
+    }
+
+    long_line_overflow_spans_naive(sql, max_len, ignore_comment_lines)
+}
+
+fn long_line_overflow_spans_naive(
+    sql: &str,
+    max_len: usize,
+    ignore_comment_lines: bool,
+) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for (line_start, line_end) in line_ranges(sql) {
+        let line = &sql[line_start..line_end];
+        if ignore_comment_lines {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("--") || trimmed.starts_with("/*") || trimmed.starts_with("{#") {
+                continue;
+            }
+        }
+
+        if line.chars().count() <= max_len {
+            continue;
+        }
+
+        let mut overflow_start = line_end;
+        for (char_idx, (byte_off, _)) in line.char_indices().enumerate() {
+            if char_idx == max_len {
+                overflow_start = line_start + byte_off;
+                break;
+            }
+        }
+
+        if overflow_start < line_end {
+            let overflow_end = sql[overflow_start..line_end]
+                .chars()
+                .next()
+                .map(|ch| overflow_start + ch.len_utf8())
+                .unwrap_or(overflow_start);
+            spans.push((overflow_start, overflow_end));
+        }
+    }
+    spans
 }
 
 #[derive(Clone)]
@@ -319,15 +367,33 @@ fn legacy_split_long_line(line: &str) -> Option<String> {
     Some(rewritten)
 }
 
-/// Generate autofix edits for long lines by splitting at word boundaries.
-/// Only handles very long lines (>300 bytes) to avoid conflicting with other
-/// rules' fixes on shorter overflows.
-fn long_line_autofix_edits(sql: &str) -> Vec<IssuePatchEdit> {
+/// Generate autofix edits for long lines.
+///
+/// For very long lines (>300 bytes), preserve the legacy splitter behavior.
+/// For shorter overflows, apply a narrow set of patch-based rewrites used by
+/// LT05 fixture parity:
+/// - move inline trailing comments to their own line
+/// - break single-clause overflows (e.g. `SELECT ... FROM ...`)
+/// - break long `... over (...)` and `... as ...` lines around boundaries
+/// - break Snowflake-style `... ignore/respect nulls over (...)` lines
+fn long_line_autofix_edits(
+    sql: &str,
+    max_line_length: usize,
+    trailing_comments_after: bool,
+) -> Vec<IssuePatchEdit> {
     let mut edits = Vec::new();
 
     for (line_start, line_end) in line_ranges(sql) {
         let line = &sql[line_start..line_end];
-        let Some(replacement) = legacy_split_long_line(line) else {
+        let replacement = if line.len() > LEGACY_MAX_LINE_LENGTH {
+            legacy_split_long_line(line)
+        } else if line.chars().count() > max_line_length {
+            rewrite_lt05_long_line(line, max_line_length, trailing_comments_after)
+        } else {
+            None
+        };
+
+        let Some(replacement) = replacement else {
             continue;
         };
         if replacement == line {
@@ -341,6 +407,334 @@ fn long_line_autofix_edits(sql: &str) -> Vec<IssuePatchEdit> {
     }
 
     edits
+}
+
+fn rewrite_lt05_long_line(
+    line: &str,
+    max_line_length: usize,
+    trailing_comments_after: bool,
+) -> Option<String> {
+    rewrite_inline_comment_line(line, max_line_length, trailing_comments_after)
+        .or_else(|| rewrite_lt05_code_line(line, max_line_length))
+}
+
+fn rewrite_lt05_code_line(line: &str, max_line_length: usize) -> Option<String> {
+    rewrite_window_function_line(line, max_line_length)
+        .or_else(|| rewrite_over_clause_with_tail_line(line, max_line_length))
+        .or_else(|| rewrite_function_alias_line(line, max_line_length))
+        .or_else(|| rewrite_function_equals_line(line, max_line_length))
+        .or_else(|| rewrite_clause_break_line(line, max_line_length))
+}
+
+fn rewrite_inline_comment_line(
+    line: &str,
+    max_line_length: usize,
+    trailing_comments_after: bool,
+) -> Option<String> {
+    let comment_start = find_unquoted_inline_comment_start(line)?;
+    let code_prefix = &line[..comment_start];
+    let code_trimmed = code_prefix.trim_end();
+    if code_trimmed.trim().is_empty() {
+        return None;
+    }
+    if code_trimmed.trim() == "," {
+        // Keep comma-prefixed comment lines unchanged; rewriting these can
+        // create endless fix cycles in LT05 edge cases.
+        return None;
+    }
+
+    let indent = leading_whitespace_prefix(line);
+    let code_body = code_trimmed
+        .strip_prefix(indent)
+        .unwrap_or(code_trimmed)
+        .trim_start();
+    if code_body.is_empty() {
+        return None;
+    }
+
+    let mut code_line = format!("{indent}{code_body}");
+    if code_line.chars().count() > max_line_length {
+        if let Some(rewritten) = rewrite_lt05_code_line(&code_line, max_line_length) {
+            code_line = rewritten;
+        }
+    }
+
+    let comment_line = format!("{indent}{}", line[comment_start..].trim_end());
+    if trailing_comments_after {
+        Some(format!("{code_line}\n{comment_line}"))
+    } else {
+        Some(format!("{comment_line}\n{code_line}"))
+    }
+}
+
+fn rewrite_clause_break_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length {
+        return None;
+    }
+
+    const CLAUSE_NEEDLES: [&str; 7] = [
+        " from ",
+        " where ",
+        " qualify ",
+        " order by ",
+        " group by ",
+        " having ",
+        " join ",
+    ];
+
+    let split_at = CLAUSE_NEEDLES
+        .iter()
+        .filter_map(|needle| find_ascii_case_insensitive(line, needle))
+        .min()?;
+
+    if split_at == 0 {
+        return None;
+    }
+    let left = line[..split_at].trim_end();
+    let right = line[split_at + 1..].trim_start();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+
+    let indent = leading_whitespace_prefix(line);
+    Some(format!("{left}\n{indent}{right}"))
+}
+
+fn rewrite_function_alias_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length
+        || find_ascii_case_insensitive(line, " over ").is_some()
+    {
+        return None;
+    }
+
+    let marker = find_ascii_case_insensitive(line, ") as ")?;
+    let split_at = marker + 1;
+    let left = line[..split_at].trim_end();
+    let right = line[split_at..].trim_start();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+
+    let continuation = format!("{}    ", leading_whitespace_prefix(line));
+    Some(format!("{left}\n{continuation}{right}"))
+}
+
+fn rewrite_function_equals_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length {
+        return None;
+    }
+
+    let marker = find_ascii_case_insensitive(line, ") = ")?;
+    let split_at = marker + 1;
+    let left = line[..split_at].trim_end();
+    let right = line[split_at..].trim_start();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+
+    let indent = leading_whitespace_prefix(line);
+    Some(format!("{left}\n{indent}{right}"))
+}
+
+fn rewrite_over_clause_with_tail_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length {
+        return None;
+    }
+
+    let over_start = find_ascii_case_insensitive(line, " over (")?;
+    let over_open = line[over_start..]
+        .find('(')
+        .map(|offset| over_start + offset)?;
+    let over_close = matching_close_paren(line, over_open)?;
+
+    let tail = line[over_close + 1..].trim_start();
+    if !contains_ascii_case_insensitive(tail, "as ") {
+        return None;
+    }
+
+    let indent = leading_whitespace_prefix(line);
+    let continuation = format!("{indent}    ");
+    let inner_indent = format!("{indent}        ");
+    let prefix = line[..over_start].trim_end();
+    if prefix.is_empty() {
+        return None;
+    }
+    let over_kw = line[over_start..over_open].trim();
+    let inside = line[over_open + 1..over_close].trim();
+    if inside.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![prefix.to_string(), format!("{continuation}{over_kw} (")];
+    if let Some(order_idx) = find_ascii_case_insensitive(inside, " order by ") {
+        let partition = inside[..order_idx].trim();
+        let order_by = inside[order_idx + 1..].trim_start();
+        if !partition.is_empty() {
+            lines.push(format!("{inner_indent}{partition}"));
+        }
+        if !order_by.is_empty() {
+            lines.push(format!("{inner_indent}{order_by}"));
+        }
+    } else {
+        lines.push(format!("{inner_indent}{inside}"));
+    }
+    lines.push(format!("{continuation})"));
+    lines.push(format!("{continuation}{tail}"));
+    Some(lines.join("\n"))
+}
+
+fn rewrite_window_function_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length {
+        return None;
+    }
+
+    let over_start = find_ascii_case_insensitive(line, " over (")?;
+    let modifier_start = rfind_ascii_case_insensitive_before(line, " ignore nulls", over_start)
+        .or_else(|| rfind_ascii_case_insensitive_before(line, " respect nulls", over_start))?;
+
+    let function_part = line[..modifier_start].trim_end();
+    let modifier = line[modifier_start..over_start].trim();
+    let over_part = line[over_start + 1..].trim_start();
+    if function_part.is_empty() || modifier.is_empty() || over_part.is_empty() {
+        return None;
+    }
+
+    let indent = leading_whitespace_prefix(line);
+    let continuation = format!("{indent}    ");
+
+    let mut lines = Vec::new();
+    if let Some((head, inner)) = outer_call_head_and_inner(function_part) {
+        if inner.contains('(') && inner.contains(')') {
+            lines.push(format!("{head}("));
+            lines.push(format!("{continuation}{inner}"));
+            lines.push(format!("{indent}) {modifier}"));
+        } else {
+            lines.push(format!("{} {modifier}", function_part.trim_end()));
+        }
+    } else {
+        lines.push(format!("{} {modifier}", function_part.trim_end()));
+    }
+    lines.push(format!("{continuation}{over_part}"));
+    Some(lines.join("\n"))
+}
+
+fn outer_call_head_and_inner(function_part: &str) -> Option<(&str, &str)> {
+    let trimmed = function_part.trim_end();
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let open = trimmed.find('(')?;
+    let close = matching_close_paren(trimmed, open)?;
+    if close + 1 != trimmed.len() {
+        return None;
+    }
+    let head = trimmed[..open].trim_end();
+    let inner = trimmed[open + 1..close].trim();
+    if head.is_empty() || inner.is_empty() {
+        return None;
+    }
+    Some((head, inner))
+}
+
+fn leading_whitespace_prefix(line: &str) -> &str {
+    let width = line
+        .bytes()
+        .take_while(|byte| matches!(*byte, b' ' | b'\t'))
+        .count();
+    &line[..width]
+}
+
+fn find_unquoted_inline_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while index + 1 < bytes.len() {
+        let byte = bytes[index];
+
+        if in_single {
+            if byte == b'\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
+                    index += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if in_double {
+            if byte == b'"' {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'"' {
+                    index += 2;
+                    continue;
+                }
+                in_double = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if byte == b'\'' {
+            in_single = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_double = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'-' && bytes[index + 1] == b'-' {
+            return Some(index);
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn matching_close_paren(input: &str, open_index: usize) -> Option<usize> {
+    if !matches!(input.as_bytes().get(open_index), Some(b'(')) {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    for (index, ch) in input
+        .char_indices()
+        .skip_while(|(idx, _)| *idx < open_index)
+    {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+}
+
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    find_ascii_case_insensitive(haystack, needle).is_some()
+}
+
+fn rfind_ascii_case_insensitive_before(haystack: &str, needle: &str, end: usize) -> Option<usize> {
+    haystack[..end.min(haystack.len())]
+        .to_ascii_lowercase()
+        .rfind(&needle.to_ascii_lowercase())
 }
 
 fn line_is_comment_only_tokenized(
@@ -691,12 +1085,16 @@ mod tests {
     fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
         let autofix = issue.autofix.as_ref()?;
         let mut edits = autofix.edits.clone();
+        Some(apply_patch_edits(sql, &mut edits))
+    }
+
+    fn apply_patch_edits(sql: &str, edits: &mut [IssuePatchEdit]) -> String {
         edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
         let mut rewritten = sql.to_string();
-        for edit in edits.into_iter().rev() {
+        for edit in edits.iter().rev() {
             rewritten.replace_range(edit.span.start..edit.span.end, &edit.replacement);
         }
-        Some(rewritten)
+        rewritten
     }
 
     #[test]
@@ -875,6 +1273,26 @@ mod tests {
     }
 
     #[test]
+    fn statementless_fallback_flags_long_jinja_config_line() {
+        let sql = "{{ config (schema='bronze', materialized='view', sort =['id','number'], dist = 'all', tags =['longlonglonglonglong']) }} \n\nselect 1\n";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = LayoutLongLines::default();
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert!(
+            !issues.is_empty(),
+            "expected LT05 to flag long templated config line in statementless mode"
+        );
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_005);
+    }
+
+    #[test]
     fn emits_safe_autofix_patch_for_very_long_line() {
         let projections = (0..120)
             .map(|index| format!("col_{index}"))
@@ -897,9 +1315,65 @@ mod tests {
         let sql = format!("SELECT {} FROM t", "x".repeat(120));
         let issues = run(&sql);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_005);
-        assert!(
-            issues[0].autofix.is_none(),
-            "LT005 legacy split only rewrites lines longer than 300 bytes"
+        let fixed = apply_issue_autofix(&sql, &issues[0]).expect("apply autofix");
+        assert!(fixed.contains('\n'));
+        assert!(fixed.contains("\nFROM t"));
+    }
+
+    #[test]
+    fn autofix_moves_inline_comment_before_code_when_overflowing() {
+        let sql = "SELECT 1 -- Some Comment\n";
+        let mut edits = long_line_autofix_edits(sql, 18, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(fixed, "-- Some Comment\nSELECT 1\n");
+    }
+
+    #[test]
+    fn autofix_moves_inline_comment_after_code_when_configured() {
+        let sql = "SELECT 1 -- Some Comment\n";
+        let mut edits = long_line_autofix_edits(sql, 18, true);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(fixed, "SELECT 1\n-- Some Comment\n");
+    }
+
+    #[test]
+    fn autofix_moves_comment_and_rebreaks_select_from_line() {
+        let sql = "SELECT COUNT(*) FROM tbl -- Some Comment\n";
+        let mut edits = long_line_autofix_edits(sql, 18, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(fixed, "-- Some Comment\nSELECT COUNT(*)\nFROM tbl\n");
+    }
+
+    #[test]
+    fn autofix_moves_mid_query_inline_comment() {
+        let sql = "select\n    my_long_long_line as foo -- with some comment\nfrom foo\n";
+        let mut edits = long_line_autofix_edits(sql, 40, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(
+            fixed,
+            "select\n    -- with some comment\n    my_long_long_line as foo\nfrom foo\n"
+        );
+    }
+
+    #[test]
+    fn autofix_rebreaks_window_function_lines() {
+        let sql = "select *\nfrom t\nqualify a = coalesce(\n    first_value(iff(b = 'none', null, a)) ignore nulls over (partition by c order by d desc),\n    first_value(a) respect nulls over (partition by c order by d desc)\n)\n";
+        let mut edits = long_line_autofix_edits(sql, 50, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(
+            fixed,
+            "select *\nfrom t\nqualify a = coalesce(\n    first_value(\n        iff(b = 'none', null, a)\n    ) ignore nulls\n        over (partition by c order by d desc),\n    first_value(a) respect nulls\n        over (partition by c order by d desc)\n)\n"
+        );
+    }
+
+    #[test]
+    fn autofix_rebreaks_long_functions_and_aliases() {
+        let sql = "SELECT\n    my_function(col1 + col2, arg2, arg3) over (partition by col3, col4 order by col5 rows between unbounded preceding and current row) as my_relatively_long_alias,\n    my_other_function(col6, col7 + col8, arg4) as my_other_relatively_long_alias,\n    my_expression_function(col6, col7 + col8, arg4) = col9 + col10 as another_relatively_long_alias\nFROM my_table\n";
+        let mut edits = long_line_autofix_edits(sql, 80, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(
+            fixed,
+            "SELECT\n    my_function(col1 + col2, arg2, arg3)\n        over (\n            partition by col3, col4\n            order by col5 rows between unbounded preceding and current row\n        )\n        as my_relatively_long_alias,\n    my_other_function(col6, col7 + col8, arg4)\n        as my_other_relatively_long_alias,\n    my_expression_function(col6, col7 + col8, arg4)\n    = col9 + col10 as another_relatively_long_alias\nFROM my_table\n"
         );
     }
 }

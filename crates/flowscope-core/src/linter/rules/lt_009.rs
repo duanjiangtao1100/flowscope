@@ -84,10 +84,7 @@ impl LintRule for LayoutSelectTargets {
                             )
                         })
                         .collect();
-                    issue = issue.with_autofix_edits(
-                        IssueAutofixApplicability::Safe,
-                        edits,
-                    );
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
                 }
                 issue
             })
@@ -528,12 +525,13 @@ fn safe_single_target_collapse_span(
     let target_indent = detect_indent(sql, gap_end);
 
     // Collect comment token indices.
-    let mut gap_comment_indices: Vec<usize> = Vec::new();
-    for idx in (last_pre_target_idx + 1)..target_start_idx {
-        if comment_token_text(&tokens[idx]).is_some() {
-            gap_comment_indices.push(idx);
-        }
-    }
+    let gap_comment_indices: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .take(target_start_idx)
+        .skip(last_pre_target_idx + 1)
+        .filter_map(|(idx, token)| comment_token_text(token).map(|_| idx))
+        .collect();
     let mut trailing_comment_indices: Vec<usize> = Vec::new();
     for (offset, t) in tokens.iter().enumerate().skip(target_end_idx) {
         if t.span.start.line != target_line {
@@ -545,14 +543,11 @@ fn safe_single_target_collapse_span(
     }
 
     let has_subsequent_content = layout.from_idx.is_some()
-        || tokens
-            .iter()
-            .skip(target_end_idx)
-            .any(|t| {
-                t.span.start.line > target_line
-                    && !is_ignorable_layout_token(&t.token)
-                    && comment_token_text(t).is_none()
-            });
+        || tokens.iter().skip(target_end_idx).any(|t| {
+            t.span.start.line > target_line
+                && !is_ignorable_layout_token(&t.token)
+                && comment_token_text(t).is_none()
+        });
 
     // Determine whether the two-edit strategy (split around comments) would
     // overlap. The two-edit strategy uses:
@@ -579,7 +574,11 @@ fn safe_single_target_collapse_span(
         // Two non-overlapping edits.
         let first_comment_idx = gap_comment_indices[0];
         let (first_comment_start, _) = token_with_span_offsets(sql, &tokens[first_comment_idx])?;
-        edits.push((gap_start, first_comment_start, format!(" {target_text}\n{target_indent}")));
+        edits.push((
+            gap_start,
+            first_comment_start,
+            format!(" {target_text}\n{target_indent}"),
+        ));
         let nl = target_line_nl?;
         edits.push((nl, target_text_end, String::new()));
     } else if !gap_comment_indices.is_empty()
@@ -595,7 +594,11 @@ fn safe_single_target_collapse_span(
 
         if has_subsequent_content {
             // Place target before comments, comments on their own line.
-            edits.push((gap_start, first_comment_start, format!(" {target_text}\n{target_indent}")));
+            edits.push((
+                gap_start,
+                first_comment_start,
+                format!(" {target_text}\n{target_indent}"),
+            ));
             edits.push((last_comment_end, target_text_end, String::new()));
         } else {
             // No FROM — place target and comments on the same line.
@@ -613,7 +616,11 @@ fn safe_single_target_collapse_span(
         if target_text_end > 0 {
             let anchor = target_text_end - 1;
             let anchor_char = &sql[anchor..target_text_end];
-            edits.push((anchor, target_text_end, format!("{anchor_char}\n{target_indent}")));
+            edits.push((
+                anchor,
+                target_text_end,
+                format!("{anchor_char}\n{target_indent}"),
+            ));
         } else {
             return None;
         }
@@ -624,20 +631,29 @@ fn safe_single_target_collapse_span(
         let (first_comment_start, _) = token_with_span_offsets(sql, &tokens[first_comment_idx])?;
 
         // Edit 1: Replace gap before first comment with target.
-        edits.push((gap_start, first_comment_start, format!(" {target_text}\n{target_indent}")));
+        edits.push((
+            gap_start,
+            first_comment_start,
+            format!(" {target_text}\n{target_indent}"),
+        ));
 
         // Edit 2: Remove the target and whitespace between the last gap comment
         // and the first trailing comment. This avoids spanning the trailing
         // comment's protected range.
         let last_gap_comment_idx = *gap_comment_indices.last().unwrap();
-        let (_, last_gap_comment_end) = token_with_span_offsets(sql, &tokens[last_gap_comment_idx])?;
+        let (_, last_gap_comment_end) =
+            token_with_span_offsets(sql, &tokens[last_gap_comment_idx])?;
         let first_trailing_idx = trailing_comment_indices[0];
         let (first_trailing_start, _) = token_with_span_offsets(sql, &tokens[first_trailing_idx])?;
 
         // Replace the region from after the last gap comment to the start of
         // the first trailing comment with just the indent (so the trailing
         // comment stays on its own line).
-        edits.push((last_gap_comment_end, first_trailing_start, format!("{target_indent}")));
+        edits.push((
+            last_gap_comment_end,
+            first_trailing_start,
+            target_indent.to_string(),
+        ));
     } else {
         return None;
     }
@@ -710,24 +726,21 @@ fn comment_token_text(token: &TokenWithSpan) -> Option<String> {
     match &token.token {
         Token::Whitespace(Whitespace::SingleLineComment { prefix, comment }) => {
             let text = format!("{prefix}{comment}");
-            Some(text.trim_end_matches('\n').trim_end_matches('\r').to_string())
+            Some(
+                text.trim_end_matches('\n')
+                    .trim_end_matches('\r')
+                    .to_string(),
+            )
         }
-        Token::Whitespace(Whitespace::MultiLineComment(content)) => {
-            Some(format!("/*{content}*/"))
-        }
+        Token::Whitespace(Whitespace::MultiLineComment(content)) => Some(format!("/*{content}*/")),
         _ => None,
     }
 }
 
-
-
 /// Detect the indentation prefix on the line where `offset` points.
 fn detect_indent(sql: &str, offset: usize) -> String {
     // Walk backwards from offset to find the start of the line.
-    let line_start = sql[..offset]
-        .rfind('\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
+    let line_start = sql[..offset].rfind('\n').map(|pos| pos + 1).unwrap_or(0);
     // Collect leading whitespace from that line.
     sql[line_start..]
         .chars()
@@ -1059,10 +1072,7 @@ mod tests {
         let issues = run(sql);
         assert!(!issues.is_empty());
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(
-            fixed,
-            "SELECT 1\n  -- this is a comment\nFROM\n  my_table"
-        );
+        assert_eq!(fixed, "SELECT 1\n  -- this is a comment\nFROM\n  my_table");
     }
 
     #[test]
@@ -1072,10 +1082,7 @@ mod tests {
         let issues = run(sql);
         assert!(!issues.is_empty());
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(
-            fixed,
-            "SELECT 1\n  /* comment before */\nFROM\n  my_table"
-        );
+        assert_eq!(fixed, "SELECT 1\n  /* comment before */\nFROM\n  my_table");
     }
 
     #[test]

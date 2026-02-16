@@ -56,8 +56,7 @@ fn jinja_padding_violation_span(ctx: &LintContext) -> Option<(usize, usize)> {
     let sql = ctx.statement_sql();
 
     // Token-based detection (works well when sqlparser can tokenize the input).
-    if let Some(tokens) = token_spans_for_context(ctx).or_else(|| token_spans(sql, ctx.dialect()))
-    {
+    if let Some(tokens) = token_spans_for_context(ctx).or_else(|| token_spans(sql, ctx.dialect())) {
         for token in &tokens {
             if let Some(span) = token_text_violation(sql, token) {
                 return Some(span);
@@ -240,8 +239,7 @@ where
 
                         // Detect trim markers (+/-) attached to delimiters.
                         let trimmed = inner.trim();
-                        let (open_marker, content, close_marker) =
-                            extract_trim_markers(trimmed);
+                        let (open_marker, content, close_marker) = extract_trim_markers(trimmed);
                         let content = content.trim();
 
                         let replacement = format!(

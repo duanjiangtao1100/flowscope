@@ -157,18 +157,36 @@ def extract_rule_configs(configs: dict | None) -> dict | None:
     result: dict = {}
     rules = configs.get("rules")
     if rules and isinstance(rules, dict):
+        # SQLFluff allows both per-rule objects and scalar values in the
+        # `rules:` section. Keep object-valued entries as rule configs and
+        # preserve scalar entries under a top-level `rules` section so
+        # section-based consumers (e.g. LT02 tab-space fixtures) can read
+        # them via section lookups.
         result = {k: v for k, v in rules.items() if isinstance(v, dict)}
+        scalar_rules = {k: v for k, v in rules.items() if not isinstance(v, dict)}
+        if scalar_rules:
+            result["rules"] = scalar_rules
 
         # Map rules.allow_scalar → aliasing.expression.allow_scalar (AL03).
         if "allow_scalar" in rules and not isinstance(rules["allow_scalar"], dict):
             al03_cfg = result.setdefault("aliasing.expression", {})
             al03_cfg.setdefault("allow_scalar", rules["allow_scalar"])
 
-    # Map core.max_line_length → layout.long_lines.max_line_length.
+    # Preserve top-level `core:` config for rules that consume core options
+    # directly (e.g. ignore_templated_areas behavior).
     core = configs.get("core", {})
+    if core and isinstance(core, dict):
+        result.setdefault("core", {}).update(core)
+
+    # Map core.max_line_length → layout.long_lines.max_line_length.
     if "max_line_length" in core:
         lt05_cfg = result.setdefault("layout.long_lines", {})
         lt05_cfg.setdefault("max_line_length", core["max_line_length"])
+
+    # Preserve top-level `indentation:` section for LT02 and related fixtures.
+    indentation = configs.get("indentation")
+    if indentation and isinstance(indentation, dict):
+        result.setdefault("indentation", {}).update(indentation)
 
     # Map layout.type.* → layout.keyword_newline.* for LT14.
     layout = configs.get("layout", {})

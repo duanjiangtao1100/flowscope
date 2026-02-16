@@ -4,9 +4,8 @@
 //! trailing newline.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
+use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
-use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 pub struct LayoutEndOfFile;
 
@@ -29,8 +28,8 @@ impl LintRule for LayoutEndOfFile {
             .trim_end_matches(|ch: char| ch.is_ascii_whitespace())
             .len();
         let is_last_statement = ctx.statement_range.end >= content_end;
-        let trailing_newlines = trailing_newline_count_tokenized(ctx);
-        let has_violation = is_last_statement && trailing_newlines != 1;
+        let (trailing_newlines, has_trailing_spaces) = trailing_newline_metrics(ctx.sql);
+        let has_violation = is_last_statement && (trailing_newlines != 1 || has_trailing_spaces);
 
         if has_violation {
             let trailing_span = Span::new(content_end, ctx.sql.len());
@@ -50,113 +49,22 @@ impl LintRule for LayoutEndOfFile {
     }
 }
 
-#[derive(Clone)]
-struct LocatedToken {
-    token: Token,
-    end: usize,
-}
-
-fn trailing_newline_count_tokenized(ctx: &LintContext) -> usize {
-    let tokens = tokenize_with_offsets_for_context(ctx)
-        .or_else(|| tokenize_with_offsets(ctx.sql, ctx.dialect()))
-        .unwrap_or_default();
-    let content_end = tokens
-        .iter()
-        .rev()
-        .find(|token| !is_whitespace_token(&token.token))
-        .map_or(0, |token| token.end);
-    trailing_newline_count(&ctx.sql[content_end..])
-}
-
-fn tokenize_with_offsets(sql: &str, dialect: Dialect) -> Option<Vec<LocatedToken>> {
-    let dialect = dialect.to_sqlparser_dialect();
-    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
-    let tokens = tokenizer.tokenize_with_location().ok()?;
-
-    let mut out = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let Some(end) = line_col_to_offset(
-            sql,
-            token.span.end.line as usize,
-            token.span.end.column as usize,
-        ) else {
+fn trailing_newline_metrics(sql: &str) -> (usize, bool) {
+    let mut end = sql.len();
+    while end > 0 {
+        let ch = sql[..end]
+            .chars()
+            .next_back()
+            .expect("string slice should not be empty");
+        if ch == ' ' || ch == '\t' {
+            end -= ch.len_utf8();
             continue;
-        };
-        out.push(LocatedToken {
-            token: token.token,
-            end,
-        });
-    }
-    Some(out)
-}
-
-fn tokenize_with_offsets_for_context(ctx: &LintContext) -> Option<Vec<LocatedToken>> {
-    ctx.with_document_tokens(|tokens| {
-        if tokens.is_empty() {
-            return None;
         }
-
-        Some(
-            tokens
-                .iter()
-                .filter_map(|token| {
-                    token_with_span_offsets(ctx.sql, token).map(|(_start, end)| LocatedToken {
-                        token: token.token.clone(),
-                        end,
-                    })
-                })
-                .collect(),
-        )
-    })
-}
-
-fn is_whitespace_token(token: &Token) -> bool {
-    matches!(
-        token,
-        Token::Whitespace(Whitespace::Space | Whitespace::Tab | Whitespace::Newline)
-    )
-}
-
-fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
-    if line == 0 || column == 0 {
-        return None;
+        break;
     }
 
-    let mut current_line = 1usize;
-    let mut current_col = 1usize;
-
-    for (offset, ch) in sql.char_indices() {
-        if current_line == line && current_col == column {
-            return Some(offset);
-        }
-
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 1;
-        } else {
-            current_col += 1;
-        }
-    }
-
-    if current_line == line && current_col == column {
-        return Some(sql.len());
-    }
-
-    None
-}
-
-fn token_with_span_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
-    let start = line_col_to_offset(
-        sql,
-        token.span.start.line as usize,
-        token.span.start.column as usize,
-    )?;
-    let end = line_col_to_offset(
-        sql,
-        token.span.end.line as usize,
-        token.span.end.column as usize,
-    )?;
-    Some((start, end))
+    let has_trailing_spaces = end != sql.len();
+    (trailing_newline_count(&sql[..end]), has_trailing_spaces)
 }
 
 fn trailing_newline_count(sql: &str) -> usize {
@@ -249,5 +157,38 @@ mod tests {
         assert_eq!(issues[0].code, issue_codes::LINT_LT_012);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(fixed, "SELECT 1\nFROM t\n");
+    }
+
+    #[test]
+    fn statementless_flags_templated_without_raw_final_newline() {
+        let sql = "{{ '\\n\\n' }}";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = LayoutEndOfFile;
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_012);
+    }
+
+    #[test]
+    fn statementless_allows_templated_line_with_raw_final_newline() {
+        let sql = "select * from {{ 'trim_whitespace_table' -}}\n";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = LayoutEndOfFile;
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert!(issues.is_empty());
     }
 }

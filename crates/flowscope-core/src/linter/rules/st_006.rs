@@ -353,10 +353,12 @@ fn visit_expr_selects<F: FnMut(&Select)>(expr: &Expr, visitor: &mut F) {
 /// the column order of referenced CTEs/subqueries is semantically significant.
 fn set_expr_has_wildcard_select(set_expr: &SetExpr) -> bool {
     match set_expr {
-        SetExpr::Select(select) => select
-            .projection
-            .iter()
-            .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _))),
+        SetExpr::Select(select) => select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        }),
         SetExpr::SetOperation { left, right, .. } => {
             set_expr_has_wildcard_select(left) || set_expr_has_wildcard_select(right)
         }

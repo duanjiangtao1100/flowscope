@@ -18,6 +18,7 @@ pub struct ConventionBlockedWords {
     blocked_words: HashSet<String>,
     blocked_regexes: Vec<Regex>,
     match_source: bool,
+    ignore_templated_areas: bool,
 }
 
 impl ConventionBlockedWords {
@@ -32,11 +33,15 @@ impl ConventionBlockedWords {
         let match_source = config
             .rule_option_bool(issue_codes::LINT_CV_009, "match_source")
             .unwrap_or(false);
+        let ignore_templated_areas = config
+            .core_option_bool("ignore_templated_areas")
+            .unwrap_or(true);
 
         Self {
             blocked_words,
             blocked_regexes,
             match_source,
+            ignore_templated_areas,
         }
     }
 }
@@ -50,6 +55,7 @@ impl Default for ConventionBlockedWords {
                 .collect(),
             blocked_regexes: Vec::new(),
             match_source: false,
+            ignore_templated_areas: true,
         }
     }
 }
@@ -68,11 +74,18 @@ impl LintRule for ConventionBlockedWords {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        let source_violation = self.match_source
-            && self
-                .blocked_regexes
+        let source_violation = if self.match_source && ctx.statement_index == 0 {
+            let source = if self.ignore_templated_areas {
+                mask_templated_areas(ctx.sql)
+            } else {
+                ctx.sql.to_string()
+            };
+            self.blocked_regexes
                 .iter()
-                .any(|regex| regex.is_match(ctx.statement_sql()));
+                .any(|regex| regex.is_match(&source))
+        } else {
+            false
+        };
 
         if source_violation || statement_contains_blocked_word(statement, self) {
             vec![Issue::warning(
@@ -223,6 +236,44 @@ fn normalized_token(token: &str) -> String {
         .trim()
         .trim_matches(|ch| matches!(ch, '"' | '`' | '\'' | '[' | ']'))
         .to_ascii_uppercase()
+}
+
+fn mask_templated_areas(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0usize;
+
+    while let Some((open_index, close_marker)) = find_next_template_open(sql, index) {
+        out.push_str(&sql[index..open_index]);
+        let marker_start = open_index + 2;
+        if let Some(close_offset) = sql[marker_start..].find(close_marker) {
+            let close_index = marker_start + close_offset + close_marker.len();
+            out.push_str(&mask_non_newlines(&sql[open_index..close_index]));
+            index = close_index;
+        } else {
+            out.push_str(&mask_non_newlines(&sql[open_index..]));
+            return out;
+        }
+    }
+
+    out.push_str(&sql[index..]);
+    out
+}
+
+fn find_next_template_open(sql: &str, from: usize) -> Option<(usize, &'static str)> {
+    let rest = sql.get(from..)?;
+    let candidates = [("{{", "}}"), ("{%", "%}"), ("{#", "#}")];
+
+    candidates
+        .into_iter()
+        .filter_map(|(open, close)| rest.find(open).map(|offset| (from + offset, close)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn mask_non_newlines(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|ch| if ch == '\n' { '\n' } else { ' ' })
+        .collect()
 }
 
 #[cfg(test)]
@@ -381,5 +432,74 @@ mod tests {
             },
         );
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn match_source_true_checks_full_source_in_statementless_mode() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([
+                (
+                    "core".to_string(),
+                    serde_json::json!({"ignore_templated_areas": false}),
+                ),
+                (
+                    "convention.blocked_words".to_string(),
+                    serde_json::json!({
+                        "blocked_words": [],
+                        "blocked_regex": "ref\\('deprecated_",
+                        "match_source": true
+                    }),
+                ),
+            ]),
+        };
+        let rule = ConventionBlockedWords::from_config(&config);
+        let sql = "SELECT * FROM {{ ref('deprecated_table') }}";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_CV_009);
+    }
+
+    #[test]
+    fn match_source_true_respects_ignore_templated_areas_core_option() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([
+                (
+                    "core".to_string(),
+                    serde_json::json!({"ignore_templated_areas": true}),
+                ),
+                (
+                    "convention.blocked_words".to_string(),
+                    serde_json::json!({
+                        "blocked_words": [],
+                        "blocked_regex": "ref\\('deprecated_",
+                        "match_source": true
+                    }),
+                ),
+            ]),
+        };
+        let rule = ConventionBlockedWords::from_config(&config);
+        let sql = "SELECT * FROM {{ ref('deprecated_table') }}";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert!(issues.is_empty());
     }
 }

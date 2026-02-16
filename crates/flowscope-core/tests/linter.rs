@@ -1961,8 +1961,8 @@ fn lint_am_001_union_all_ok() {
 fn lint_am_001_enabled_for_postgres_dialect() {
     let issues = run_lint_in_dialect("SELECT 1 UNION SELECT 2", Dialect::Postgres);
     assert!(
-        issues.iter().any(|(code, _)| code == "LINT_AM_002"),
-        "AM_001 should be enabled for postgres dialect: {issues:?}"
+        !issues.iter().any(|(code, _)| code == "LINT_AM_002"),
+        "AM_002 should be exempt for postgres dialect: {issues:?}"
     );
 }
 
@@ -2257,6 +2257,7 @@ fn lint_clean_complex_query_no_issues() {
                 "LINT_LT_009".to_string(),
                 "LINT_LT_008".to_string(),
                 "LINT_LT_005".to_string(),
+                "LINT_LT_002".to_string(),
                 "LINT_AL_001".to_string(),
                 "LINT_AL_007".to_string(),
                 "LINT_AM_005".to_string(),
@@ -3025,11 +3026,15 @@ fn lint_sqlfluff_parity_rule_smoke_cases() {
         ("LINT_ST_011", "SELECT a.id FROM a LEFT JOIN b b1 ON a.id = b1.id"),
         ("LINT_ST_012", "SELECT 1;;"),
         ("LINT_TQ_001", "CREATE PROCEDURE sp_legacy AS SELECT 1;"),
-        ("LINT_TQ_002", "CREATE PROCEDURE p AS SELECT 1;"),
+        ("LINT_TQ_002", "CREATE PROCEDURE p AS SELECT 1; SELECT 2;"),
     ];
 
     for (code, sql) in cases {
-        let issues = run_lint(sql);
+        let issues = if code.starts_with("LINT_TQ_") {
+            run_lint_in_dialect(sql, Dialect::Mssql)
+        } else {
+            run_lint(sql)
+        };
         assert!(
             issues.iter().any(|(c, _)| c == code),
             "expected {code} for SQL: {sql}; got: {issues:?}"

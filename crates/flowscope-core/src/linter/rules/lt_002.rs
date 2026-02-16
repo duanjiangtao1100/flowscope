@@ -16,6 +16,15 @@ pub struct LayoutIndent {
     indent_unit: usize,
     tab_space_size: usize,
     indent_style: IndentStyle,
+    indented_joins: bool,
+    indented_using_on: bool,
+    indented_on_contents: bool,
+    ignore_comment_lines: bool,
+    indented_ctes: bool,
+    indented_then: bool,
+    indented_then_contents: bool,
+    implicit_indents: ImplicitIndentsMode,
+    ignore_templated_areas: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,8 +33,28 @@ enum IndentStyle {
     Tabs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitIndentsMode {
+    Forbid,
+    Allow,
+    Require,
+}
+
 impl LayoutIndent {
     pub fn from_config(config: &LintConfig) -> Self {
+        let option_bool = |key: &str| {
+            config
+                .rule_option_bool(issue_codes::LINT_LT_002, key)
+                .or_else(|| config.section_option_bool("indentation", key))
+                .or_else(|| config.section_option_bool("rules", key))
+        };
+        let option_str = |key: &str| {
+            config
+                .rule_option_str(issue_codes::LINT_LT_002, key)
+                .or_else(|| config.section_option_str("indentation", key))
+                .or_else(|| config.section_option_str("rules", key))
+        };
+
         let tab_space_size = config
             .rule_option_usize(issue_codes::LINT_LT_002, "tab_space_size")
             .or_else(|| config.section_option_usize("indentation", "tab_space_size"))
@@ -47,13 +76,34 @@ impl LayoutIndent {
             .or_else(|| config.section_option_usize("indentation", "indent_unit"))
             .or_else(|| config.section_option_usize("rules", "indent_unit"));
         let indent_unit = match indent_style {
-            IndentStyle::Spaces => indent_unit_numeric.unwrap_or(4).max(1),
+            IndentStyle::Spaces => indent_unit_numeric.unwrap_or(tab_space_size).max(1),
             IndentStyle::Tabs => indent_unit_numeric.unwrap_or(tab_space_size).max(1),
         };
+        let implicit_indents = match option_str("implicit_indents")
+            .unwrap_or("forbid")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "allow" => ImplicitIndentsMode::Allow,
+            "require" => ImplicitIndentsMode::Require,
+            _ => ImplicitIndentsMode::Forbid,
+        };
+
         Self {
             indent_unit,
             tab_space_size,
             indent_style,
+            indented_joins: option_bool("indented_joins").unwrap_or(false),
+            indented_using_on: option_bool("indented_using_on").unwrap_or(true),
+            indented_on_contents: option_bool("indented_on_contents").unwrap_or(true),
+            ignore_comment_lines: option_bool("ignore_comment_lines").unwrap_or(false),
+            indented_ctes: option_bool("indented_ctes").unwrap_or(false),
+            indented_then: option_bool("indented_then").unwrap_or(true),
+            indented_then_contents: option_bool("indented_then_contents").unwrap_or(true),
+            implicit_indents,
+            ignore_templated_areas: config
+                .core_option_bool("ignore_templated_areas")
+                .unwrap_or(true),
         }
     }
 }
@@ -64,6 +114,15 @@ impl Default for LayoutIndent {
             indent_unit: 4,
             tab_space_size: 4,
             indent_style: IndentStyle::Spaces,
+            indented_joins: false,
+            indented_using_on: true,
+            indented_on_contents: true,
+            ignore_comment_lines: false,
+            indented_ctes: false,
+            indented_then: true,
+            indented_then_contents: true,
+            implicit_indents: ImplicitIndentsMode::Forbid,
+            ignore_templated_areas: true,
         }
     }
 }
@@ -82,34 +141,65 @@ impl LintRule for LayoutIndent {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        let statement_sql = ctx.statement_sql();
+        let statement_lines: Vec<&str> = statement_sql.lines().collect();
+        let template_only_lines = template_only_line_flags(&statement_lines);
+        let first_line_template_fragment = first_line_is_template_fragment(ctx);
         let snapshots = line_indent_snapshots(ctx, self.tab_space_size);
-        let mut has_violation = first_line_is_indented(ctx);
+        let mut has_syntactic_violation =
+            !first_line_template_fragment && first_line_is_indented(ctx);
+        let mut has_violation = has_syntactic_violation;
 
         // Syntactic checks: odd width, mixed chars, wrong style.
         for snapshot in &snapshots {
+            if template_only_lines
+                .get(snapshot.line_index)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(line) = statement_lines.get(snapshot.line_index) {
+                let trimmed = line.trim_start();
+                if self.ignore_comment_lines && is_comment_line(trimmed) {
+                    continue;
+                }
+                if self.ignore_templated_areas && contains_template_marker(trimmed) {
+                    continue;
+                }
+            }
+
             let indent = snapshot.indent;
 
             if snapshot.line_index == 0 && indent.width > 0 {
+                if first_line_template_fragment {
+                    continue;
+                }
+                has_syntactic_violation = true;
                 has_violation = true;
                 break;
             }
 
             if indent.has_mixed_indent_chars {
+                has_syntactic_violation = true;
                 has_violation = true;
                 break;
             }
 
             if matches!(self.indent_style, IndentStyle::Spaces) && indent.tab_count > 0 {
+                has_syntactic_violation = true;
                 has_violation = true;
                 break;
             }
 
             if matches!(self.indent_style, IndentStyle::Tabs) && indent.space_count > 0 {
+                has_syntactic_violation = true;
                 has_violation = true;
                 break;
             }
 
             if indent.width > 0 && indent.width % self.indent_unit != 0 {
+                has_syntactic_violation = true;
                 has_violation = true;
                 break;
             }
@@ -124,6 +214,7 @@ impl LintRule for LayoutIndent {
                 self.indent_unit,
                 self.tab_space_size,
                 self.indent_style,
+                self,
             );
             if !edits.is_empty() {
                 has_violation = true;
@@ -133,6 +224,44 @@ impl LintRule for LayoutIndent {
             Vec::new()
         };
 
+        let detection_only_violation = if !has_violation {
+            detect_additional_indentation_violation(
+                statement_sql,
+                self.indent_unit,
+                self.tab_space_size,
+                self,
+                ctx.dialect(),
+            )
+        } else {
+            false
+        };
+        let tsql_else_if_successive_violation = if !has_violation {
+            ctx.dialect() == Dialect::Mssql
+                && ctx.statement_index == 0
+                && ctx.statement_range.end < ctx.sql.len()
+                && detect_tsql_else_if_successive_violation(ctx.sql, self.tab_space_size)
+        } else {
+            false
+        };
+        if detection_only_violation {
+            if contains_template_marker(statement_sql)
+                && !has_syntactic_violation
+                && structural_edits.is_empty()
+                && !templated_detection_confident(
+                    statement_sql,
+                    self.indent_unit,
+                    self.tab_space_size,
+                )
+            {
+                // Template-heavy fragments can produce parser-split artifacts
+                // that are not actionable indentation violations.
+            } else {
+                has_violation = true;
+            }
+        }
+        if tsql_else_if_successive_violation {
+            has_violation = true;
+        }
         if !has_violation {
             return Vec::new();
         }
@@ -143,13 +272,16 @@ impl LintRule for LayoutIndent {
         )
         .with_statement(ctx.statement_index);
 
-        let mut autofix_edits = indentation_autofix_edits(
-            ctx.statement_sql(),
-            &snapshots,
-            self.indent_unit,
-            self.tab_space_size,
-            self.indent_style,
-        );
+        let mut autofix_edits = Vec::new();
+        if has_syntactic_violation || !structural_edits.is_empty() {
+            autofix_edits = indentation_autofix_edits(
+                statement_sql,
+                &snapshots,
+                self.indent_unit,
+                self.tab_space_size,
+                self.indent_style,
+            );
+        }
 
         // Merge structural edits (e.g., adding indentation to content lines
         // under clause keywords). Only add structural edits for lines not
@@ -162,6 +294,19 @@ impl LintRule for LayoutIndent {
                 }
             }
         }
+        autofix_edits.extend(multiline_bracket_spacing_edits(statement_sql));
+        autofix_edits.sort_by(|left, right| {
+            (left.start, left.end, left.replacement.as_str()).cmp(&(
+                right.start,
+                right.end,
+                right.replacement.as_str(),
+            ))
+        });
+        autofix_edits.dedup_by(|left, right| {
+            left.start == right.start
+                && left.end == right.end
+                && left.replacement == right.replacement
+        });
 
         let autofix_edits: Vec<_> = autofix_edits
             .into_iter()
@@ -194,6 +339,32 @@ fn first_line_is_indented(ctx: &LintContext) -> bool {
     !leading.is_empty() && leading.chars().all(char::is_whitespace)
 }
 
+fn first_line_is_template_fragment(ctx: &LintContext) -> bool {
+    let statement_start = ctx.statement_range.start;
+    if statement_start == 0 {
+        return false;
+    }
+
+    let line_start = ctx.sql[..statement_start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let leading = &ctx.sql[line_start..statement_start];
+    if leading.is_empty() || !leading.chars().all(char::is_whitespace) {
+        return false;
+    }
+
+    let before_line = &ctx.sql[..line_start];
+    for raw_line in before_line.lines().rev() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return is_template_boundary_line(trimmed);
+    }
+
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Structural indent detection
 // ---------------------------------------------------------------------------
@@ -213,8 +384,13 @@ fn structural_indent_edits(
     indent_unit: usize,
     tab_space_size: usize,
     indent_style: IndentStyle,
+    options: &LayoutIndent,
 ) -> Vec<Lt02AutofixEdit> {
     let sql = ctx.statement_sql();
+
+    if options.ignore_templated_areas && contains_template_marker(sql) {
+        return Vec::new();
+    }
 
     // Skip structural check for templated SQL. Template expansion can
     // produce indentation patterns that look structurally wrong but are
@@ -297,6 +473,9 @@ fn structural_indent_edits(
         // Check comment-only lines after the last content line.
         for (&line, info) in &line_infos {
             if line > last_content_line && info.is_comment_only {
+                if options.ignore_comment_lines {
+                    continue;
+                }
                 let comment_indent = actual_indents.get(&line).copied().unwrap_or(0);
                 if comment_indent > last_content_indent {
                     if let Some(line_info) = line_info_list.get(line) {
@@ -322,6 +501,903 @@ fn structural_indent_edits(
     }
 
     edits
+}
+
+struct ScanLine<'a> {
+    trimmed: &'a str,
+    indent: usize,
+    words: Vec<String>,
+    is_blank: bool,
+    is_comment_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateMultilineMode {
+    Expression,
+    Statement,
+    Comment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateControlKind {
+    Open,
+    Mid,
+    Close,
+}
+
+#[derive(Clone, Debug)]
+struct TemplateControlTag {
+    kind: TemplateControlKind,
+    keyword: Option<String>,
+}
+
+fn detect_additional_indentation_violation(
+    sql: &str,
+    indent_unit: usize,
+    tab_space_size: usize,
+    options: &LayoutIndent,
+    dialect: Dialect,
+) -> bool {
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+
+    let indent_map = actual_indent_map(sql, tab_space_size);
+    let scans: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .map(|(line_idx, line)| {
+            let trimmed = line.trim_start();
+            let is_blank = trimmed.trim().is_empty();
+            let is_comment_only = is_comment_line(trimmed);
+            let words = if is_blank {
+                Vec::new()
+            } else {
+                split_upper_words(trimmed)
+            };
+            ScanLine {
+                trimmed,
+                indent: indent_map.get(&line_idx).copied().unwrap_or(0),
+                words,
+                is_blank,
+                is_comment_only,
+            }
+        })
+        .collect();
+
+    let template_only_lines = template_only_line_flags(&lines);
+    let mut sql_template_block_indents: Vec<usize> = Vec::new();
+
+    for idx in 0..scans.len() {
+        let line = &scans[idx];
+        if line.is_blank {
+            continue;
+        }
+
+        let template_controls = template_control_tags_in_line(line.trimmed);
+        if !template_controls.is_empty() {
+            for tag in template_controls {
+                match tag.kind {
+                    TemplateControlKind::Open => {
+                        if tag
+                            .keyword
+                            .as_deref()
+                            .is_none_or(|keyword| !is_non_sql_template_keyword(keyword))
+                        {
+                            sql_template_block_indents.push(line.indent);
+                        }
+                    }
+                    TemplateControlKind::Mid => {
+                        if let Some(expected_indent) = sql_template_block_indents.last() {
+                            if line.indent != *expected_indent {
+                                return true;
+                            }
+                        }
+                    }
+                    TemplateControlKind::Close => {
+                        if tag
+                            .keyword
+                            .as_deref()
+                            .is_none_or(|keyword| !is_non_sql_template_keyword(keyword))
+                        {
+                            if let Some(open_indent) = sql_template_block_indents.pop() {
+                                if line.indent != open_indent {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if template_only_lines.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+
+        let in_sql_template_block = !sql_template_block_indents.is_empty();
+        if in_sql_template_block {
+            let required_indent = sql_template_block_indents[0] + indent_unit;
+            if line.indent < required_indent {
+                return true;
+            }
+        }
+
+        let first = line.words.first().map(String::as_str);
+        let second = line.words.get(1).map(String::as_str);
+
+        if matches!(first, Some("ELSE")) && words_contain_in_order(&line.words, "ELSE", "END") {
+            return true;
+        }
+
+        let upper = line.trimmed.to_ascii_uppercase();
+        if upper.contains(" AS (SELECT") || upper.starts_with("(SELECT") {
+            return true;
+        }
+
+        if matches!(first, Some("DECLARE")) && line.words.len() > 1 {
+            return true;
+        }
+
+        if upper.contains(" PROCEDURE") {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if scans[next_idx].trimmed.starts_with('@') && scans[next_idx].indent <= line.indent
+                {
+                    return true;
+                }
+            }
+        }
+
+        if matches!(first, Some("ELSE")) {
+            if idx == 0 && matches!(dialect, Dialect::Mssql) {
+                return true;
+            }
+            if let Some(prev_idx) =
+                previous_line_matching(&scans, idx, |f, _| matches!(f, Some("IF" | "ELSE")))
+            {
+                if line.indent > scans[prev_idx].indent {
+                    return true;
+                }
+            }
+        }
+
+        if options.indented_ctes && matches!(first, Some("WITH")) {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if scans[next_idx].indent != line.indent + indent_unit {
+                    return true;
+                }
+            }
+        }
+
+        if is_content_clause_line(first, line.trimmed) {
+            let expected_indent = line.indent + indent_unit;
+            let mut scan_idx = idx + 1;
+            while scan_idx < scans.len() {
+                let next = &scans[scan_idx];
+                if next.is_blank {
+                    scan_idx += 1;
+                    continue;
+                }
+                if template_only_lines.get(scan_idx).copied().unwrap_or(false) {
+                    let one_line_template_expr =
+                        next.trimmed.starts_with("{{") && next.trimmed.contains("}}");
+                    if one_line_template_expr {
+                        // One-line templated expressions can still represent
+                        // content elements (e.g. SELECT list items) and should
+                        // keep their surrounding indentation.
+                    } else {
+                        scan_idx += 1;
+                        continue;
+                    }
+                }
+                let next_first = next.words.first().map(String::as_str);
+                if is_clause_boundary(next_first, next.trimmed) {
+                    break;
+                }
+                if next.is_comment_only {
+                    scan_idx += 1;
+                    continue;
+                }
+                if next.indent < expected_indent {
+                    return true;
+                }
+                scan_idx += 1;
+            }
+        }
+
+        if is_join_clause(first, second) && !in_sql_template_block {
+            if let Some(prev_join_idx) = previous_line_matching(&scans, idx, is_join_clause) {
+                let prev_first = scans[prev_join_idx].words.first().map(String::as_str);
+                let prev_second = scans[prev_join_idx].words.get(1).map(String::as_str);
+                if previous_significant_line(&scans, idx) == Some(prev_join_idx)
+                    && join_requires_condition(prev_first, prev_second)
+                    && line.indent < scans[prev_join_idx].indent + indent_unit
+                {
+                    return true;
+                }
+            }
+
+            let parent_from_indent =
+                previous_line_indent_matching(&scans, idx, |f, _| matches!(f, Some("FROM")))
+                    .or_else(|| previous_line_indent_matching(&scans, idx, is_join_clause))
+                    .unwrap_or(0);
+            let expected = parent_from_indent
+                + if options.indented_joins {
+                    indent_unit
+                } else {
+                    0
+                };
+            if line.indent != expected {
+                return true;
+            }
+        }
+
+        if matches!(first, Some("USING" | "ON")) {
+            let parent_indent = previous_line_indent_matching(&scans, idx, |f, s| {
+                is_join_clause(f, s) || matches!(f, Some("USING"))
+            })
+            .unwrap_or(0);
+            let expected = parent_indent
+                + if options.indented_using_on {
+                    indent_unit
+                } else {
+                    0
+                };
+            if line.indent != expected {
+                return true;
+            }
+        }
+
+        if line.is_comment_only && !options.ignore_comment_lines {
+            if let (Some(prev_idx), Some(next_idx)) = (
+                previous_significant_line(&scans, idx),
+                next_significant_line(&scans, idx),
+            ) {
+                if is_join_clause(
+                    scans[next_idx].words.first().map(String::as_str),
+                    scans[next_idx].words.get(1).map(String::as_str),
+                ) || matches!(
+                    scans[next_idx].words.first().map(String::as_str),
+                    Some("FROM" | "WHERE" | "HAVING" | "QUALIFY" | "LIMIT")
+                ) {
+                    let allowed = scans[prev_idx].indent.max(scans[next_idx].indent);
+                    if line.indent > allowed {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if options.implicit_indents == ImplicitIndentsMode::Require
+            && matches!(first, Some("WHERE" | "HAVING" | "ON" | "CASE"))
+            && line.words.len() == 1
+        {
+            return true;
+        }
+
+        if options.implicit_indents == ImplicitIndentsMode::Allow
+            && matches!(first, Some("WHERE"))
+            && line.words.len() > 1
+            && line.trimmed.contains('(')
+            && !line.trimmed.contains(')')
+            && !line.trimmed.trim_end().ends_with('(')
+        {
+            return true;
+        }
+
+        if matches!(first, Some("WHERE" | "HAVING")) && line.words.len() > 1 {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if matches!(
+                    scans[next_idx].words.first().map(String::as_str),
+                    Some("AND" | "OR")
+                ) {
+                    match options.implicit_indents {
+                        ImplicitIndentsMode::Forbid => return true,
+                        ImplicitIndentsMode::Allow | ImplicitIndentsMode::Require => {
+                            if scans[next_idx].indent < line.indent + indent_unit {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("ON")) {
+            if options.indented_on_contents {
+                let on_has_inline = line.words.len() > 1;
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    let next_first = scans[next_idx].words.first().map(String::as_str);
+                    if on_has_inline && matches!(next_first, Some("AND" | "OR")) {
+                        match options.implicit_indents {
+                            ImplicitIndentsMode::Allow => {
+                                if scans[next_idx].indent < line.indent + indent_unit {
+                                    return true;
+                                }
+                            }
+                            ImplicitIndentsMode::Forbid | ImplicitIndentsMode::Require => {
+                                return true;
+                            }
+                        }
+                    }
+                    if !on_has_inline && scans[next_idx].indent < line.indent + indent_unit {
+                        return true;
+                    }
+                }
+            } else if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_first = scans[next_idx].words.first().map(String::as_str);
+                if matches!(next_first, Some("AND" | "OR")) && scans[next_idx].indent != line.indent
+                {
+                    return true;
+                }
+            }
+        }
+
+        if options.indented_on_contents && line_contains_inline_on(line.trimmed) {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if matches!(
+                    scans[next_idx].words.first().map(String::as_str),
+                    Some("AND" | "OR")
+                ) {
+                    match options.implicit_indents {
+                        ImplicitIndentsMode::Allow => {
+                            if scans[next_idx].indent < line.indent + indent_unit {
+                                return true;
+                            }
+                        }
+                        ImplicitIndentsMode::Forbid | ImplicitIndentsMode::Require => {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if options.indented_then && matches!(first, Some("THEN")) {
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                let prev_first = scans[prev_idx].words.first().map(String::as_str);
+                if matches!(prev_first, Some("WHEN")) && line.indent <= scans[prev_idx].indent {
+                    return true;
+                }
+            }
+        }
+
+        if !options.indented_then && matches!(first, Some("THEN")) {
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                if line.indent > scans[prev_idx].indent + indent_unit {
+                    return true;
+                }
+            }
+        }
+
+        if !options.indented_then_contents && matches!(first, Some("THEN")) {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if scans[next_idx].indent > line.indent + indent_unit {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn detect_tsql_else_if_successive_violation(sql: &str, tab_space_size: usize) -> bool {
+    let lines: Vec<&str> = sql.lines().collect();
+    let indent_map = actual_indent_map(sql, tab_space_size);
+    let scans: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .map(|(line_idx, line)| {
+            let trimmed = line.trim_start();
+            let is_blank = trimmed.trim().is_empty();
+            let words = if is_blank {
+                Vec::new()
+            } else {
+                split_upper_words(trimmed)
+            };
+            ScanLine {
+                trimmed,
+                indent: indent_map.get(&line_idx).copied().unwrap_or(0),
+                words,
+                is_blank,
+                is_comment_only: is_comment_line(trimmed),
+            }
+        })
+        .collect();
+
+    for idx in 0..scans.len() {
+        let line = &scans[idx];
+        if line.is_blank || line.is_comment_only {
+            continue;
+        }
+
+        if !matches!(line.words.first().map(String::as_str), Some("ELSE")) {
+            continue;
+        }
+
+        if let Some(prev_idx) =
+            previous_line_matching(&scans, idx, |f, _| matches!(f, Some("IF" | "ELSE")))
+        {
+            if line.indent > scans[prev_idx].indent {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn split_upper_words(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_ascii_uppercase())
+        .collect()
+}
+
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("--")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("*/")
+}
+
+fn words_contain_in_order(words: &[String], first: &str, second: &str) -> bool {
+    let Some(first_pos) = words.iter().position(|word| word == first) else {
+        return false;
+    };
+    words.iter().skip(first_pos + 1).any(|word| word == second)
+}
+
+fn is_content_clause_line(first_word: Option<&str>, trimmed: &str) -> bool {
+    matches!(
+        first_word,
+        Some("SELECT")
+            | Some("FROM")
+            | Some("WHERE")
+            | Some("SET")
+            | Some("RETURNING")
+            | Some("HAVING")
+            | Some("LIMIT")
+            | Some("QUALIFY")
+            | Some("WINDOW")
+            | Some("DECLARE")
+            | Some("VALUES")
+            | Some("UPDATE")
+    ) && split_upper_words(trimmed).len() == 1
+}
+
+fn is_join_clause(first_word: Option<&str>, second_word: Option<&str>) -> bool {
+    matches!(first_word, Some("JOIN" | "APPLY"))
+        || (matches!(
+            first_word,
+            Some("LEFT" | "RIGHT" | "FULL" | "INNER" | "CROSS" | "OUTER" | "NATURAL")
+        ) && matches!(second_word, Some("JOIN" | "APPLY")))
+}
+
+fn join_requires_condition(first_word: Option<&str>, second_word: Option<&str>) -> bool {
+    matches!(
+        first_word,
+        Some("JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL")
+    ) || matches!(
+        (first_word, second_word),
+        (Some("OUTER"), Some("JOIN")) | (Some("NATURAL"), Some("JOIN"))
+    )
+}
+
+fn is_clause_boundary(first_word: Option<&str>, trimmed: &str) -> bool {
+    matches!(
+        first_word,
+        Some("SELECT")
+            | Some("FROM")
+            | Some("WHERE")
+            | Some("GROUP")
+            | Some("ORDER")
+            | Some("HAVING")
+            | Some("LIMIT")
+            | Some("QUALIFY")
+            | Some("WINDOW")
+            | Some("RETURNING")
+            | Some("SET")
+            | Some("UPDATE")
+            | Some("DELETE")
+            | Some("INSERT")
+            | Some("MERGE")
+            | Some("WITH")
+            | Some("JOIN")
+            | Some("LEFT")
+            | Some("RIGHT")
+            | Some("FULL")
+            | Some("INNER")
+            | Some("OUTER")
+            | Some("CROSS")
+            | Some("USING")
+            | Some("ON")
+            | Some("WHEN")
+            | Some("THEN")
+            | Some("ELSE")
+            | Some("END")
+    ) || trimmed.starts_with(')')
+}
+
+fn next_significant_line(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
+    scans
+        .iter()
+        .enumerate()
+        .skip(from_idx + 1)
+        .find_map(|(idx, scan)| (!scan.is_blank && !scan.is_comment_only).then_some(idx))
+}
+
+fn previous_significant_line(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
+    (0..from_idx)
+        .rev()
+        .find(|idx| !scans[*idx].is_blank && !scans[*idx].is_comment_only)
+}
+
+fn previous_line_matching(
+    scans: &[ScanLine<'_>],
+    from_idx: usize,
+    predicate: impl Fn(Option<&str>, Option<&str>) -> bool,
+) -> Option<usize> {
+    (0..from_idx).rev().find(|idx| {
+        let first = scans[*idx].words.first().map(String::as_str);
+        let second = scans[*idx].words.get(1).map(String::as_str);
+        predicate(first, second)
+    })
+}
+
+fn previous_line_indent_matching(
+    scans: &[ScanLine<'_>],
+    from_idx: usize,
+    predicate: impl Fn(Option<&str>, Option<&str>) -> bool,
+) -> Option<usize> {
+    (0..from_idx).rev().find_map(|idx| {
+        let first = scans[idx].words.first().map(String::as_str);
+        let second = scans[idx].words.get(1).map(String::as_str);
+        predicate(first, second).then_some(scans[idx].indent)
+    })
+}
+
+fn line_contains_inline_on(trimmed: &str) -> bool {
+    let upper = trimmed.to_ascii_uppercase();
+    upper.contains(" ON ") && !upper.starts_with("ON ")
+}
+
+fn contains_template_marker(sql: &str) -> bool {
+    sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
+}
+
+fn is_template_boundary_line(trimmed: &str) -> bool {
+    trimmed.starts_with("{%")
+        || trimmed.starts_with("{{")
+        || trimmed.starts_with("{#")
+        || trimmed.starts_with("%}")
+        || trimmed.starts_with("}}")
+        || trimmed.starts_with("#}")
+        || trimmed.ends_with("%}")
+        || trimmed.ends_with("}}")
+        || trimmed.ends_with("#}")
+}
+
+fn template_only_line_flags(lines: &[&str]) -> Vec<bool> {
+    let mut flags = vec![false; lines.len()];
+    let mut multiline_mode: Option<TemplateMultilineMode> = None;
+    let mut non_sql_depth = 0usize;
+
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(mode) = multiline_mode {
+            flags[idx] = true;
+            if line_closes_multiline_template(trimmed, mode) {
+                multiline_mode = None;
+            }
+            continue;
+        }
+
+        let mut template_only = false;
+
+        // Track `{% ... %}` blocks so macro/set bodies are treated as template-only.
+        let control_tags = template_control_tags_in_line(trimmed);
+        if !control_tags.is_empty() {
+            template_only = true;
+            for tag in &control_tags {
+                match tag.kind {
+                    TemplateControlKind::Open => {
+                        if tag
+                            .keyword
+                            .as_deref()
+                            .is_some_and(is_non_sql_template_keyword)
+                        {
+                            non_sql_depth += 1;
+                        }
+                    }
+                    TemplateControlKind::Close => {
+                        if tag
+                            .keyword
+                            .as_deref()
+                            .is_some_and(is_non_sql_template_keyword)
+                            && non_sql_depth > 0
+                        {
+                            non_sql_depth -= 1;
+                        }
+                    }
+                    TemplateControlKind::Mid => {}
+                }
+            }
+        }
+
+        if let Some(mode) = line_starts_multiline_template(trimmed) {
+            template_only = true;
+            multiline_mode = Some(mode);
+        } else if trimmed.starts_with("%}")
+            || trimmed.starts_with("}}")
+            || trimmed.starts_with("#}")
+        {
+            template_only = true;
+        }
+
+        if (trimmed.starts_with("{{") || trimmed.starts_with("{#") || trimmed.starts_with("{%"))
+            && !line_has_sql_outside_template_tags(trimmed)
+        {
+            template_only = true;
+        }
+
+        if non_sql_depth > 0 {
+            template_only = true;
+        }
+
+        flags[idx] = template_only;
+    }
+
+    flags
+}
+
+fn line_starts_multiline_template(trimmed: &str) -> Option<TemplateMultilineMode> {
+    if trimmed.starts_with("{{") && !trimmed.contains("}}") {
+        return Some(TemplateMultilineMode::Expression);
+    }
+    if trimmed.starts_with("{%") && !trimmed.contains("%}") {
+        return Some(TemplateMultilineMode::Statement);
+    }
+    if trimmed.starts_with("{#") && !trimmed.contains("#}") {
+        return Some(TemplateMultilineMode::Comment);
+    }
+    None
+}
+
+fn line_closes_multiline_template(trimmed: &str, mode: TemplateMultilineMode) -> bool {
+    match mode {
+        TemplateMultilineMode::Expression => trimmed.contains("}}"),
+        TemplateMultilineMode::Statement => trimmed.contains("%}"),
+        TemplateMultilineMode::Comment => trimmed.contains("#}"),
+    }
+}
+
+fn is_non_sql_template_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "macro" | "set" | "call" | "filter" | "raw" | "test"
+    )
+}
+
+fn template_control_tags_in_line(line: &str) -> Vec<TemplateControlTag> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(open_rel) = line[cursor..].find("{%") {
+        let open = cursor + open_rel;
+        let Some(close_rel) = line[open + 2..].find("%}") else {
+            break;
+        };
+        let close = open + 2 + close_rel;
+        let mut inner = &line[open + 2..close];
+        inner = inner.trim();
+        if let Some(stripped) = inner.strip_prefix('-') {
+            inner = stripped.trim_start();
+        }
+        if let Some(stripped) = inner.strip_suffix('-') {
+            inner = stripped.trim_end();
+        }
+        if let Some(first) = inner.split_whitespace().next() {
+            let first = first.to_ascii_lowercase();
+            if first.starts_with("end") {
+                let keyword = first.strip_prefix("end").unwrap_or("").to_string();
+                out.push(TemplateControlTag {
+                    kind: TemplateControlKind::Close,
+                    keyword: (!keyword.is_empty()).then_some(keyword),
+                });
+            } else if matches!(first.as_str(), "else" | "elif") {
+                out.push(TemplateControlTag {
+                    kind: TemplateControlKind::Mid,
+                    keyword: None,
+                });
+            } else {
+                out.push(TemplateControlTag {
+                    kind: TemplateControlKind::Open,
+                    keyword: Some(first),
+                });
+            }
+        }
+        cursor = close + 2;
+    }
+
+    out
+}
+
+fn line_has_sql_outside_template_tags(line: &str) -> bool {
+    let mut index = 0usize;
+    while index < line.len() {
+        let rest = &line[index..];
+        if rest.starts_with("{{") {
+            let Some(close) = rest.find("}}") else {
+                return line[..index].chars().any(|ch| !ch.is_whitespace());
+            };
+            index += close + 2;
+            continue;
+        }
+        if rest.starts_with("{%") {
+            let Some(close) = rest.find("%}") else {
+                return line[..index].chars().any(|ch| !ch.is_whitespace());
+            };
+            index += close + 2;
+            continue;
+        }
+        if rest.starts_with("{#") {
+            let Some(close) = rest.find("#}") else {
+                return line[..index].chars().any(|ch| !ch.is_whitespace());
+            };
+            index += close + 2;
+            continue;
+        }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            return true;
+        }
+        index += ch.len_utf8();
+    }
+
+    false
+}
+
+fn templated_detection_confident(sql: &str, indent_unit: usize, tab_space_size: usize) -> bool {
+    if templated_control_confident_violation(sql, indent_unit, tab_space_size) {
+        return true;
+    }
+
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+
+    for idx in 0..lines.len() {
+        let line = lines[idx];
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || is_comment_line(trimmed) {
+            continue;
+        }
+        let indent = line
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t')
+            .count();
+
+        if let Some(prev_idx) = (0..idx).rev().find(|prev| {
+            let prev_trim = lines[*prev].trim_start();
+            !prev_trim.is_empty() && !is_comment_line(prev_trim)
+        }) {
+            let prev_trimmed = lines[prev_idx].trim_start();
+            let prev_upper = prev_trimmed.to_ascii_uppercase();
+
+            if lines[prev_idx].trim_end().ends_with(',') && indent == 0 {
+                return true;
+            }
+
+            if is_content_clause_line(
+                split_upper_words(&prev_upper).first().map(String::as_str),
+                &prev_upper,
+            ) && indent == 0
+            {
+                return true;
+            }
+        }
+
+        if trimmed.starts_with("{{")
+            && indent == 0
+            && (0..idx)
+                .rev()
+                .find(|prev| {
+                    let prev_trim = lines[*prev].trim_start();
+                    !prev_trim.is_empty() && !is_comment_line(prev_trim)
+                })
+                .is_some_and(|prev_idx| lines[prev_idx].trim_end().ends_with(','))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn templated_control_confident_violation(
+    sql: &str,
+    indent_unit: usize,
+    tab_space_size: usize,
+) -> bool {
+    let lines: Vec<&str> = sql.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+
+    let template_only_lines = template_only_line_flags(&lines);
+    let indent_map = actual_indent_map(sql, tab_space_size);
+    let mut sql_template_block_indents: Vec<usize> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let indent = indent_map.get(&idx).copied().unwrap_or(0);
+        let controls = template_control_tags_in_line(trimmed);
+        if !controls.is_empty() {
+            for tag in controls {
+                match tag.kind {
+                    TemplateControlKind::Open => {
+                        if tag
+                            .keyword
+                            .as_deref()
+                            .is_none_or(|keyword| !is_non_sql_template_keyword(keyword))
+                        {
+                            sql_template_block_indents.push(indent);
+                        }
+                    }
+                    TemplateControlKind::Mid => {
+                        if let Some(expected_indent) = sql_template_block_indents.last() {
+                            if indent != *expected_indent {
+                                return true;
+                            }
+                        }
+                    }
+                    TemplateControlKind::Close => {
+                        if tag
+                            .keyword
+                            .as_deref()
+                            .is_none_or(|keyword| !is_non_sql_template_keyword(keyword))
+                        {
+                            if let Some(open_indent) = sql_template_block_indents.pop() {
+                                if indent != open_indent {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if template_only_lines.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+
+        if !sql_template_block_indents.is_empty() {
+            let required_indent = sql_template_block_indents[0] + indent_unit;
+            if indent < required_indent {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Build the indent string for a given target width.
@@ -793,6 +1869,196 @@ fn indentation_autofix_edits(
     edits
 }
 
+fn multiline_bracket_spacing_edits(statement_sql: &str) -> Vec<Lt02AutofixEdit> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ScanMode {
+        Outside,
+        SingleQuote,
+        DoubleQuote,
+        BacktickQuote,
+        BracketQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = statement_sql.as_bytes();
+    let mut mode = ScanMode::Outside;
+    let mut edits = Vec::new();
+    let mut open_stack: Vec<(usize, usize, bool)> = Vec::new();
+    let mut line = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        match mode {
+            ScanMode::Outside => {
+                if b == b'\'' {
+                    mode = ScanMode::SingleQuote;
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    mode = ScanMode::DoubleQuote;
+                    i += 1;
+                    continue;
+                }
+                if b == b'`' {
+                    mode = ScanMode::BacktickQuote;
+                    i += 1;
+                    continue;
+                }
+                if b == b'[' {
+                    mode = ScanMode::BracketQuote;
+                    i += 1;
+                    continue;
+                }
+                if b == b'-' && next == Some(b'-') {
+                    mode = ScanMode::LineComment;
+                    i += 2;
+                    continue;
+                }
+                if b == b'/' && next == Some(b'*') {
+                    mode = ScanMode::BlockComment;
+                    i += 2;
+                    continue;
+                }
+
+                if b == b'(' {
+                    let allow_nested_spacing =
+                        preceding_word_before_offset(bytes, i).is_some_and(|word| {
+                            matches!(
+                                word.as_str(),
+                                "IF" | "WHERE" | "HAVING" | "ON" | "USING" | "AS" | "CAST"
+                            )
+                        });
+                    open_stack.push((i, line, allow_nested_spacing));
+                    i += 1;
+                    continue;
+                }
+                if b == b')' {
+                    if let Some((open_offset, open_line, allow_nested_spacing)) = open_stack.pop() {
+                        if open_line != line {
+                            let open_line_end = bytes[open_offset + 1..]
+                                .iter()
+                                .position(|byte| *byte == b'\n')
+                                .map(|relative| open_offset + 1 + relative)
+                                .unwrap_or(bytes.len());
+                            let has_nested_open_on_open_line =
+                                bytes[open_offset + 1..open_line_end].contains(&b'(');
+
+                            if let Some(next_byte) = bytes.get(open_offset + 1).copied() {
+                                if !next_byte.is_ascii_whitespace()
+                                    && (allow_nested_spacing || !has_nested_open_on_open_line)
+                                {
+                                    edits.push(Lt02AutofixEdit {
+                                        start: open_offset + 1,
+                                        end: open_offset + 1,
+                                        replacement: " ".to_string(),
+                                    });
+                                }
+                            }
+
+                            if i > 0 {
+                                let prev_byte = bytes[i - 1];
+                                let close_line_start = bytes[..i]
+                                    .iter()
+                                    .rposition(|byte| *byte == b'\n')
+                                    .map(|index| index + 1)
+                                    .unwrap_or(0);
+                                let has_nested_close_on_close_line =
+                                    bytes[close_line_start..i].contains(&b')');
+                                if !prev_byte.is_ascii_whitespace()
+                                    && prev_byte != b'('
+                                    && (allow_nested_spacing || !has_nested_close_on_close_line)
+                                {
+                                    edits.push(Lt02AutofixEdit {
+                                        start: i,
+                                        end: i,
+                                        replacement: " ".to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+            ScanMode::SingleQuote => {
+                if b == b'\'' {
+                    if next == Some(b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::DoubleQuote => {
+                if b == b'"' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::BacktickQuote => {
+                if b == b'`' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::BracketQuote => {
+                if b == b']' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::LineComment => {
+                if b == b'\n' || b == b'\r' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::BlockComment => {
+                if b == b'*' && next == Some(b'/') {
+                    mode = ScanMode::Outside;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
+        if b == b'\n' {
+            line += 1;
+        }
+        i += 1;
+    }
+
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    edits.dedup_by_key(|edit| (edit.start, edit.end));
+    edits
+}
+
+fn preceding_word_before_offset(bytes: &[u8], offset: usize) -> Option<String> {
+    if offset == 0 || offset > bytes.len() {
+        return None;
+    }
+
+    let mut end = offset;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+
+    let mut start = end;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    if start == end {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&bytes[start..end]).to_ascii_uppercase())
+}
+
 fn statement_line_infos(sql: &str) -> Vec<StatementLineInfo> {
     let mut infos = Vec::new();
     let mut line_start = 0usize;
@@ -917,8 +2183,9 @@ fn offset_to_line(sql: &str, offset: usize) -> usize {
 mod tests {
     use super::*;
     use crate::linter::config::LintConfig;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
-    use crate::types::IssueAutofixApplicability;
+    use crate::types::{Dialect, IssueAutofixApplicability};
 
     fn run(sql: &str) -> Vec<Issue> {
         run_with_config(sql, LintConfig::default())
@@ -952,6 +2219,10 @@ mod tests {
             out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
         }
         Some(out)
+    }
+
+    fn normalize_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     #[test]
@@ -1181,5 +2452,73 @@ mod tests {
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         // Both comments should be at indent 0 (same as content line).
         assert_eq!(fixed, "SELECT 1\n-- foo\n-- bar");
+    }
+
+    #[test]
+    fn structural_autofix_adds_spacing_for_multiline_parenthesized_select() {
+        let sql = "WITH bar as (SELECT 1\n    FROM foo)\nSELECT a FROM bar";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            normalize_whitespace(&fixed),
+            "WITH bar as ( SELECT 1 FROM foo ) SELECT a FROM bar"
+        );
+    }
+
+    #[test]
+    fn structural_autofix_adds_spacing_for_multiline_parenthesized_expression() {
+        let sql = "SELECT coalesce(foo,\n              bar)\n   FROM tbl";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            normalize_whitespace(&fixed),
+            "SELECT coalesce( foo, bar ) FROM tbl"
+        );
+    }
+
+    #[test]
+    fn structural_autofix_adds_spacing_for_multiline_where_parentheses() {
+        let sql = "select *\nfrom a\nwhere (b = a\n    and c = d)";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            normalize_whitespace(&fixed),
+            "select * from a where ( b = a and c = d )"
+        );
+    }
+
+    #[test]
+    fn detects_tsql_successive_else_if_indent_violation() {
+        let sql = "IF (1 > 1)\n    PRINT 'A';\n    ELSE IF (2 > 2)\n        PRINT 'B';\n        ELSE IF (3 > 3)\n            PRINT 'C';\n            ELSE\n                PRINT 'D';\n";
+        assert!(detect_tsql_else_if_successive_violation(sql, 4));
+    }
+
+    #[test]
+    fn allows_tsql_proper_else_if_chain() {
+        let sql = "IF (1 > 1)\n    PRINT 'A';\nELSE IF (2 > 2)\n    PRINT 'B';\nELSE IF (3 > 3)\n    PRINT 'C';\nELSE\n    PRINT 'D';\n";
+        assert!(!detect_tsql_else_if_successive_violation(sql, 4));
+    }
+
+    #[test]
+    fn mssql_partial_parse_fallback_detects_successive_else_if_violation() {
+        let sql = "IF (1 > 1)\n    PRINT 'A';\n    ELSE IF (2 > 2)\n        PRINT 'B';\n        ELSE IF (3 > 3)\n            PRINT 'C';\n            ELSE\n                PRINT 'D';\n";
+        let first_statement = "IF (1 > 1)\n    PRINT 'A';";
+        let placeholder = parse_sql("SELECT 1").expect("parse placeholder");
+        let rule = LayoutIndent::default();
+        let issues = with_active_dialect(Dialect::Mssql, || {
+            rule.check(
+                &placeholder[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..first_statement.len(),
+                    statement_index: 0,
+                },
+            )
+        });
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_002);
     }
 }

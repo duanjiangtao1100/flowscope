@@ -13,6 +13,10 @@ use sqlparser::tokenizer::{
 
 pub struct LayoutSelectModifiers;
 
+type SimpleCollapseSpans = Vec<(usize, usize)>;
+type CommentAwareEdits = Vec<(usize, usize, String)>;
+type Lt010ViolationResult = (bool, SimpleCollapseSpans, CommentAwareEdits);
+
 impl LintRule for LayoutSelectModifiers {
     fn code(&self) -> &'static str {
         issue_codes::LINT_LT_010
@@ -74,9 +78,7 @@ impl LintRule for LayoutSelectModifiers {
 /// Returns (has_violation, simple_collapse_spans, comment_aware_edits).
 /// `simple_collapse_spans` are (start, end) ranges to replace with " ".
 /// `comment_aware_edits` are (start, end, replacement) triples for surgical edits.
-fn select_modifier_violations_and_fixable_spans(
-    ctx: &LintContext,
-) -> (bool, Vec<(usize, usize)>, Vec<(usize, usize, String)>) {
+fn select_modifier_violations_and_fixable_spans(ctx: &LintContext) -> Lt010ViolationResult {
     let tokens =
         tokenized_for_context(ctx).or_else(|| tokenized(ctx.statement_sql(), ctx.dialect()));
     let Some(tokens) = tokens else {
@@ -170,8 +172,7 @@ fn select_modifier_violations_and_fixable_spans(
                     ));
                     // Edit 2: Remove the modifier + trailing space from its
                     // original line.
-                    let remove_end =
-                        skip_trailing_space(sql, modifier_end);
+                    let remove_end = skip_trailing_space(sql, modifier_end);
                     comment_aware_edits.push((modifier_start, remove_end, String::new()));
                 }
             }

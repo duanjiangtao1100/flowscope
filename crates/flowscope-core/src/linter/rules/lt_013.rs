@@ -3,9 +3,8 @@
 //! SQLFluff LT13 parity (current scope): avoid leading blank lines.
 
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
+use crate::types::{issue_codes, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
-use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 pub struct LayoutStartOfFile;
 
@@ -50,14 +49,7 @@ fn leading_blank_line_trim_end(sql: &str) -> Option<usize> {
         .find(|(_, ch)| !ch.is_whitespace())
         .map(|(idx, _)| idx)
         .unwrap_or(sql.len());
-    let leading = &sql[..first_non_ws];
-    let last_newline = leading.rfind('\n')?;
-    let trim_end = last_newline + 1;
-    if trim_end == 0 {
-        None
-    } else {
-        Some(trim_end)
-    }
+    (first_non_ws > 0).then_some(first_non_ws)
 }
 
 #[cfg(test)]
@@ -70,6 +62,25 @@ mod tests {
         let statements = parse_sql(sql).expect("parse");
         let rule = LayoutStartOfFile;
         statements
+            .iter()
+            .enumerate()
+            .flat_map(|(index, statement)| {
+                rule.check(
+                    statement,
+                    &LintContext {
+                        sql,
+                        statement_range: 0..sql.len(),
+                        statement_index: index,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn run_statementless(sql: &str) -> Vec<Issue> {
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = LayoutStartOfFile;
+        synthetic
             .iter()
             .enumerate()
             .flat_map(|(index, statement)| {
@@ -129,53 +140,25 @@ mod tests {
             "comment should remain after LT013 autofix: {fixed}"
         );
     }
+
+    #[test]
+    fn does_not_flag_jinja_comment_at_start_of_file() {
+        let sql = "{# I am a comment #}\nSELECT foo FROM bar\n";
+        assert!(run_statementless(sql).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_jinja_if_at_start_of_file() {
+        let sql = "{% if True %}\nSELECT foo\nFROM bar;\n{% endif %}\n";
+        assert!(run_statementless(sql).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_jinja_for_at_start_of_file() {
+        let sql = "{% for item in range(10) %}\nSELECT foo_{{ item }}\nFROM bar;\n{% endfor %}\n";
+        assert!(run_statementless(sql).is_empty());
+    }
 }
 fn has_leading_blank_lines_for_context(ctx: &LintContext) -> bool {
-    let from_document_tokens = ctx.with_document_tokens(|tokens| {
-        if tokens.is_empty() {
-            None
-        } else {
-            Some(has_leading_blank_lines_in_tokens(tokens))
-        }
-    });
-
-    if let Some(has_violation) = from_document_tokens {
-        return has_violation;
-    }
-
-    has_leading_blank_lines(ctx.sql, ctx.dialect())
-}
-
-fn has_leading_blank_lines(sql: &str, dialect: Dialect) -> bool {
-    let dialect = dialect.to_sqlparser_dialect();
-    let mut tokenizer = Tokenizer::new(dialect.as_ref(), sql);
-    let Ok(tokens) = tokenizer.tokenize() else {
-        return false;
-    };
-
-    for token in tokens {
-        match token {
-            Token::Whitespace(Whitespace::Space | Whitespace::Tab) => continue,
-            Token::Whitespace(Whitespace::Newline) => return true,
-            Token::Whitespace(Whitespace::SingleLineComment { .. })
-            | Token::Whitespace(Whitespace::MultiLineComment(_)) => return false,
-            _ => return false,
-        }
-    }
-
-    false
-}
-
-fn has_leading_blank_lines_in_tokens(tokens: &[TokenWithSpan]) -> bool {
-    for token in tokens {
-        match &token.token {
-            Token::Whitespace(Whitespace::Space | Whitespace::Tab) => continue,
-            Token::Whitespace(Whitespace::Newline) => return true,
-            Token::Whitespace(Whitespace::SingleLineComment { .. })
-            | Token::Whitespace(Whitespace::MultiLineComment(_)) => return false,
-            _ => return false,
-        }
-    }
-
-    false
+    leading_blank_line_trim_end(ctx.sql).is_some()
 }

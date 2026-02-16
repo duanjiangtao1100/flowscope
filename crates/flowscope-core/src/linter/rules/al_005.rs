@@ -524,7 +524,22 @@ fn collect_aliases(
                 );
             }
         }
-        TableFactor::Derived { alias: Some(_), .. } => {}
+        TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } => {
+            if derived_values_alias_can_be_unused(dialect, subquery) {
+                aliases.insert(
+                    alias.name.value.clone(),
+                    AliasRef {
+                        name: alias.name.value.clone(),
+                        quoted: alias.name.quote_style.is_some(),
+                        relation_key: None,
+                    },
+                );
+            }
+        }
         TableFactor::Function {
             lateral: true,
             alias: Some(alias),
@@ -833,6 +848,13 @@ fn include_qualify_alias_references(dialect: Dialect, select: &Select) -> bool {
     // SQLFluff AL05 Redshift parity: QUALIFY references only count for alias usage
     // when QUALIFY immediately follows the FROM/JOIN section (no WHERE clause).
     !matches!(dialect, Dialect::Redshift) || select.selection.is_none()
+}
+
+fn derived_values_alias_can_be_unused(dialect: Dialect, subquery: &Query) -> bool {
+    // SQLFluff AL05 parity: this currently applies to SparkSQL fixtures
+    // (mapped to Databricks). Other dialect fixtures treat VALUES aliases as
+    // valid/required and should not be flagged.
+    matches!(dialect, Dialect::Databricks) && matches!(subquery.body.as_ref(), SetExpr::Values(_))
 }
 
 fn redshift_qualify_uses_alias_prefixed_identifier(expr: &Expr, alias: &str) -> bool {
@@ -1183,7 +1205,7 @@ fn legacy_collect_simple_table_alias_declarations(
             index += 1;
             continue;
         };
-        index = legacy_try_parse_table_item(&tokens, next, &mut out);
+        index = legacy_try_parse_table_item(&tokens, next, dialect, &mut out);
 
         // Handle comma-separated table items (FROM t1, t2, LATERAL f(...) AS x).
         loop {
@@ -1197,7 +1219,7 @@ fn legacy_collect_simple_table_alias_declarations(
                 index = comma_index + 1;
                 break;
             };
-            index = legacy_try_parse_table_item(&tokens, next_item, &mut out);
+            index = legacy_try_parse_table_item(&tokens, next_item, dialect, &mut out);
         }
     }
 
@@ -1209,6 +1231,7 @@ fn legacy_collect_simple_table_alias_declarations(
 fn legacy_try_parse_table_item(
     tokens: &[LegacyLocatedToken],
     start: usize,
+    dialect: Dialect,
     out: &mut Vec<LegacySimpleTableAliasDecl>,
 ) -> usize {
     if start >= tokens.len() {
@@ -1241,6 +1264,52 @@ fn legacy_try_parse_table_item(
             return func_end;
         }
         return start + 1;
+    }
+
+    // Handle parenthesized VALUES relation:
+    //   (VALUES (...), (...)) AS t(c1, c2)
+    if matches!(tokens[start].token, Token::LParen)
+        && matches!(dialect, Dialect::Databricks)
+        && legacy_parenthesized_relation_starts_with_values(tokens, start)
+    {
+        let Some(paren_end) = legacy_skip_parenthesized(tokens, start) else {
+            return start + 1;
+        };
+        let table_end = tokens[paren_end - 1].end;
+
+        let Some(mut alias_index) = legacy_next_non_trivia_token(tokens, paren_end) else {
+            return paren_end;
+        };
+        if legacy_token_matches_keyword(&tokens[alias_index].token, "AS") {
+            let Some(next_index) = legacy_next_non_trivia_token(tokens, alias_index + 1) else {
+                return alias_index + 1;
+            };
+            alias_index = next_index;
+        }
+        let Some((alias_value, alias_quoted)) =
+            legacy_token_any_identifier(&tokens[alias_index].token)
+        else {
+            return paren_end;
+        };
+
+        let mut alias_end = tokens[alias_index].end;
+        let mut next_cursor = alias_index + 1;
+        if let Some(cols_start) = legacy_next_non_trivia_token(tokens, alias_index + 1) {
+            if matches!(tokens[cols_start].token, Token::LParen) {
+                if let Some(cols_end) = legacy_skip_parenthesized(tokens, cols_start) {
+                    alias_end = tokens[cols_end - 1].end;
+                    next_cursor = cols_end;
+                }
+            }
+        }
+
+        out.push(LegacySimpleTableAliasDecl {
+            table_end,
+            alias_end,
+            alias: alias_value.to_string(),
+            quoted: alias_quoted,
+        });
+        return next_cursor;
     }
 
     // Table name: identifier(.identifier)*
@@ -1388,6 +1457,37 @@ fn legacy_skip_lateral_function_call(tokens: &[LegacyLocatedToken], start: usize
     }
 }
 
+fn legacy_parenthesized_relation_starts_with_values(
+    tokens: &[LegacyLocatedToken],
+    lparen_index: usize,
+) -> bool {
+    let Some(first_inner) = legacy_next_non_trivia_token(tokens, lparen_index + 1) else {
+        return false;
+    };
+    legacy_token_matches_keyword(&tokens[first_inner].token, "VALUES")
+}
+
+fn legacy_skip_parenthesized(tokens: &[LegacyLocatedToken], lparen_index: usize) -> Option<usize> {
+    if !matches!(tokens.get(lparen_index)?.token, Token::LParen) {
+        return None;
+    }
+    let mut depth = 1u32;
+    let mut cursor = lparen_index + 1;
+    while cursor < tokens.len() && depth > 0 {
+        match &tokens[cursor].token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if depth == 0 {
+        Some(cursor)
+    } else {
+        None
+    }
+}
+
 fn legacy_is_trivia_token(token: &Token) -> bool {
     matches!(
         token,
@@ -1428,6 +1528,12 @@ fn legacy_contains_alias_qualifier_dialect(
     dialect: Dialect,
     alias_case_check: AliasCaseCheck,
 ) -> bool {
+    if matches!(dialect, Dialect::Redshift)
+        && legacy_redshift_qualify_uses_alias_prefixed_identifier(sql, alias)
+    {
+        return true;
+    }
+
     let alias_bytes = alias.as_bytes();
     if alias_bytes.is_empty() {
         return false;
@@ -1524,6 +1630,49 @@ fn legacy_contains_alias_qualifier_dialect(
     }
 
     false
+}
+
+fn legacy_redshift_qualify_uses_alias_prefixed_identifier(sql: &str, alias: &str) -> bool {
+    let Some(tokens) = legacy_tokenize_with_offsets(sql, Dialect::Redshift) else {
+        return false;
+    };
+    let Some(qualify_index) = tokens
+        .iter()
+        .position(|token| legacy_token_matches_keyword(&token.token, "QUALIFY"))
+    else {
+        return false;
+    };
+
+    // SQLFluff parity: for Redshift AL05, QUALIFY references only count when
+    // QUALIFY follows FROM/JOIN directly (i.e. no WHERE before QUALIFY).
+    if tokens[..qualify_index]
+        .iter()
+        .any(|token| legacy_token_matches_keyword(&token.token, "WHERE"))
+    {
+        return false;
+    }
+
+    tokens[qualify_index + 1..]
+        .iter()
+        .filter_map(|token| legacy_token_reference_identifier(&token.token))
+        .any(|identifier| legacy_alias_prefixed_identifier(identifier, alias))
+}
+
+fn legacy_token_reference_identifier(token: &Token) -> Option<&str> {
+    match token {
+        Token::Word(word) => Some(word.value.as_str()),
+        _ => None,
+    }
+}
+
+fn legacy_alias_prefixed_identifier(identifier: &str, alias: &str) -> bool {
+    if identifier.is_empty() || alias.is_empty() {
+        return false;
+    }
+    identifier
+        .to_ascii_uppercase()
+        .strip_prefix(&alias.to_ascii_uppercase())
+        .is_some_and(|suffix| suffix.starts_with('_'))
 }
 
 fn legacy_is_generated_alias_identifier(alias: &str) -> bool {
@@ -1638,7 +1787,7 @@ fn legacy_is_simple_identifier(value: &str) -> bool {
 }
 
 fn legacy_is_ascii_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
+    byte.is_ascii_alphabetic() || byte == b'_' || byte == b'#'
 }
 
 fn legacy_is_ascii_ident_continue(byte: u8) -> bool {
@@ -2200,6 +2349,62 @@ mod tests {
             Dialect::Redshift,
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn redshift_qualify_after_from_autofix_keeps_used_join_alias() {
+        let sql = "SELECT *\n\
+FROM #store as s\n\
+INNER JOIN #store_sales AS ss\n\
+QUALIFY row_number() OVER (PARTITION BY ss_sold_date ORDER BY ss_sales_price DESC) <= 2";
+        let issues = check_sql_in_dialect(sql, Dialect::Redshift);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT *\n\
+FROM #store\n\
+INNER JOIN #store_sales AS ss\n\
+QUALIFY row_number() OVER (PARTITION BY ss_sold_date ORDER BY ss_sales_price DESC) <= 2"
+        );
+    }
+
+    #[test]
+    fn redshift_qualify_after_where_autofix_removes_both_unused_aliases() {
+        let sql = "SELECT *\n\
+FROM #store as s\n\
+INNER JOIN #store_sales AS ss\n\
+WHERE col = 1\n\
+QUALIFY row_number() OVER (PARTITION BY ss_sold_date ORDER BY ss_sales_price DESC) <= 2";
+        let issues = check_sql_in_dialect(sql, Dialect::Redshift);
+        assert_eq!(issues.len(), 2);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT *\n\
+FROM #store\n\
+INNER JOIN #store_sales\n\
+WHERE col = 1\n\
+QUALIFY row_number() OVER (PARTITION BY ss_sold_date ORDER BY ss_sales_price DESC) <= 2"
+        );
+    }
+
+    #[test]
+    fn sparksql_values_derived_alias_is_detected_and_autofixed() {
+        let sql = "SELECT *\n\
+FROM (\n\
+    VALUES (1, 2), (3, 4)\n\
+) AS t(c1, c2)";
+        let issues = check_sql_in_dialect(sql, Dialect::Databricks);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT *\n\
+FROM (\n\
+    VALUES (1, 2), (3, 4)\n\
+)"
+        );
     }
 
     #[test]

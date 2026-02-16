@@ -39,13 +39,33 @@ impl LintRule for FlattenableNestedCase {
             .with_statement(ctx.statement_index);
 
             if let Some((span, edits)) = build_flatten_autofix(ctx, expr) {
-                issue = issue
-                    .with_span(span)
-                    .with_autofix_edits(IssueAutofixApplicability::Unsafe, edits);
+                issue = issue.with_span(span);
+                if !edits.is_empty() {
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Unsafe, edits);
+                }
             }
 
             issues.push(issue);
         });
+
+        // Parser fallback path for unparsable CASE syntax and templated inner
+        // branches: detect at token level using statement SQL.
+        if issues.is_empty()
+            && (is_synthetic_select_one(stmt) || contains_template_tags(ctx.statement_sql()))
+        {
+            if let Some((span, edits)) = build_flatten_autofix_from_sql(ctx) {
+                let mut issue = Issue::warning(
+                    issue_codes::LINT_ST_004,
+                    "Nested CASE in ELSE clause can be flattened.",
+                )
+                .with_statement(ctx.statement_index)
+                .with_span(span);
+                if !edits.is_empty() {
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Unsafe, edits);
+                }
+                issues.push(issue);
+            }
+        }
 
         issues
     }
@@ -105,6 +125,19 @@ fn exprs_equal(left: &Expr, right: &Expr) -> bool {
     format!("{left}") == format!("{right}")
 }
 
+fn contains_template_tags(sql: &str) -> bool {
+    sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
+}
+
+fn is_synthetic_select_one(stmt: &Statement) -> bool {
+    let normalized = stmt
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    normalized.eq_ignore_ascii_case("SELECT 1")
+}
+
 // ---------------------------------------------------------------------------
 // Autofix: flatten nested CASE in ELSE clause
 // ---------------------------------------------------------------------------
@@ -134,7 +167,6 @@ fn build_flatten_autofix(
 
     // Get the outer CASE span in statement coordinates.
     let (outer_start, outer_end) = expr_statement_offsets(ctx, outer_expr)?;
-    let outer_span = ctx.span_from_statement_offset(outer_start, outer_end);
 
     // Tokenize the CASE expression region to find key positions.
     let tokens = tokenize_with_spans(sql, ctx.dialect())?;
@@ -152,33 +184,145 @@ fn build_flatten_autofix(
         .collect();
 
     // Find the ELSE keyword that begins the nested CASE, and the inner CASE/END tokens.
-    let flatten_info = find_flatten_positions(&positioned, outer_start)?;
+    let flatten_info = find_flatten_positions(&positioned)?;
 
-    // The flattened output replaces:
-    //   `ELSE [comments-before-case] CASE [operand] [body] END [comments-after-inner-end]`
-    // with:
-    //   `[comments-between-else-and-case-body] [inner-body] [comments-after-inner-end]`
-    //
-    // Then also remove the outer's trailing END (replaced by inner's END position).
+    build_flatten_edit_from_positions(ctx, sql, &positioned, &flatten_info)
+}
+
+fn build_flatten_autofix_from_sql(ctx: &LintContext) -> Option<(Span, Vec<IssuePatchEdit>)> {
+    let sql = ctx.statement_sql();
+    let masked_sql = contains_template_tags(sql).then(|| mask_templated_areas(sql));
+    let scan_sql = masked_sql.as_deref().unwrap_or(sql);
+    let tokens = tokenize_with_spans(scan_sql, ctx.dialect())?;
+    let positioned: Vec<PositionedToken> = tokens
+        .iter()
+        .filter_map(|token| {
+            let (start, end) = token_with_span_offsets(scan_sql, token)?;
+            Some(PositionedToken {
+                token: token.token.clone(),
+                start,
+                end,
+            })
+        })
+        .collect();
+
+    let flatten_info = find_flatten_positions(&positioned)?;
+    build_flatten_edit_from_positions(ctx, sql, &positioned, &flatten_info)
+}
+
+fn mask_templated_areas(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut index = 0usize;
+
+    while let Some((open_index, close_marker)) = find_next_template_open(sql, index) {
+        out.push_str(&sql[index..open_index]);
+        let marker_start = open_index + 2;
+        if let Some(close_offset) = sql[marker_start..].find(close_marker) {
+            let close_index = marker_start + close_offset + close_marker.len();
+            out.push_str(&mask_non_newlines(&sql[open_index..close_index]));
+            index = close_index;
+        } else {
+            out.push_str(&mask_non_newlines(&sql[open_index..]));
+            return out;
+        }
+    }
+
+    out.push_str(&sql[index..]);
+    out
+}
+
+fn find_next_template_open(sql: &str, from: usize) -> Option<(usize, &'static str)> {
+    let rest = sql.get(from..)?;
+    let candidates = [("{{", "}}"), ("{%", "%}"), ("{#", "#}")];
+
+    candidates
+        .into_iter()
+        .filter_map(|(open, close)| rest.find(open).map(|offset| (from + offset, close)))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn mask_non_newlines(segment: &str) -> String {
+    segment
+        .chars()
+        .map(|ch| if ch == '\n' { '\n' } else { ' ' })
+        .collect()
+}
+
+fn build_flatten_edit_from_positions(
+    ctx: &LintContext,
+    sql: &str,
+    positioned: &[PositionedToken],
+    flatten_info: &FlattenPositions,
+) -> Option<(Span, Vec<IssuePatchEdit>)> {
     let else_start = flatten_info.else_start;
     let inner_case_body_start = flatten_info.inner_body_start;
     let inner_end_start = flatten_info.inner_end_start;
     let inner_end_end = flatten_info.inner_end_end;
     let outer_end_start = flatten_info.outer_end_start;
+    let outer_case_start = flatten_info.outer_case_start;
+    let outer_end_end = flatten_info.outer_end_end;
+    let else_end = flatten_info.else_end;
+    let inner_case_start = flatten_info.inner_case_start;
+    let inner_case_end = flatten_info.inner_case_end;
+
+    let issue_span = ctx.span_from_statement_offset(outer_case_start, outer_end_end);
+
+    // Replace from the start of the ELSE line up to (but not including) the
+    // outer END token.
+    let replace_start = line_start_offset(sql, else_start);
+    let replace_end = outer_end_start;
+    if replace_end <= replace_start {
+        return Some((issue_span, Vec::new()));
+    }
 
     // Collect comments between ELSE and inner CASE body.
-    let comments_before_body =
-        collect_comments_in_range(&positioned, else_start, inner_case_body_start);
+    let else_line_start = line_start_offset(sql, else_start);
+    let mut comments_before_body =
+        collect_comments_in_range(positioned, else_line_start, else_start);
+    comments_before_body.extend(collect_comments_in_range(
+        positioned,
+        else_start,
+        inner_case_body_start,
+    ));
 
     // Collect comments between inner END and outer END.
     let comments_after_inner_end =
-        collect_comments_in_range(&positioned, inner_end_end, outer_end_start);
+        collect_comments_in_range(positioned, inner_end_end, outer_end_start);
 
-    // Get the inner body text (WHEN/ELSE clauses) starting from the line
-    // containing the first WHEN/ELSE keyword.
-    let inner_body_line_start = line_start_offset(sql, inner_case_body_start);
-    let inner_end_line_start = line_start_offset(sql, inner_end_start);
-    let inner_body_full_lines = sql.get(inner_body_line_start..inner_end_line_start)?;
+    // If the rewrite region touches template tags, report only (no autofix).
+    if contains_template_tags(sql.get(replace_start..replace_end)?) {
+        return Some((issue_span, Vec::new()));
+    }
+
+    // In comment-heavy regions, avoid editing comment bytes directly (blocked
+    // by the fix planner). Remove only CASE/ELSE/END wrapper keywords.
+    if has_comments_in_range(positioned, replace_start, replace_end) {
+        let mut edits = Vec::new();
+        edits.push(IssuePatchEdit::new(
+            ctx.span_from_statement_offset(else_start, else_end),
+            String::new(),
+        ));
+        edits.push(IssuePatchEdit::new(
+            ctx.span_from_statement_offset(inner_case_start, inner_case_end),
+            String::new(),
+        ));
+        if inner_case_end < inner_case_body_start
+            && !has_comments_in_range(positioned, inner_case_end, inner_case_body_start)
+        {
+            edits.push(IssuePatchEdit::new(
+                ctx.span_from_statement_offset(inner_case_end, inner_case_body_start),
+                String::new(),
+            ));
+        }
+        edits.push(IssuePatchEdit::new(
+            ctx.span_from_statement_offset(inner_end_start, inner_end_end),
+            String::new(),
+        ));
+        return Some((issue_span, edits));
+    }
+
+    // Get the inner body text (WHEN/ELSE clauses).
+    let inner_body_text = sql.get(inner_case_body_start..inner_end_start)?;
 
     // Determine indentation levels.
     let outer_indent = find_indent_of_else(sql, else_start);
@@ -195,7 +339,7 @@ fn build_flatten_autofix(
     }
 
     // Add inner body lines, re-indented to match outer CASE indentation.
-    let inner_body_trimmed = inner_body_full_lines.trim_end();
+    let inner_body_trimmed = inner_body_text.trim();
     if !inner_body_trimmed.is_empty() {
         for line in inner_body_trimmed.lines() {
             let stripped = strip_indent(line, &inner_body_indent);
@@ -217,37 +361,36 @@ fn build_flatten_autofix(
         replacement.pop();
     }
 
-    // Build a single edit: replace from the start of the ELSE line to the outer END.
-    // We start from the line start (after the preceding newline) so that the
-    // replacement's own indentation replaces the original ELSE indentation.
-    let replace_start = line_start_offset(sql, else_start);
-    let replace_end = outer_end;
-
-    // Rebuild the END part: use original outer END formatting (whitespace before END).
+    // Keep the outer END token in place by restoring its indentation prefix.
     let end_prefix = find_line_prefix(sql, outer_end_start);
-
     replacement.push('\n');
     replacement.push_str(&end_prefix);
-    replacement.push_str("END");
-
-    // Include anything after the outer END keyword (like " AS sound").
-    let after_outer_end = outer_end_start + "END".len();
-    if after_outer_end < outer_end {
-        replacement.push_str(sql.get(after_outer_end..outer_end)?);
-    }
 
     let edit_span = ctx.span_from_statement_offset(replace_start, replace_end);
-
     Some((
-        outer_span,
+        issue_span,
         vec![IssuePatchEdit::new(edit_span, replacement)],
     ))
 }
 
+fn has_comments_in_range(tokens: &[PositionedToken], start: usize, end: usize) -> bool {
+    tokens
+        .iter()
+        .any(|t| t.start >= start && t.end <= end && is_comment(&t.token))
+}
+
 #[derive(Debug)]
 struct FlattenPositions {
+    /// Byte offset of the outer CASE keyword.
+    outer_case_start: usize,
     /// Byte offset of the outer ELSE keyword that contains the nested CASE.
     else_start: usize,
+    /// Byte offset after the outer ELSE keyword.
+    else_end: usize,
+    /// Byte offset of the inner CASE keyword.
+    inner_case_start: usize,
+    /// Byte offset after the inner CASE keyword.
+    inner_case_end: usize,
     /// Byte offset where the inner CASE body starts (first WHEN or ELSE after CASE keyword).
     inner_body_start: usize,
     /// Byte offset of the inner END keyword.
@@ -256,12 +399,11 @@ struct FlattenPositions {
     inner_end_end: usize,
     /// Byte offset of the outer END keyword.
     outer_end_start: usize,
+    /// Byte offset after the outer END keyword.
+    outer_end_end: usize,
 }
 
-fn find_flatten_positions(
-    tokens: &[PositionedToken],
-    _outer_start: usize,
-) -> Option<FlattenPositions> {
+fn find_flatten_positions(tokens: &[PositionedToken]) -> Option<FlattenPositions> {
     let significant: Vec<(usize, &PositionedToken)> = tokens
         .iter()
         .enumerate()
@@ -304,6 +446,7 @@ fn find_else_with_nested_case(
 ) -> Option<FlattenPositions> {
     // Walk from the outer CASE to outer END tracking depth.
     let mut depth = 0usize;
+    let outer_case_start = significant.get(outer_case_sig_idx)?.1.start;
 
     for sig_idx in outer_case_sig_idx..=outer_end_sig_idx {
         let (_, token) = &significant[sig_idx];
@@ -320,6 +463,9 @@ fn find_else_with_nested_case(
                 if token_word_equals(&next_token.token, "CASE") {
                     // Found ELSE followed by CASE.
                     let else_start = token.start;
+                    let else_end = token.end;
+                    let inner_case_start = next_token.start;
+                    let inner_case_end = next_token.end;
 
                     // Find where the inner CASE body starts (after CASE keyword and optional operand).
                     let inner_body_start =
@@ -345,13 +491,19 @@ fn find_else_with_nested_case(
                     }
 
                     let outer_end_start = significant[outer_end_sig_idx].1.start;
+                    let outer_end_end = significant[outer_end_sig_idx].1.end;
 
                     return Some(FlattenPositions {
+                        outer_case_start,
                         else_start,
+                        else_end,
+                        inner_case_start,
+                        inner_case_end,
                         inner_body_start,
                         inner_end_start: inner_end_start?,
                         inner_end_end: inner_end_end?,
                         outer_end_start,
+                        outer_end_end,
                     });
                 }
             }
@@ -389,7 +541,10 @@ fn find_inner_body_start(
             return Some(token.start);
         }
     }
-    None
+    // Template-heavy or parser-fallback SQL may not expose explicit WHEN/ELSE
+    // tokens inside the inner CASE body. Fall back to the byte immediately
+    // after the CASE keyword so we can still emit a detection-only issue.
+    Some(significant.get(inner_case_sig_idx)?.1.end)
 }
 
 fn collect_comments_in_range(tokens: &[PositionedToken], start: usize, end: usize) -> Vec<String> {

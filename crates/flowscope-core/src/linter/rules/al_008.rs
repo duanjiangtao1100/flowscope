@@ -76,7 +76,12 @@ impl LintRule for AliasingUniqueColumn {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if first_duplicate_column_alias_in_statement(statement, self.alias_case_check).is_none() {
+        let duplicate = first_duplicate_column_alias_in_statement(statement, self.alias_case_check)
+            .or_else(|| {
+                fallback_duplicate_column_alias_in_sql(ctx.statement_sql(), self.alias_case_check)
+            });
+
+        if duplicate.is_none() {
             return Vec::new();
         }
 
@@ -269,6 +274,71 @@ fn first_duplicate_alias(
     }
 
     None
+}
+
+fn fallback_duplicate_column_alias_in_sql(
+    sql: &str,
+    alias_case_check: AliasCaseCheck,
+) -> Option<String> {
+    let trimmed = sql.trim();
+    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("select") {
+        return None;
+    }
+
+    // Keep the fallback narrow: only used for parser-fragment SELECT lists
+    // that end with a trailing comma (e.g. SQLFluff AL08 test_fail_locs).
+    if !trimmed.ends_with(',') {
+        return None;
+    }
+
+    let projection_sql = trimmed[6..].trim_start();
+    let aliases = fallback_projection_aliases(projection_sql);
+    if aliases.is_empty() {
+        return None;
+    }
+
+    first_duplicate_alias(&aliases, alias_case_check)
+}
+
+fn fallback_projection_aliases(projection_sql: &str) -> Vec<ProjectionAlias> {
+    projection_sql
+        .lines()
+        .filter_map(|line| {
+            let expr = line.trim().trim_end_matches(',').trim();
+            if expr.is_empty() {
+                return None;
+            }
+            projection_alias_from_fragment(expr)
+        })
+        .collect()
+}
+
+fn projection_alias_from_fragment(expr: &str) -> Option<ProjectionAlias> {
+    if expr.contains("{{") || expr.contains("{%") || expr.contains("{#") {
+        return None;
+    }
+
+    let parts = expr.split_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let alias_raw = if parts.len() >= 2 {
+        parts[parts.len() - 1]
+    } else {
+        parts[0]
+    };
+
+    let quoted =
+        alias_raw.starts_with('"') || alias_raw.starts_with('`') || alias_raw.starts_with('[');
+    let name = alias_raw
+        .trim_matches(|ch| matches!(ch, '"' | '`' | '[' | ']'))
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(ProjectionAlias { name, quoted })
 }
 
 fn aliases_match(
@@ -505,6 +575,23 @@ mod tests {
         // Note: fixture SQL has trailing comma and no FROM clause.
         let sql = "select\n  foo,\n  b as foo,\n  c as bar,\n  bar,\n  d foo\nfrom t";
         let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_AL_008);
+    }
+
+    #[test]
+    fn statementless_trailing_comma_fragment_detects_duplicate_aliases() {
+        let sql = "select\n  foo,\n  b as foo,\n  c as bar,\n  bar,\n  d foo,\n";
+        let synthetic = parse_sql("SELECT 1").expect("parse");
+        let rule = AliasingUniqueColumn::default();
+        let issues = rule.check(
+            &synthetic[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_AL_008);
     }

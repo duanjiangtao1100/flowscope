@@ -1,6 +1,6 @@
 # SQLFluff vs FlowScope Lint Gap Matrix
 
-_Generated on 2026-02-12 from a local SQLFluff source snapshot (2026-01-20)._
+_Generated on 2026-02-16 from a local SQLFluff source snapshot (2026-01-20)._
 
 ## Summary
 
@@ -13,6 +13,7 @@ _Generated on 2026-02-12 from a local SQLFluff source snapshot (2026-01-20)._
 - FlowScope fix coverage: **55 / 72**
 - FlowScope rules without fix support: **17**
 - FlowScope coverage on SQLFluff-fixable rules (`SQLFluff Fix = Yes`): **52 / 52**
+- SQLFluff parity replay (2026-02-16): **Detection 1885/1885 (100.0%)**, **Fix 667/667 (100.0%)** via `just sqlfluff-parity /home/sasha/Developer/tries/2026-01-20-sqlfluff`
 
 Bundle counts (SQLFluff): Aliasing=9, Ambiguous=9, Capitalisation=5, Convention=12, Jinja=1, Layout=15, References=6, Structure=12, TSQL=3
 

@@ -49,6 +49,32 @@ pub fn parse_sql_with_dialect_output(
                 }
             }
 
+            if matches!(dialect, Dialect::Ansi) {
+                if let Some(sanitized_sql) = sanitize_ansi_national_literal_spacing(sql) {
+                    if let Ok(statements) =
+                        Parser::parse_sql(sqlparser_dialect.as_ref(), &sanitized_sql)
+                    {
+                        return Ok(ParseSqlOutput {
+                            statements,
+                            parser_fallback_used: true,
+                        });
+                    }
+                }
+            }
+
+            if matches!(dialect, Dialect::Bigquery) {
+                if let Some(sanitized_sql) = sanitize_bigquery_raw_double_quoted_literals(sql) {
+                    if let Ok(statements) =
+                        Parser::parse_sql(sqlparser_dialect.as_ref(), &sanitized_sql)
+                    {
+                        return Ok(ParseSqlOutput {
+                            statements,
+                            parser_fallback_used: true,
+                        });
+                    }
+                }
+            }
+
             // Parity fallback: Generic dialect frequently fails on Postgres-specific
             // operators (`?`, `->>`, `::`) commonly used in warehouse SQL.
             if matches!(dialect, Dialect::Generic) && looks_like_postgres_syntax(sql) {
@@ -99,6 +125,219 @@ fn sanitize_escaped_identifiers_for_dialect(sql: &str, dialect: Dialect) -> Opti
 fn sanitize_trailing_comma_before_from(sql: &str) -> Option<String> {
     let rewritten = remove_trailing_comma_before_from(sql);
     (rewritten != sql).then_some(rewritten)
+}
+
+fn sanitize_ansi_national_literal_spacing(sql: &str) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ScanMode {
+        Outside,
+        SingleQuote,
+        DoubleQuote,
+        BacktickQuote,
+        BracketQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    fn identifier_tail(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+    }
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut mode = ScanMode::Outside;
+    let mut i = 0usize;
+    let mut changed = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        match mode {
+            ScanMode::Outside => {
+                if b == b'\'' {
+                    mode = ScanMode::SingleQuote;
+                    out.push('\'');
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    mode = ScanMode::DoubleQuote;
+                    out.push('"');
+                    i += 1;
+                    continue;
+                }
+                if b == b'`' {
+                    mode = ScanMode::BacktickQuote;
+                    out.push('`');
+                    i += 1;
+                    continue;
+                }
+                if b == b'[' {
+                    mode = ScanMode::BracketQuote;
+                    out.push('[');
+                    i += 1;
+                    continue;
+                }
+                if b == b'-' && next == Some(b'-') {
+                    mode = ScanMode::LineComment;
+                    out.push('-');
+                    out.push('-');
+                    i += 2;
+                    continue;
+                }
+                if b == b'/' && next == Some(b'*') {
+                    mode = ScanMode::BlockComment;
+                    out.push('/');
+                    out.push('*');
+                    i += 2;
+                    continue;
+                }
+
+                if matches!(b, b'N' | b'n') {
+                    let prev = i.checked_sub(1).and_then(|idx| bytes.get(idx).copied());
+                    if !prev.is_some_and(identifier_tail) {
+                        let mut j = i + 1;
+                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j > i + 1 && bytes.get(j).copied() == Some(b'\'') {
+                            out.push(b as char);
+                            i += 1;
+                            while i < j {
+                                changed = true;
+                                i += 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                out.push(b as char);
+                i += 1;
+            }
+            ScanMode::SingleQuote => {
+                out.push(b as char);
+                i += 1;
+                if b == b'\'' {
+                    if next == Some(b'\'') {
+                        out.push('\'');
+                        i += 1;
+                    } else {
+                        mode = ScanMode::Outside;
+                    }
+                }
+            }
+            ScanMode::DoubleQuote => {
+                out.push(b as char);
+                i += 1;
+                if b == b'"' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::BacktickQuote => {
+                out.push(b as char);
+                i += 1;
+                if b == b'`' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::BracketQuote => {
+                out.push(b as char);
+                i += 1;
+                if b == b']' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::LineComment => {
+                out.push(b as char);
+                i += 1;
+                if b == b'\n' || b == b'\r' {
+                    mode = ScanMode::Outside;
+                }
+            }
+            ScanMode::BlockComment => {
+                out.push(b as char);
+                i += 1;
+                if b == b'*' && next == Some(b'/') {
+                    out.push('/');
+                    i += 1;
+                    mode = ScanMode::Outside;
+                }
+            }
+        }
+    }
+
+    changed.then_some(out)
+}
+
+fn sanitize_bigquery_raw_double_quoted_literals(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut changed = false;
+
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+
+        let prefix = &sql[start..i];
+        let is_raw_prefix = prefix.eq_ignore_ascii_case("r")
+            || prefix.eq_ignore_ascii_case("br")
+            || prefix.eq_ignore_ascii_case("rb");
+
+        if !is_raw_prefix || i >= bytes.len() || bytes[i] != b'"' {
+            if start < i {
+                out.push_str(prefix);
+            } else if i < bytes.len() {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+
+        let quote_start = i;
+        i += 1;
+        let mut body = String::new();
+        let mut closed = false;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                body.push('\\');
+                body.push('"');
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                closed = true;
+                i += 1;
+                break;
+            }
+            body.push(bytes[i] as char);
+            i += 1;
+        }
+
+        if !closed {
+            out.push_str(&sql[start..quote_start]);
+            out.push('"');
+            out.push_str(&body);
+            break;
+        }
+
+        changed = true;
+        out.push_str(prefix);
+        out.push('\'');
+        for ch in body.chars() {
+            if ch == '\'' {
+                out.push('\'');
+            }
+            out.push(ch);
+        }
+        out.push('\'');
+    }
+
+    changed.then_some(out)
 }
 
 fn rewrite_escaped_quoted_identifiers(sql: &str, delimiters: &[u8]) -> String {
@@ -391,6 +630,22 @@ mod tests {
     fn test_parse_output_trailing_comma_before_from_fallback_usage() {
         let sql = "SELECT widget.id,\nwidget.name,\nFROM widget";
         let output = parse_sql_with_dialect_output(sql, Dialect::Ansi).expect("parse");
+        assert!(output.parser_fallback_used);
+        assert_eq!(output.statements.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_output_ansi_national_literal_spacing_fallback_usage() {
+        let sql = "SELECT a + N 'b' + N 'c' FROM tbl;";
+        let output = parse_sql_with_dialect_output(sql, Dialect::Ansi).expect("parse");
+        assert!(output.parser_fallback_used);
+        assert_eq!(output.statements.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_output_bigquery_raw_double_quoted_literal_fallback_usage() {
+        let sql = r#"SELECT r'Tricky "quote', r"Not-so-tricky \"quote""#;
+        let output = parse_sql_with_dialect_output(sql, Dialect::Bigquery).expect("parse");
         assert!(output.parser_fallback_used);
         assert_eq!(output.statements.len(), 1);
     }

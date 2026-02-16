@@ -29,9 +29,7 @@ impl CapitalisationLiterals {
         // shorter `capitalisation_policy` for CP04.
         let policy = config
             .rule_option_str(issue_codes::LINT_CP_004, "extended_capitalisation_policy")
-            .or_else(|| {
-                config.rule_option_str(issue_codes::LINT_CP_004, "capitalisation_policy")
-            })
+            .or_else(|| config.rule_option_str(issue_codes::LINT_CP_004, "capitalisation_policy"))
             .map(CapitalisationPolicy::from_raw_value)
             .unwrap_or(CapitalisationPolicy::Consistent);
 
@@ -209,8 +207,7 @@ fn literal_autofix_edits(
     let mut edits = Vec::new();
 
     for candidate in literals {
-        let Some(replacement) = literal_case_replacement(candidate.value.as_str(), resolved)
-        else {
+        let Some(replacement) = literal_case_replacement(candidate.value.as_str(), resolved) else {
             continue;
         };
         if replacement == candidate.value {

@@ -121,7 +121,14 @@ pub(crate) fn resolve_select_output_columns(
                 count += sum_all_source_columns(&sources)?;
             }
             SelectItem::QualifiedWildcard(name, _) => {
-                count += resolve_qualified_wildcard_columns(&name.to_string(), &sources)?;
+                let qualifier = name.to_string();
+                if qualified_wildcard_source_exists(&qualifier, &sources) {
+                    count += resolve_qualified_wildcard_columns(&qualifier, &sources)?;
+                } else {
+                    // AM04 parity: unresolved qualifiers are reference issues
+                    // (RF01), but do not make output width ambiguous.
+                    count += 1;
+                }
             }
             _ => count += 1,
         }
@@ -331,21 +338,31 @@ pub(crate) fn resolve_qualified_wildcard_columns(
     let cleaned = qualifier.strip_suffix(".*").unwrap_or(qualifier);
     let qualifier_upper = normalize_identifier(cleaned.to_string());
 
-    find_source_columns_by_name(&qualifier_upper, sources).or_else(|| {
-        qualifier_upper
-            .rsplit('.')
-            .next()
-            .and_then(|tail| find_source_columns_by_name(tail, sources))
-    })
+    find_source_by_name(&qualifier_upper, sources)
+        .and_then(|source| source.column_count)
+        .or_else(|| {
+            qualifier_upper
+                .rsplit('.')
+                .next()
+                .and_then(|tail| find_source_by_name(tail, sources))
+                .and_then(|source| source.column_count)
+        })
 }
 
-fn find_source_columns_by_name(name: &str, sources: &[SourceColumns]) -> Option<usize> {
-    for source in sources {
-        if source.names.iter().any(|candidate| candidate == name) {
-            return source.column_count;
-        }
-    }
-    None
+fn qualified_wildcard_source_exists(qualifier: &str, sources: &[SourceColumns]) -> bool {
+    let cleaned = qualifier.strip_suffix(".*").unwrap_or(qualifier);
+    let qualifier_upper = normalize_identifier(cleaned.to_string());
+    find_source_by_name(&qualifier_upper, sources).is_some()
+        || qualifier_upper
+            .rsplit('.')
+            .next()
+            .is_some_and(|tail| find_source_by_name(tail, sources).is_some())
+}
+
+fn find_source_by_name<'a>(name: &str, sources: &'a [SourceColumns]) -> Option<&'a SourceColumns> {
+    sources
+        .iter()
+        .find(|source| source.names.iter().any(|candidate| candidate == name))
 }
 
 fn resolve_query_output_column_names(query: &Query) -> Option<Vec<String>> {

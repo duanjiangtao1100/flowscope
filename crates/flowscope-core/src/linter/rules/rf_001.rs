@@ -82,7 +82,15 @@ impl LintRule for ReferencesFrom {
     }
 
     fn check(&self, statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
-        if !self.force_enable {
+        let effective_force_enable = if self.force_enable_configured {
+            self.force_enable
+        } else {
+            // SQLFluff keeps RF01 disabled by default for SparkSQL because
+            // dotted struct-field access is ambiguous with table qualification.
+            !matches!(ctx.dialect(), crate::types::Dialect::Databricks)
+        };
+
+        if !effective_force_enable {
             return Vec::new();
         }
 
@@ -1056,6 +1064,7 @@ fn clean_identifier_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::config::LintConfig;
     use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
     use crate::parser::parse_sql_with_dialect;
@@ -1175,6 +1184,44 @@ mod tests {
             "CREATE POLICY p ON my_table USING (my_tableeee.id = my_table.id)",
             Dialect::Postgres,
         );
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn sparksql_default_mode_skips_explode_nested_field_check() {
+        let issues = run_in_dialect(
+            "SELECT tbl.a AS a_new, EXPLODE(tbl.b.c) AS a_b_new FROM test AS tbl",
+            Dialect::Databricks,
+        );
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn sparksql_force_enable_flags_explode_nested_field_reference() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "references.from".to_string(),
+                serde_json::json!({"force_enable": true}),
+            )]),
+        };
+        let rule = ReferencesFrom::from_config(&config);
+        let sql = "SELECT tbl.a AS a_new, EXPLODE(tbl.b.c) AS a_b_new FROM test AS tbl";
+        let statements = parse_sql_with_dialect(sql, Dialect::Databricks).expect("parse");
+        let mut issues = Vec::new();
+        with_active_dialect(Dialect::Databricks, || {
+            for (index, statement) in statements.iter().enumerate() {
+                issues.extend(rule.check(
+                    statement,
+                    &LintContext {
+                        sql,
+                        statement_range: 0..sql.len(),
+                        statement_index: index,
+                    },
+                ));
+            }
+        });
         assert_eq!(issues.len(), 1);
     }
 

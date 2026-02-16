@@ -125,15 +125,26 @@ impl LintRule for ConventionNotEqual {
             ) {
                 let issue_span =
                     ctx.span_from_statement_offset(first_occurrence.start, first_occurrence.end);
-                let edits = violating_occurrences
-                    .into_iter()
-                    .map(|occurrence| {
-                        IssuePatchEdit::new(
+                let mut edits = Vec::new();
+                for occurrence in violating_occurrences {
+                    if let Some((first_pos, second_pos)) = occurrence.split_positions {
+                        let (first_replacement, second_replacement) =
+                            target_style.split_replacements();
+                        edits.push(IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(first_pos, first_pos + 1),
+                            first_replacement,
+                        ));
+                        edits.push(IssuePatchEdit::new(
+                            ctx.span_from_statement_offset(second_pos, second_pos + 1),
+                            second_replacement,
+                        ));
+                    } else {
+                        edits.push(IssuePatchEdit::new(
                             ctx.span_from_statement_offset(occurrence.start, occurrence.end),
                             target_style.replacement(),
-                        )
-                    })
-                    .collect();
+                        ));
+                    }
+                }
                 issue = issue
                     .with_span(issue_span)
                     .with_autofix_edits(IssueAutofixApplicability::Safe, edits);
@@ -165,6 +176,13 @@ impl NotEqualStyle {
             Self::Bang => "!=",
         }
     }
+
+    fn split_replacements(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Angle => ("<", ">"),
+            Self::Bang => ("!", "="),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +190,7 @@ struct NotEqualOccurrence {
     style: NotEqualStyle,
     start: usize,
     end: usize,
+    split_positions: Option<(usize, usize)>,
 }
 
 fn statement_not_equal_occurrences_with_tokens(
@@ -206,6 +225,15 @@ fn statement_not_equal_occurrences_with_tokens(
         if let Some(occurrence) = occurrence {
             occurrences.push(occurrence);
         }
+    });
+
+    occurrences.extend(scan_split_not_equal_occurrences(sql));
+    occurrences.sort_by_key(|occurrence| (occurrence.start, occurrence.end));
+    occurrences.dedup_by(|left, right| {
+        left.style == right.style
+            && left.start == right.start
+            && left.end == right.end
+            && left.split_positions == right.split_positions
     });
 
     occurrences
@@ -283,10 +311,74 @@ fn not_equal_occurrence_in_tokens(
             style,
             start: token.start,
             end: token.end,
+            split_positions: None,
         });
     }
 
     None
+}
+
+fn scan_split_not_equal_occurrences(sql: &str) -> Vec<NotEqualOccurrence> {
+    let mut occurrences = Vec::new();
+    let bytes = sql.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let (style, expected_second) = match bytes[index] {
+            b'<' => (NotEqualStyle::Angle, b'>'),
+            b'!' => (NotEqualStyle::Bang, b'='),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        let mut probe = index + 1;
+        let mut saw_separator = false;
+
+        while probe < bytes.len() {
+            match bytes[probe] {
+                b' ' | b'\t' | b'\n' | b'\r' => {
+                    saw_separator = true;
+                    probe += 1;
+                }
+                b'-' if probe + 1 < bytes.len() && bytes[probe + 1] == b'-' => {
+                    saw_separator = true;
+                    probe += 2;
+                    while probe < bytes.len() && bytes[probe] != b'\n' {
+                        probe += 1;
+                    }
+                }
+                b'/' if probe + 1 < bytes.len() && bytes[probe + 1] == b'*' => {
+                    saw_separator = true;
+                    probe += 2;
+                    while probe + 1 < bytes.len() {
+                        if bytes[probe] == b'*' && bytes[probe + 1] == b'/' {
+                            probe += 2;
+                            break;
+                        }
+                        probe += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        if saw_separator && probe < bytes.len() && bytes[probe] == expected_second {
+            occurrences.push(NotEqualOccurrence {
+                style,
+                start: index,
+                end: probe + 1,
+                split_positions: Some((index, probe)),
+            });
+            index = probe + 1;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    occurrences
 }
 
 #[derive(Clone)]
@@ -420,6 +512,17 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
+        let autofix = issue.autofix.as_ref()?;
+        let mut output = sql.to_string();
+        let mut edits = autofix.edits.clone();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        for edit in edits.into_iter().rev() {
+            output.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(output)
     }
 
     #[test]
@@ -570,5 +673,67 @@ mod tests {
         assert_eq!(autofix.edits[0].span.start, bang_start);
         assert_eq!(autofix.edits[0].span.end, bang_start + 2);
         assert_eq!(autofix.edits[0].replacement, "<>");
+    }
+
+    #[test]
+    fn c_style_preference_fixes_split_angle_operator_around_comment() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.not_equal".to_string(),
+                serde_json::json!({"preferred_not_equal_style": "c_style"}),
+            )]),
+        };
+        let rule = ConventionNotEqual::from_config(&config);
+        let sql = "SELECT * FROM X WHERE 1  <\n  -- some comment\n> 2\n";
+        let statements = parse_sql("SELECT 1").expect("synthetic parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.edits.len(), 2);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT * FROM X WHERE 1  !\n  -- some comment\n= 2\n"
+        );
+    }
+
+    #[test]
+    fn ansi_preference_fixes_split_bang_operator_around_comment() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "convention.not_equal".to_string(),
+                serde_json::json!({"preferred_not_equal_style": "ansi"}),
+            )]),
+        };
+        let rule = ConventionNotEqual::from_config(&config);
+        let sql = "SELECT * FROM X WHERE 1  !\n  -- some comment\n= 2\n";
+        let statements = parse_sql("SELECT 1").expect("synthetic parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.edits.len(), 2);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(
+            fixed,
+            "SELECT * FROM X WHERE 1  <\n  -- some comment\n> 2\n"
+        );
     }
 }

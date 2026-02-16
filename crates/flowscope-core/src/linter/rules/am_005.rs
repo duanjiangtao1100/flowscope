@@ -209,8 +209,8 @@ fn am005_autofix_candidates_from_positioned_tokens(
         let is_plain = is_plain_join_sequence(tokens, previous, previous_previous);
 
         let join_token = &tokens[token_index];
-        let source_is_lower = token_word_value(&join_token.token)
-            .map_or(false, |v| v == v.to_ascii_lowercase());
+        let source_is_lower =
+            token_word_value(&join_token.token).is_some_and(|v| v == v.to_ascii_lowercase());
 
         let needs_inner = match qualify_mode {
             FullyQualifyJoinTypes::Inner | FullyQualifyJoinTypes::Both => is_plain,
@@ -815,10 +815,7 @@ mod tests {
         let sql = "SELECT a FROM t join u ON t.id = u.id\n";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
-        let autofix = issues[0]
-            .autofix
-            .as_ref()
-            .expect("expected AM005 autofix");
+        let autofix = issues[0].autofix.as_ref().expect("expected AM005 autofix");
         assert_eq!(autofix.edits[0].replacement, "inner join");
     }
 }
