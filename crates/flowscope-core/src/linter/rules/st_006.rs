@@ -86,14 +86,9 @@ fn expr_band(expr: &Expr) -> u8 {
         // Literal values.
         Expr::Value(_) => 1,
         // Standalone CAST expressions: `CAST(x AS type)` or `x::type`.
-        Expr::Cast { expr: inner, .. } => {
-            let inner_band = expr_band(inner);
-            if inner_band <= 1 {
-                1
-            } else {
-                2
-            }
-        }
+        // SQLFluff classifies any top-level cast as band 1 regardless of
+        // what is inside the cast (e.g. `EXTRACT(...)::integer` is simple).
+        Expr::Cast { .. } => 1,
         // CAST as a function call: `cast(b)` parsed as Function.
         Expr::Function(f) if is_cast_function(f) => 1,
         // Nested/parenthesized expression — unwrap.
@@ -239,6 +234,10 @@ fn visit_query_selects<F: FnMut(&Select)>(query: &Query, visitor: &mut F, in_set
     // SELECTs use wildcards (SELECT *), since reordering the CTE projection
     // would change the set operation result. When the set operation's leaf
     // SELECTs use explicit columns (SELECT a, b), CTE order is irrelevant.
+    //
+    // Note: when the body is INSERT/UPDATE/DELETE/MERGE (e.g.
+    // `WITH cte AS (...) INSERT INTO ...`), CTEs are still visited — SQLFluff
+    // only skips the INSERT body's own SELECT, not the CTE definitions.
     if let Some(with) = &query.with {
         let body_is_set = matches!(query.body.as_ref(), SetExpr::SetOperation { .. });
         let cte_order_matters = body_is_set && set_expr_has_wildcard_select(&query.body);
@@ -932,6 +931,36 @@ INSERT INTO my_table
 WITH my_cte AS (SELECT * FROM t1)
 SELECT MAX(field1), field2
 FROM t1";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn with_cte_insert_into_still_checks_cte() {
+        // WITH ... INSERT INTO ... is parsed by sqlparser as
+        // Statement::Query { body: SetExpr::Insert(...) }.
+        // SQLFluff still checks CTE SELECTs for ordering — only the
+        // INSERT body's own SELECT is skipped.
+        let sql = "\
+WITH my_cte AS (
+    SELECT MAX(field1) AS mx, field2 FROM t1
+)
+INSERT INTO my_table (col1, col2)
+SELECT mx, field2 FROM my_cte";
+        let issues = run(sql);
+        // CTE has MAX(field1) (band 2) before field2 (band 1) → violation.
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn with_cte_insert_into_no_violation_when_ordered() {
+        // When the CTE projection is already ordered, no violation.
+        let sql = "\
+WITH my_cte AS (
+    SELECT field2, MAX(field1) AS mx FROM t1
+)
+INSERT INTO my_table (col1, col2)
+SELECT mx, field2 FROM my_cte";
         let issues = run(sql);
         assert!(issues.is_empty());
     }

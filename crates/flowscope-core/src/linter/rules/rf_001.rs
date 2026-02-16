@@ -463,12 +463,15 @@ fn unresolved_references_in_query(
 
     count += unresolved_references_in_set_expr(&query.body, inherited_sources, dialect, in_trigger);
 
+    // ORDER BY lives at the Query level but references columns from the
+    // body SELECT's FROM/JOIN scope. Build that scope for validation.
     if let Some(order_by) = &query.order_by {
         if let OrderByKind::Expressions(order_exprs) = &order_by.kind {
+            let order_scope = order_by_scope_from_body(&query.body, inherited_sources);
             for order_expr in order_exprs {
                 count += unresolved_references_in_expr(
                     &order_expr.expr,
-                    inherited_sources,
+                    &order_scope,
                     dialect,
                     in_trigger,
                 );
@@ -477,6 +480,28 @@ fn unresolved_references_in_query(
     }
 
     count
+}
+
+/// Build a source registry for ORDER BY by extracting FROM/JOIN sources
+/// from the body SELECT (or both sides of a set operation).
+fn order_by_scope_from_body(body: &SetExpr, inherited: &SourceRegistry) -> SourceRegistry {
+    let mut scope = inherited.clone();
+    match body {
+        SetExpr::Select(select) => {
+            for from_item in &select.from {
+                register_table_with_joins_sources(from_item, &mut scope);
+            }
+        }
+        SetExpr::Query(query) => {
+            return order_by_scope_from_body(&query.body, inherited);
+        }
+        SetExpr::SetOperation { left, .. } => {
+            // For UNION/INTERSECT/EXCEPT, ORDER BY references come from the left branch.
+            return order_by_scope_from_body(left, inherited);
+        }
+        _ => {}
+    }
+    scope
 }
 
 fn unresolved_references_in_set_expr(
@@ -1223,6 +1248,20 @@ mod tests {
             }
         });
         assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn allows_qualified_order_by_from_select_scope() {
+        let issues = run("SELECT t.a FROM my_table AS t ORDER BY t.a DESC");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn allows_qualified_order_by_in_cte_query() {
+        let issues = run("\
+WITH cte AS (SELECT t.a FROM my_table AS t)
+SELECT cte.a FROM cte ORDER BY cte.a");
+        assert!(issues.is_empty());
     }
 
     #[test]
