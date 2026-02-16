@@ -609,10 +609,10 @@ fn expected_spacing(
 
     // --- Right bracket ---
     if matches!(left.token, Token::RBracket) {
-        // After ] usually no space before :: or . or [
+        // After ] usually no space before :: or . or [ or )
         if matches!(
             right.token,
-            Token::DoubleColon | Token::Period | Token::LBracket
+            Token::DoubleColon | Token::Period | Token::LBracket | Token::RParen
         ) {
             return ExpectedSpacing::None;
         }
@@ -825,7 +825,39 @@ fn is_literal(token: &Token) -> bool {
 
 fn is_type_keyword_for_bracket(token: &Token) -> bool {
     if let Token::Word(w) = token {
-        w.quote_style.is_none() && w.value.eq_ignore_ascii_case("text")
+        if w.quote_style.is_some() {
+            return false;
+        }
+        matches!(
+            w.value.to_ascii_uppercase().as_str(),
+            "TEXT"
+                | "UUID"
+                | "INT"
+                | "INTEGER"
+                | "BIGINT"
+                | "SMALLINT"
+                | "VARCHAR"
+                | "CHAR"
+                | "BOOLEAN"
+                | "BOOL"
+                | "NUMERIC"
+                | "DECIMAL"
+                | "FLOAT"
+                | "DOUBLE"
+                | "DATE"
+                | "TIME"
+                | "TIMESTAMP"
+                | "INTERVAL"
+                | "JSONB"
+                | "JSON"
+                | "BYTEA"
+                | "REAL"
+                | "SERIAL"
+                | "BIGSERIAL"
+                | "INET"
+                | "CIDR"
+                | "MACADDR"
+        )
     } else {
         false
     }
@@ -941,6 +973,41 @@ fn is_copy_into_target_name(tokens: &[TokenWithSpan], word_index: usize) -> bool
         cursor = prev_idx;
         steps += 1;
         if steps > 64 {
+            return false;
+        }
+    }
+
+    false
+}
+
+/// Check if `word_index` is the table/view name in an `INSERT INTO schema.table` context.
+fn is_insert_into_target_name(tokens: &[TokenWithSpan], word_index: usize) -> bool {
+    let mut cursor = word_index;
+    let mut steps = 0usize;
+
+    while let Some(prev_idx) = prev_non_trivia_index(tokens, cursor) {
+        match &tokens[prev_idx].token {
+            Token::Word(word) if word.keyword == Keyword::INTO => {
+                // Check for INSERT before INTO.
+                let Some(insert_idx) = prev_non_trivia_index(tokens, prev_idx) else {
+                    return false;
+                };
+                return matches!(
+                    &tokens[insert_idx].token,
+                    Token::Word(w) if w.keyword == Keyword::INSERT
+                );
+            }
+            // Walk through schema qualifiers (schema.table).
+            Token::Period => {}
+            // Accept any unquoted word as a schema/table identifier — the name
+            // may coincide with a SQL keyword (e.g. `metrics`, `daily`).
+            Token::Word(word) if word.quote_style.is_none() => {}
+            _ => return false,
+        }
+
+        cursor = prev_idx;
+        steps += 1;
+        if steps > 16 {
             return false;
         }
     }
@@ -1216,6 +1283,12 @@ fn expected_spacing_before_lparen(
                 }
                 return ExpectedSpacing::Single;
             }
+            // INSERT INTO table_name ( — the ( opens a column list.
+            // Checked before the NoKeyword guard because the table name may
+            // coincide with a SQL keyword (e.g., metrics.daily → daily is Keyword).
+            if is_insert_into_target_name(tokens, left_idx) {
+                return ExpectedSpacing::Single;
+            }
             // Check if this word is a table/view name after CREATE TABLE/VIEW —
             // the ( opens a column list, not a function call, so skip.
             if w.keyword == Keyword::NoKeyword {
@@ -1284,6 +1357,9 @@ fn is_keyword_requiring_space_before_paren(keyword: Keyword) -> bool {
             | Keyword::VALUES
             | Keyword::SET
             | Keyword::RETURNS
+            | Keyword::FILTER
+            | Keyword::CONFLICT
+            | Keyword::BY
     )
 }
 
@@ -2545,6 +2621,54 @@ mod tests {
         assert!(
             run("WITH\na AS -- comment\n(\nselect 1\n)\nselect * from a").is_empty(),
             "comment between AS and ( should be acceptable"
+        );
+    }
+
+    #[test]
+    fn insert_into_table_paren_allows_space() {
+        // Space before ( in INSERT INTO table ( should be fine.
+        let issues = run("INSERT INTO metrics.cold_start_daily (\n    workspace_id\n) SELECT 1");
+        let lt01 = issues.iter().filter(|i| i.code == "LT01").collect::<Vec<_>>();
+        assert!(
+            lt01.is_empty(),
+            "INSERT INTO table ( should not flag LT01, got: {lt01:?}"
+        );
+    }
+
+    #[test]
+    fn insert_into_table_paren_with_cte() {
+        // CTE + INSERT INTO: both parsed-statement and fallback paths.
+        let sql = "WITH starts AS (\n    SELECT 1\n)\nINSERT INTO metrics.cold_start_daily (\n    workspace_id\n) SELECT workspace_id FROM starts";
+        let issues = run_with_dialect(sql, Dialect::Postgres);
+        let lt01 = issues.iter().filter(|i| i.code == "LT01").collect::<Vec<_>>();
+        assert!(
+            lt01.is_empty(),
+            "INSERT INTO table ( with CTE should not flag LT01, got: {lt01:?}"
+        );
+    }
+
+    #[test]
+    fn insert_into_table_paren_on_conflict() {
+        // Regression: CTE + INSERT INTO + ON CONFLICT via statementless path.
+        let sql = "\
+WITH cte AS (
+    SELECT workspace_id
+    FROM ledger.query_history
+    WHERE start_time >= $1
+)
+
+INSERT INTO metrics.cold_start_daily (
+    workspace_id
+)
+SELECT workspace_id
+FROM cte
+ON CONFLICT (workspace_id) DO UPDATE
+    SET workspace_id = excluded.workspace_id";
+        let issues = run_statementless_with_dialect(sql, Dialect::Postgres);
+        let lt01 = issues.iter().filter(|i| i.code == "LT01").collect::<Vec<_>>();
+        assert!(
+            lt01.is_empty(),
+            "INSERT INTO table ( with ON CONFLICT should not flag LT01, got: {lt01:?}"
         );
     }
 }

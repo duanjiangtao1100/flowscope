@@ -103,6 +103,7 @@ fn keyword_tokens_for_context(
         }
 
         let mut out = Vec::new();
+        let mut prev_is_period = false;
         for token in tokens {
             let Some((start, end)) = token_with_span_offsets(ctx.sql, token) else {
                 continue;
@@ -111,7 +112,21 @@ fn keyword_tokens_for_context(
                 continue;
             }
 
+            match &token.token {
+                Token::Period => {
+                    prev_is_period = true;
+                    continue;
+                }
+                Token::Whitespace(_) => continue,
+                _ => {}
+            }
+
             if let Token::Word(word) = &token.token {
+                let after_period = prev_is_period;
+                prev_is_period = false;
+                if after_period {
+                    continue;
+                }
                 // Document token spans are tied to rendered SQL. If the source
                 // slice does not match the token text, fall back to
                 // statement-local tokenization.
@@ -134,6 +149,8 @@ fn keyword_tokens_for_context(
                         end: local_end,
                     });
                 }
+            } else {
+                prev_is_period = false;
             }
         }
         Some(out)
@@ -163,25 +180,42 @@ fn keyword_tokens(
         return Vec::new();
     };
 
-    tokens
-        .into_iter()
-        .filter_map(|token| {
-            if let Token::Word(word) = &token.token {
+    // Track the previous non-whitespace token to skip keywords used as
+    // column references in compound identifiers (e.g. `wu.type`).
+    let mut prev_is_period = false;
+    let mut out = Vec::new();
+    for token in &tokens {
+        match &token.token {
+            Token::Period => {
+                prev_is_period = true;
+                continue;
+            }
+            Token::Whitespace(_) => continue,
+            Token::Word(word) => {
+                let after_period = prev_is_period;
+                prev_is_period = false;
+                if after_period {
+                    continue;
+                }
                 if is_tracked_keyword(word.value.as_str())
                     && !is_excluded_keyword(word.value.as_str())
                     && !token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex)
                 {
-                    let (start, end) = token_with_span_offsets(sql, &token)?;
-                    return Some(KeywordCandidate {
-                        value: word.value.clone(),
-                        start,
-                        end,
-                    });
+                    if let Some((start, end)) = token_with_span_offsets(sql, token) {
+                        out.push(KeywordCandidate {
+                            value: word.value.clone(),
+                            start,
+                            end,
+                        });
+                    }
                 }
             }
-            None
-        })
-        .collect()
+            _ => {
+                prev_is_period = false;
+            }
+        }
+    }
+    out
 }
 
 fn keyword_autofix_edits(
@@ -502,6 +536,7 @@ fn is_excluded_keyword(value: &str) -> bool {
             | "DATE"
             | "TIME"
             | "TIMESTAMP"
+            | "INTERVAL"
             | "STRUCT"
             | "ARRAY"
             | "MAP"

@@ -472,8 +472,6 @@ fn is_tracked_type_name(value: &str) -> bool {
             | "ARRAY"
             | "MAP"
             | "ENUM"
-            | "WITH"
-            | "ZONE"
     )
 }
 
