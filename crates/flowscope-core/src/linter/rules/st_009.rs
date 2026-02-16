@@ -86,7 +86,10 @@ impl LintRule for StructureJoinConditionOrder {
         let mut issues = Vec::new();
 
         visit_selects_in_statement(statement, &mut |select| {
-            for table in &select.from {
+            // SQLFluff ST09 parity: report at most one reversed-join issue
+            // per SELECT, matching SQLFluff's first-violation-only behaviour.
+            let before = issues.len();
+            'from_loop: for table in &select.from {
                 let mut seen_sources: Vec<String> = Vec::new();
                 check_table_factor_joins(
                     &table.relation,
@@ -96,6 +99,9 @@ impl LintRule for StructureJoinConditionOrder {
                     ctx,
                     &mut issues,
                 );
+                if issues.len() > before {
+                    break 'from_loop;
+                }
             }
         });
 
@@ -111,6 +117,8 @@ fn check_table_factor_joins(
     ctx: &LintContext,
     issues: &mut Vec<Issue>,
 ) {
+    let issues_before = issues.len();
+
     // For NestedJoin, recurse into the inner table_with_joins.
     if let TableFactor::NestedJoin {
         table_with_joins, ..
@@ -148,49 +156,51 @@ fn check_table_factor_joins(
         if let (Some(current), Some(on_expr)) =
             (join_name.as_ref(), join_on_expr(&join.join_operator))
         {
-            let matching_previous = seen_sources
-                .iter()
-                .rev()
-                .find(|candidate| {
-                    let left = preference.left_source(current, candidate.as_str());
-                    let right = preference.right_source(current, candidate.as_str());
-                    has_join_pair(on_expr, left, right)
-                })
-                .cloned();
+            // SQLFluff parity: only flag the first reversed join per FROM clause.
+            if issues.len() == issues_before {
+                let matching_previous = seen_sources
+                    .iter()
+                    .rev()
+                    .find(|candidate| {
+                        let left = preference.left_source(current, candidate.as_str());
+                        let right = preference.right_source(current, candidate.as_str());
+                        has_join_pair(on_expr, left, right)
+                    })
+                    .cloned();
 
-            if let Some(previous) = matching_previous {
-                let left = preference.left_source(current, previous.as_str());
-                let right = preference.right_source(current, previous.as_str());
+                if let Some(previous) = matching_previous {
+                    let left = preference.left_source(current, previous.as_str());
+                    let right = preference.right_source(current, previous.as_str());
 
-                if let Some((span, replacement)) = join_condition_autofix(ctx, on_expr, left, right)
-                {
-                    issues.push(
-                        Issue::info(
-                            issue_codes::LINT_ST_009,
-                            "Join condition ordering appears inconsistent with configured preference.",
-                        )
-                        .with_statement(ctx.statement_index)
-                        .with_span(span)
-                        .with_autofix_edits(
-                            IssueAutofixApplicability::Safe,
-                            vec![IssuePatchEdit::new(span, replacement)],
-                        ),
-                    );
-                } else if let Some((expr_start, expr_end)) =
-                    expr_statement_offsets(ctx, on_expr)
-                {
-                    let span = ctx.span_from_statement_offset(expr_start, expr_end);
-                    issues.push(
-                        Issue::info(
-                            issue_codes::LINT_ST_009,
-                            "Join condition ordering appears inconsistent with configured preference.",
-                        )
-                        .with_statement(ctx.statement_index)
-                        .with_span(span),
-                    );
+                    if let Some((span, replacement)) =
+                        join_condition_autofix(ctx, on_expr, left, right)
+                    {
+                        issues.push(
+                            Issue::info(
+                                issue_codes::LINT_ST_009,
+                                "Join condition ordering appears inconsistent with configured preference.",
+                            )
+                            .with_statement(ctx.statement_index)
+                            .with_span(span)
+                            .with_autofix_edits(
+                                IssueAutofixApplicability::Safe,
+                                vec![IssuePatchEdit::new(span, replacement)],
+                            ),
+                        );
+                    } else if let Some((expr_start, expr_end)) =
+                        expr_statement_offsets(ctx, on_expr)
+                    {
+                        let span = ctx.span_from_statement_offset(expr_start, expr_end);
+                        issues.push(
+                            Issue::info(
+                                issue_codes::LINT_ST_009,
+                                "Join condition ordering appears inconsistent with configured preference.",
+                            )
+                            .with_statement(ctx.statement_index)
+                            .with_span(span),
+                        );
+                    }
                 }
-                // Skip issues where neither the autofix nor the ON expression
-                // span can be resolved — these produce misleading L1:1 reports.
             }
         }
 
@@ -749,20 +759,15 @@ mod tests {
 
     #[test]
     fn autofix_reorders_join_conditions_against_any_seen_source_in_chain() {
-        // SQLFluff: test_fail_later_table_first_multiple_comparison_operators
+        // SQLFluff: ST09 flags only the first reversed join per SELECT.
         let sql = "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on bar.a != foo.a\n    and bar.b > foo.b\n    and bar.c <= foo.c\nleft join baz\n    on baz.a <> foo.a\n    and baz.b >= foo.b\n    and baz.c < foo.c\n";
         let issues = run(sql);
-        assert_eq!(issues.len(), 2);
-        let mut edits: Vec<IssuePatchEdit> = issues
-            .iter()
-            .filter_map(|issue| issue.autofix.as_ref())
-            .flat_map(|autofix| autofix.edits.iter().cloned())
-            .collect();
-        edits.sort_by_key(|edit| edit.span.start);
-        let fixed = apply_edits(sql, &edits);
+        // Only the first reversed join (bar) is reported per SELECT.
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_edits(sql, &issues[0].autofix.as_ref().unwrap().edits);
         assert_eq!(
             fixed,
-            "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on foo.a != bar.a\n    and foo.b < bar.b\n    and foo.c >= bar.c\nleft join baz\n    on foo.a <> baz.a\n    and foo.b <= baz.b\n    and foo.c > baz.c\n"
+            "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on foo.a != bar.a\n    and foo.b < bar.b\n    and foo.c >= bar.c\nleft join baz\n    on baz.a <> foo.a\n    and baz.b >= foo.b\n    and baz.c < foo.c\n"
         );
     }
 }
