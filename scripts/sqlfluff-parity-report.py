@@ -81,6 +81,23 @@ DIALECT_MAP: dict[str, str | None] = {
     "vertica": None,
 }
 
+# All FlowScope lint rule short codes (used to build --exclude-rules lists
+# so that fix comparisons test a single rule in isolation).
+ALL_RULE_CODES: set[str] = {
+    "AM01", "AM02", "AM03", "AM04", "AM05", "AM06", "AM07", "AM08", "AM09",
+    "CP01", "CP02", "CP03", "CP04", "CP05",
+    "CV01", "CV02", "CV03", "CV04", "CV05", "CV06", "CV07", "CV08", "CV09",
+    "CV10", "CV11", "CV12",
+    "JJ01",
+    "LT01", "LT02", "LT03", "LT04", "LT05", "LT06", "LT07", "LT08", "LT09",
+    "LT10", "LT11", "LT12", "LT13", "LT14", "LT15",
+    "RF01", "RF02", "RF03", "RF04", "RF05", "RF06",
+    "ST01", "ST02", "ST03", "ST04", "ST05", "ST06", "ST07", "ST08", "ST09",
+    "ST10", "ST11", "ST12",
+    "AL01", "AL02", "AL03", "AL04", "AL05", "AL06", "AL07", "AL08", "AL09",
+    "TQ01", "TQ02", "TQ03",
+}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -185,11 +202,14 @@ def _build_flowscope_cmd(
     dialect: str,
     filepath: str,
     rule_configs: dict | None = None,
+    exclude_rules: list[str] | None = None,
 ) -> list[str]:
     """Build the flowscope CLI command with optional --rule-configs."""
     cmd = [str(FLOWSCOPE_BIN)] + base_args + [filepath, "--dialect", dialect]
     if rule_configs:
         cmd.extend(["--rule-configs", json.dumps(rule_configs)])
+    if exclude_rules:
+        cmd.extend(["--exclude-rules", ",".join(exclude_rules)])
     return cmd
 
 
@@ -235,6 +255,7 @@ def run_flowscope_fix(
     sql: str,
     dialect: str = "generic",
     rule_configs: dict | None = None,
+    exclude_rules: list[str] | None = None,
 ) -> str | None:
     """Run FlowScope --fix and return the fixed SQL."""
     with tempfile.NamedTemporaryFile(
@@ -248,6 +269,7 @@ def run_flowscope_fix(
                 dialect,
                 f.name,
                 rule_configs,
+                exclude_rules,
             )
             result = subprocess.run(
                 cmd,
@@ -268,6 +290,17 @@ def run_flowscope_fix(
 def normalize_whitespace(s: str) -> str:
     """Collapse whitespace for loose fix comparison."""
     return " ".join(s.split())
+
+
+def exclude_rules_for(rule_code: str) -> list[str]:
+    """Build an --exclude-rules list that keeps only the given rule(s).
+
+    ``rule_code`` may be a single code (``"ST08"``) or a comma-separated
+    multi-rule fixture key (``"AL02, LT01"``).  The returned list contains
+    every known rule code *except* the ones in ``rule_code``.
+    """
+    keep = {c.strip() for c in rule_code.split(",")}
+    return sorted(ALL_RULE_CODES - keep)
 
 
 def get_dialect(configs: dict | None) -> str:
@@ -418,7 +451,10 @@ def main() -> None:
                 if "fix_str" in case:
                     r_fix_total += 1
                     total_fix_cases += 1
-                    fs_fixed = run_flowscope_fix(sql, fs_dialect, case_rule_configs)
+                    fix_excludes = exclude_rules_for(rule_code)
+                    fs_fixed = run_flowscope_fix(
+                        sql, fs_dialect, case_rule_configs, fix_excludes,
+                    )
                     expected = case["fix_str"]
 
                     if fs_fixed is not None and normalize_whitespace(
