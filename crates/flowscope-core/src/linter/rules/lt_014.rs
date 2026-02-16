@@ -816,25 +816,36 @@ fn keyword_newline_violation_span(
         &owned_tokens
     };
 
-    let select_line = tokens.iter().find_map(|token| {
-        let Token::Word(word) = &token.token else {
-            return None;
-        };
-        if word.keyword != Keyword::SELECT {
-            return None;
+    // Only consider top-level SELECTs (paren_depth == 0). Subquery SELECTs
+    // inside EXISTS or similar constructs have compact single-line layouts
+    // that are intentional and should not trigger inconsistency warnings.
+    let select_line = {
+        let mut depth = 0i32;
+        let mut found = None;
+        for token in tokens {
+            match &token.token {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Word(word) if word.keyword == Keyword::SELECT && depth == 0 => {
+                    let select_start = line_col_to_offset(
+                        sql,
+                        token.span.start.line as usize,
+                        token.span.start.column as usize,
+                    );
+                    if let Some(start) = select_start {
+                        let line_start =
+                            sql[..start].rfind('\n').map_or(0, |idx| idx + 1);
+                        if sql[line_start..start].trim().is_empty() {
+                            found = Some(token.span.start.line);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-
-        let select_start = line_col_to_offset(
-            sql,
-            token.span.start.line as usize,
-            token.span.start.column as usize,
-        )?;
-        let line_start = sql[..select_start].rfind('\n').map_or(0, |idx| idx + 1);
-        sql[line_start..select_start]
-            .trim()
-            .is_empty()
-            .then_some(token.span.start.line)
-    })?;
+        found
+    }?;
 
     let clauses = major_clause_occurrences(sql, tokens)?;
 
@@ -855,16 +866,34 @@ fn keyword_newline_violation_span(
 }
 
 fn major_clause_occurrences(sql: &str, tokens: &[TokenWithSpan]) -> Option<Vec<ClauseOccurrence>> {
-    let significant: Vec<&TokenWithSpan> = tokens
-        .iter()
-        .filter(|token| !is_trivia_token(&token.token))
-        .collect();
+    // Build significant-token list with paren depth so we can skip subqueries.
+    let mut depth = 0i32;
+    let mut significant: Vec<(&TokenWithSpan, i32)> = Vec::new();
+    for token in tokens {
+        match &token.token {
+            Token::LParen => {
+                significant.push((token, depth));
+                depth += 1;
+            }
+            Token::RParen => {
+                depth -= 1;
+                significant.push((token, depth));
+            }
+            t if is_trivia_token(t) => {}
+            _ => significant.push((token, depth)),
+        }
+    }
 
     let mut out = Vec::new();
     let mut index = 0usize;
 
     while index < significant.len() {
-        let token = significant[index];
+        let (token, token_depth) = significant[index];
+        // Only collect top-level clause keywords.
+        if token_depth != 0 {
+            index += 1;
+            continue;
+        }
         let Token::Word(word) = &token.token else {
             index += 1;
             continue;
@@ -890,7 +919,7 @@ fn major_clause_occurrences(sql: &str, tokens: &[TokenWithSpan]) -> Option<Vec<C
                 index += 1;
             }
             Keyword::GROUP | Keyword::ORDER => {
-                let Some(next) = significant.get(index + 1) else {
+                let Some((next, _)) = significant.get(index + 1) else {
                     index += 1;
                     continue;
                 };
@@ -1185,6 +1214,14 @@ mod tests {
             fixed.contains("\nFROM t"),
             "expected FROM to move to new line: {fixed}"
         );
+    }
+
+    #[test]
+    fn does_not_flag_exists_subquery_select_from_inline() {
+        // EXISTS subqueries with compact SELECT 1 FROM t are intentional and
+        // should not trigger the legacy inconsistency check.
+        let sql = "UPDATE t SET x = 1\nWHERE EXISTS (\n  SELECT 1 FROM s\n  WHERE s.id = t.id\n)";
+        assert!(run(sql).is_empty());
     }
 
     // --- Config-driven tests (SQLFluff parity) ---

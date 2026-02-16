@@ -541,6 +541,17 @@ fn is_excluded_keyword(value: &str) -> bool {
             | "ARRAY"
             | "MAP"
             | "ENUM"
+            // Function-like keywords tracked by CP03, not CP01 in SQLFluff.
+            | "COALESCE"
+            | "CAST"
+            | "SAFE_CAST"
+            | "TRY_CAST"
+            | "ANY"
+            | "SOME"
+            | "REPLACE"
+            // TYPE is very commonly used as a column name; SQLFluff does not
+            // track it under CP01.
+            | "TYPE"
     )
 }
 

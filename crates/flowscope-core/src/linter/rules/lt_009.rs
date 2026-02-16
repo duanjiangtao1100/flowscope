@@ -342,14 +342,77 @@ fn is_ignorable_layout_token(token: &Token) -> bool {
 }
 
 fn find_first_target_idx(tokens: &[TokenWithSpan], start: usize, end: usize) -> Option<usize> {
-    for (idx, token) in tokens.iter().enumerate().take(end).skip(start) {
+    let mut i = start;
+    while i < end {
+        let token = &tokens[i];
         match &token.token {
-            token if is_ignorable_layout_token(token) => {}
-            Token::Word(word) if is_select_modifier_keyword(word.keyword) => {}
-            _ => return Some(idx),
+            t if is_ignorable_layout_token(t) => {}
+            Token::Word(word) if is_select_modifier_keyword(word.keyword) => {
+                // PostgreSQL DISTINCT ON (...) — skip past the parenthesized list.
+                if word.keyword == Keyword::DISTINCT {
+                    if let Some(on_idx) = skip_distinct_on_clause(tokens, i + 1, end) {
+                        i = on_idx;
+                    }
+                }
+            }
+            _ => return Some(i),
         }
+        i += 1;
     }
     None
+}
+
+/// If the tokens after DISTINCT start with `ON (...)`, return the index of
+/// the closing `)` so the caller can skip the entire DISTINCT ON clause.
+fn skip_distinct_on_clause(tokens: &[TokenWithSpan], start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    // Skip whitespace/comments to find ON.
+    while i < end {
+        if is_ignorable_layout_token(&tokens[i].token) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if i >= end {
+        return None;
+    }
+    let Token::Word(word) = &tokens[i].token else {
+        return None;
+    };
+    if word.keyword != Keyword::ON {
+        return None;
+    }
+    i += 1;
+    // Skip whitespace/comments to find (.
+    while i < end {
+        if is_ignorable_layout_token(&tokens[i].token) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if i >= end || !matches!(tokens[i].token, Token::LParen) {
+        return None;
+    }
+    // Skip past the matching ).
+    let mut depth = 1usize;
+    i += 1;
+    while i < end && depth > 0 {
+        match tokens[i].token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+        if depth > 0 {
+            i += 1;
+        }
+    }
+    if depth == 0 {
+        Some(i)
+    } else {
+        None
+    }
 }
 
 fn split_target_ranges(
@@ -1083,6 +1146,20 @@ mod tests {
         assert!(!issues.is_empty());
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(fixed, "SELECT 1\n  /* comment before */\nFROM\n  my_table");
+    }
+
+    #[test]
+    fn does_not_flag_distinct_on_with_targets_on_own_lines() {
+        // PostgreSQL DISTINCT ON (...) — targets each on own line = no violation.
+        let sql = "SELECT DISTINCT ON (a.id)\n    a.id,\n    a.name\nFROM a";
+        assert!(run(sql).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_distinct_on_single_target_inline() {
+        // DISTINCT ON with a single target on the same line as SELECT.
+        let sql = "SELECT DISTINCT ON (a.id) a.name FROM a";
+        assert!(run(sql).is_empty());
     }
 
     #[test]
