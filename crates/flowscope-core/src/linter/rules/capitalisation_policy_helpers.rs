@@ -148,7 +148,7 @@ fn token_matches_policy(token: &str, policy: CapitalisationPolicy) -> bool {
 }
 
 /// Pascal-case transform: uppercase the first letter of each word at non-alphanumeric boundaries.
-fn apply_pascal_transform(value: &str) -> String {
+pub fn apply_pascal_transform(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut at_word_start = true;
     for ch in value.chars() {
@@ -167,7 +167,7 @@ fn apply_pascal_transform(value: &str) -> String {
 }
 
 /// Camel-case transform: lowercase the first letter of each word at non-alphanumeric boundaries.
-fn apply_camel_transform(value: &str) -> String {
+pub fn apply_camel_transform(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut at_word_start = true;
     for ch in value.chars() {
@@ -186,7 +186,7 @@ fn apply_camel_transform(value: &str) -> String {
 }
 
 /// Snake-case transform: insert underscores at camelCase and letter/digit boundaries, lowercase.
-fn apply_snake_transform(value: &str) -> String {
+pub fn apply_snake_transform(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 4);
     let chars: Vec<char> = value.chars().collect();
     let all_upper = chars

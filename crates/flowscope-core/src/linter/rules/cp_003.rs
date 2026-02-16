@@ -13,6 +13,7 @@ use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 use super::capitalisation_policy_helpers::{
+    apply_camel_transform, apply_pascal_transform, apply_snake_transform,
     ignored_words_from_config, ignored_words_regex_from_config, token_is_ignored,
     tokens_violate_policy, CapitalisationPolicy,
 };
@@ -214,10 +215,9 @@ fn function_case_replacement(value: &str, policy: CapitalisationPolicy) -> Optio
         CapitalisationPolicy::Lower => Some(value.to_ascii_lowercase()),
         CapitalisationPolicy::Upper => Some(value.to_ascii_uppercase()),
         CapitalisationPolicy::Capitalise => Some(capitalise_ascii_token(value)),
-        // These policies are currently report-only in CP03 autofix scope.
-        CapitalisationPolicy::Pascal
-        | CapitalisationPolicy::Camel
-        | CapitalisationPolicy::Snake => None,
+        CapitalisationPolicy::Pascal => Some(apply_pascal_transform(value)),
+        CapitalisationPolicy::Camel => Some(apply_camel_transform(value)),
+        CapitalisationPolicy::Snake => Some(apply_snake_transform(value)),
     }
 }
 
@@ -522,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn camel_policy_violation_remains_report_only() {
+    fn camel_policy_emits_autofix() {
         let config = LintConfig {
             enabled: true,
             disabled_rules: vec![],
@@ -532,7 +532,7 @@ mod tests {
             )]),
         };
         let rule = CapitalisationFunctions::from_config(&config);
-        let sql = "SELECT COUNT(x) FROM t";
+        let sql = "SELECT COUNT(x), SUM(y) FROM t";
         let statements = parse_sql(sql).expect("parse");
         let issues = rule.check(
             &statements[0],
@@ -543,10 +543,60 @@ mod tests {
             },
         );
         assert_eq!(issues.len(), 1);
-        assert!(
-            issues[0].autofix.is_none(),
-            "camel/pascal/snake are report-only in current CP003 autofix scope"
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT cOUNT(x), sUM(y) FROM t");
+    }
+
+    #[test]
+    fn pascal_policy_emits_autofix() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "LINT_CP_003".to_string(),
+                serde_json::json!({"extended_capitalisation_policy": "pascal"}),
+            )]),
+        };
+        let rule = CapitalisationFunctions::from_config(&config);
+        let sql = "SELECT current_timestamp, min(a) FROM t";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
         );
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT Current_Timestamp, Min(a) FROM t");
+    }
+
+    #[test]
+    fn snake_policy_emits_autofix() {
+        let config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::from([(
+                "LINT_CP_003".to_string(),
+                serde_json::json!({"extended_capitalisation_policy": "snake"}),
+            )]),
+        };
+        let rule = CapitalisationFunctions::from_config(&config);
+        let sql = "SELECT Current_Timestamp, Min(a) FROM t";
+        let statements = parse_sql(sql).expect("parse");
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: 0..sql.len(),
+                statement_index: 0,
+            },
+        );
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT current_timestamp, min(a) FROM t");
     }
 
     #[test]

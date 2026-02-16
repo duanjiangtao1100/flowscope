@@ -95,11 +95,16 @@ fn check_query_body(
                 if let Some((start, end)) = union_span {
                     let span = ctx.span_from_statement_offset(start, end);
                     let union_keyword = &ctx.statement_sql()[start..end];
+                    let distinct = if union_keyword == union_keyword.to_ascii_lowercase() {
+                        "distinct"
+                    } else {
+                        "DISTINCT"
+                    };
                     issue = issue.with_span(span).with_autofix_edits(
                         IssueAutofixApplicability::Safe,
                         vec![IssuePatchEdit::new(
                             span,
-                            format!("{union_keyword} DISTINCT"),
+                            format!("{union_keyword} {distinct}"),
                         )],
                     );
                 }

@@ -170,12 +170,14 @@ fn type_candidates_from_tokens(
 
     tokens
         .iter()
-        .filter_map(|token| {
+        .enumerate()
+        .filter_map(|(index, token)| {
             if let Token::Word(word) = &token.token {
                 let is_candidate = word.quote_style.is_none()
                     && (is_tracked_type_name(word.value.as_str())
                         || user_defined_types.contains(&word.value.to_ascii_uppercase()))
-                    && !token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex);
+                    && !token_is_ignored(word.value.as_str(), ignore_words, ignore_words_regex)
+                    && !is_keyword_after_as(tokens, index);
                 if is_candidate {
                     let (start, end) = token_with_span_offsets(sql, token)?;
                     let local_start = start.checked_sub(statement_start)?;
@@ -191,6 +193,34 @@ fn type_candidates_from_tokens(
             None
         })
         .collect()
+}
+
+/// Returns true when the word at `index` is preceded by `AS` — e.g.
+/// `CREATE TYPE mood AS ENUM (...)` where `ENUM` is a keyword, not a type name.
+fn is_keyword_after_as(tokens: &[TokenWithSpan], index: usize) -> bool {
+    let Some(prev_index) = prev_non_trivia_index(tokens, index) else {
+        return false;
+    };
+    matches!(
+        &tokens[prev_index].token,
+        Token::Word(w) if w.value.eq_ignore_ascii_case("AS")
+    )
+}
+
+fn prev_non_trivia_index(tokens: &[TokenWithSpan], index: usize) -> Option<usize> {
+    if index == 0 {
+        return None;
+    }
+    let mut i = index - 1;
+    loop {
+        if !matches!(tokens[i].token, Token::Whitespace(_)) {
+            return Some(i);
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
 }
 
 fn type_autofix_edits(

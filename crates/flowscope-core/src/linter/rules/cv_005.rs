@@ -34,16 +34,25 @@ impl LintRule for NullComparison {
                 return;
             }
 
+            let null_case = detect_null_case(ctx, expr);
             let (message, replacement_target, replacement_suffix) = match op {
                 BinaryOperator::Eq => (
                     Some("Use IS NULL instead of = NULL."),
                     non_null_operand(left, right),
-                    " IS NULL",
+                    if null_case == KeywordCase::Lower {
+                        " is null"
+                    } else {
+                        " IS NULL"
+                    },
                 ),
                 BinaryOperator::NotEq => (
                     Some("Use IS NOT NULL instead of <> NULL or != NULL."),
                     non_null_operand(left, right),
-                    " IS NOT NULL",
+                    if null_case == KeywordCase::Lower {
+                        " is not null"
+                    } else {
+                        " IS NOT NULL"
+                    },
                 ),
                 _ => (None, None, ""),
             };
@@ -66,6 +75,27 @@ impl LintRule for NullComparison {
         });
         issues
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeywordCase {
+    Upper,
+    Lower,
+}
+
+/// Detect whether the `NULL` keyword in the original SQL is uppercase or lowercase.
+fn detect_null_case(ctx: &LintContext, expr: &Expr) -> KeywordCase {
+    if let Some((start, end)) = expr_statement_offsets(ctx, expr) {
+        let fragment = &ctx.statement_sql()[start..end];
+        // Look for the literal "null" (case-insensitive) in the expression text.
+        if let Some(pos) = fragment.to_ascii_lowercase().rfind("null") {
+            let null_text = &fragment[pos..pos + 4];
+            if null_text == "null" {
+                return KeywordCase::Lower;
+            }
+        }
+    }
+    KeywordCase::Upper
 }
 
 fn is_null_expr(expr: &Expr) -> bool {
@@ -245,6 +275,15 @@ mod tests {
 
         let fixed = apply_issue_autofix(sql, issue).expect("apply autofix");
         assert_eq!(fixed, "SELECT * FROM t WHERE a IS NULL");
+    }
+
+    #[test]
+    fn test_not_eq_lowercase_null_emits_lowercase_autofix() {
+        let sql = "SELECT a FROM foo WHERE a <> null";
+        let issues = check_sql(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT a FROM foo WHERE a is not null");
     }
 
     #[test]
