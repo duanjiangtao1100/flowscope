@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use regex::Regex;
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
@@ -72,21 +72,33 @@ impl LintRule for CapitalisationLiterals {
             .map(|candidate| candidate.value.clone())
             .collect::<Vec<_>>();
         if !tokens_violate_policy(&literal_values, self.policy) {
-            Vec::new()
-        } else {
-            let mut issue = Issue::info(
+            return Vec::new();
+        }
+
+        let autofix_edits = literal_autofix_edits(ctx, &literals, self.policy);
+
+        // Emit one issue per violating literal at its specific position.
+        if autofix_edits.is_empty() {
+            return vec![Issue::info(
                 issue_codes::LINT_CP_004,
                 "Literal keywords (NULL/TRUE/FALSE) use inconsistent capitalisation.",
             )
-            .with_statement(ctx.statement_index);
-
-            let autofix_edits = literal_autofix_edits(ctx, &literals, self.policy);
-            if !autofix_edits.is_empty() {
-                issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
-            }
-
-            vec![issue]
+            .with_statement(ctx.statement_index)];
         }
+
+        autofix_edits
+            .into_iter()
+            .map(|edit| {
+                let span = Span::new(edit.span.start, edit.span.end);
+                Issue::info(
+                    issue_codes::LINT_CP_004,
+                    "Literal keywords (NULL/TRUE/FALSE) use inconsistent capitalisation.",
+                )
+                .with_statement(ctx.statement_index)
+                .with_span(span)
+                .with_autofix_edits(IssueAutofixApplicability::Safe, vec![edit])
+            })
+            .collect()
     }
 }
 
@@ -441,8 +453,21 @@ mod tests {
                 statement_index: 0,
             },
         );
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Both null and true violate upper → 2 violations.
+        assert_eq!(issues.len(), 2);
+        let fixed = {
+            let mut edits: Vec<_> = issues
+                .iter()
+                .filter_map(|i| i.autofix.as_ref())
+                .flat_map(|a| a.edits.clone())
+                .collect();
+            edits.sort_by_key(|e| (e.span.start, e.span.end));
+            let mut out = sql.to_string();
+            for edit in edits.into_iter().rev() {
+                out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+            }
+            out
+        };
         assert_eq!(fixed, "SELECT NULL, TRUE FROM t");
     }
 

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use regex::Regex;
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
@@ -101,18 +101,31 @@ impl LintRule for CapitalisationFunctions {
             self.policy
         };
 
-        let mut issue = Issue::info(
-            issue_codes::LINT_CP_003,
-            "Function names use inconsistent capitalisation.",
-        )
-        .with_statement(ctx.statement_index);
-
         let autofix_edits = function_autofix_edits(ctx, &functions, resolved_policy);
-        if !autofix_edits.is_empty() {
-            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+
+        // Emit one issue per violating function name at its specific position
+        // (SQLFluff reports per-identifier, not per-statement).
+        if autofix_edits.is_empty() {
+            return vec![Issue::info(
+                issue_codes::LINT_CP_003,
+                "Function names use inconsistent capitalisation.",
+            )
+            .with_statement(ctx.statement_index)];
         }
 
-        vec![issue]
+        autofix_edits
+            .into_iter()
+            .map(|edit| {
+                let span = Span::new(edit.span.start, edit.span.end);
+                Issue::info(
+                    issue_codes::LINT_CP_003,
+                    "Function names use inconsistent capitalisation.",
+                )
+                .with_statement(ctx.statement_index)
+                .with_span(span)
+                .with_autofix_edits(IssueAutofixApplicability::Safe, vec![edit])
+            })
+            .collect()
     }
 }
 
@@ -521,6 +534,20 @@ mod tests {
         Some(out)
     }
 
+    fn apply_all_autofixes(sql: &str, issues: &[Issue]) -> String {
+        let mut edits: Vec<_> = issues
+            .iter()
+            .filter_map(|i| i.autofix.as_ref())
+            .flat_map(|a| a.edits.clone())
+            .collect();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        let mut out = sql.to_string();
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        out
+    }
+
     #[test]
     fn flags_mixed_function_case() {
         let issues = run("SELECT COUNT(*), count(x) FROM t");
@@ -621,8 +648,9 @@ mod tests {
                 statement_index: 0,
             },
         );
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Both COUNT and SUM violate camel → 2 violations.
+        assert_eq!(issues.len(), 2);
+        let fixed = apply_all_autofixes(sql, &issues);
         assert_eq!(fixed, "SELECT cOUNT(x), sUM(y) FROM t");
     }
 
@@ -647,8 +675,9 @@ mod tests {
                 statement_index: 0,
             },
         );
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Both current_timestamp and min violate pascal → 2 violations.
+        assert_eq!(issues.len(), 2);
+        let fixed = apply_all_autofixes(sql, &issues);
         assert_eq!(fixed, "SELECT Current_Timestamp, Min(a) FROM t");
     }
 
@@ -673,8 +702,9 @@ mod tests {
                 statement_index: 0,
             },
         );
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        // Both Current_Timestamp and Min violate snake → 2 violations.
+        assert_eq!(issues.len(), 2);
+        let fixed = apply_all_autofixes(sql, &issues);
         assert_eq!(fixed, "SELECT current_timestamp, min(a) FROM t");
     }
 

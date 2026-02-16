@@ -4,7 +4,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Select, SelectItem, Spanned, Statement,
     TableFactor, WindowType,
@@ -186,7 +186,7 @@ impl LintRule for ReferencesConsistent {
         autofix_edits_raw.sort_by_key(|edit| (edit.start, edit.end));
         autofix_edits_raw.dedup_by_key(|edit| (edit.start, edit.end));
 
-        let autofix_edits = autofix_edits_raw
+        let autofix_edits: Vec<IssuePatchEdit> = autofix_edits_raw
             .into_iter()
             .map(|edit| {
                 IssuePatchEdit::new(
@@ -194,20 +194,34 @@ impl LintRule for ReferencesConsistent {
                     edit.replacement,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
 
+        // Emit one issue per violating reference at its specific position
+        // (SQLFluff reports per-reference, not per-SELECT).
+        if !autofix_edits.is_empty() {
+            return autofix_edits
+                .into_iter()
+                .map(|edit| {
+                    let span = Span::new(edit.span.start, edit.span.end);
+                    Issue::info(
+                        issue_codes::LINT_RF_003,
+                        "Avoid mixing qualified and unqualified references.",
+                    )
+                    .with_statement(ctx.statement_index)
+                    .with_span(span)
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, vec![edit])
+                })
+                .collect();
+        }
+
+        // Fallback: no per-reference edits available, emit per-SELECT issues.
         (0..mixed_count)
-            .map(|index| {
-                let mut issue = Issue::info(
+            .map(|_| {
+                Issue::info(
                     issue_codes::LINT_RF_003,
                     "Avoid mixing qualified and unqualified references.",
                 )
-                .with_statement(ctx.statement_index);
-                if index == 0 && !autofix_edits.is_empty() {
-                    issue = issue
-                        .with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits.clone());
-                }
-                issue
+                .with_statement(ctx.statement_index)
             })
             .collect()
     }

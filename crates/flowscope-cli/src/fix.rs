@@ -4824,17 +4824,19 @@ mod tests {
 
     #[test]
     fn cp04_fix_reduces_literal_capitalisation_violations() {
+        // Per-identifier: true and False both violate upper → 2 violations, 2 fixes.
         assert_rule_case(
             "SELECT NULL, true, False FROM t",
             issue_codes::LINT_CP_004,
-            1,
+            2,
             0,
-            1,
+            2,
         );
     }
 
     #[test]
     fn cp05_fix_reduces_type_capitalisation_violations() {
+        // Per-identifier: VarChar violates upper (INT is already correct) → 1 violation.
         assert_rule_case(
             "CREATE TABLE t (a INT, b VarChar(10));",
             issue_codes::LINT_CP_005,

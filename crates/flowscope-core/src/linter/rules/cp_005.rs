@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use regex::Regex;
 use sqlparser::ast::Statement;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
@@ -70,18 +70,30 @@ impl LintRule for CapitalisationTypes {
             return Vec::new();
         }
 
-        let mut issue = Issue::info(
-            issue_codes::LINT_CP_005,
-            "Type names use inconsistent capitalisation.",
-        )
-        .with_statement(ctx.statement_index);
-
         let autofix_edits = type_autofix_edits(ctx, &types, self.policy);
-        if !autofix_edits.is_empty() {
-            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, autofix_edits);
+
+        // Emit one issue per violating type name at its specific position.
+        if autofix_edits.is_empty() {
+            return vec![Issue::info(
+                issue_codes::LINT_CP_005,
+                "Type names use inconsistent capitalisation.",
+            )
+            .with_statement(ctx.statement_index)];
         }
 
-        vec![issue]
+        autofix_edits
+            .into_iter()
+            .map(|edit| {
+                let span = Span::new(edit.span.start, edit.span.end);
+                Issue::info(
+                    issue_codes::LINT_CP_005,
+                    "Type names use inconsistent capitalisation.",
+                )
+                .with_statement(ctx.statement_index)
+                .with_span(span)
+                .with_autofix_edits(IssueAutofixApplicability::Safe, vec![edit])
+            })
+            .collect()
     }
 }
 

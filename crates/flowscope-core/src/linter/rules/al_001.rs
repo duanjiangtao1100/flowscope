@@ -5,7 +5,10 @@
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
-use sqlparser::ast::{Ident, Query, SetExpr, Statement, TableFactor, TableWithJoins};
+use sqlparser::ast::{
+    Expr, FromTable, Ident, Query, SetExpr, Statement, TableFactor, TableWithJoins,
+    UpdateTableFromKind,
+};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +194,49 @@ fn collect_table_aliases_in_statement<F: FnMut(&Ident)>(statement: &Statement, v
                 collect_table_aliases_in_query(query, visitor);
             }
         }
+        Statement::Update {
+            table,
+            from,
+            selection,
+            ..
+        } => {
+            // SQLFluff does not flag the UPDATE target's own alias —
+            // only FROM/JOIN aliases in subqueries or PostgreSQL FROM clause.
+            // Visit joins on the target table but not the target table itself.
+            for join in &table.joins {
+                collect_table_aliases_in_table_factor(&join.relation, visitor);
+            }
+            if let Some(from) = from {
+                match from {
+                    UpdateTableFromKind::BeforeSet(tables)
+                    | UpdateTableFromKind::AfterSet(tables) => {
+                        for t in tables {
+                            collect_table_aliases_in_table_with_joins(t, visitor);
+                        }
+                    }
+                }
+            }
+            if let Some(selection) = selection {
+                collect_table_aliases_in_expr(selection, visitor);
+            }
+        }
+        Statement::Delete(delete) => {
+            match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                    for t in tables {
+                        collect_table_aliases_in_table_with_joins(t, visitor);
+                    }
+                }
+            }
+            if let Some(using) = &delete.using {
+                for t in using {
+                    collect_table_aliases_in_table_with_joins(t, visitor);
+                }
+            }
+            if let Some(selection) = &delete.selection {
+                collect_table_aliases_in_expr(selection, visitor);
+            }
+        }
         Statement::Merge { table, source, .. } => {
             collect_table_aliases_in_table_factor(table, visitor);
             collect_table_aliases_in_table_factor(source, visitor);
@@ -214,6 +260,31 @@ fn collect_table_aliases_in_set_expr<F: FnMut(&Ident)>(set_expr: &SetExpr, visit
         SetExpr::Select(select) => {
             for table in &select.from {
                 collect_table_aliases_in_table_with_joins(table, visitor);
+                // Recurse into JOIN ON expressions for subquery aliases.
+                for join in &table.joins {
+                    if let Some(expr) = join_constraint_expr(&join.join_operator) {
+                        collect_table_aliases_in_expr(expr, visitor);
+                    }
+                }
+            }
+            if let Some(selection) = &select.selection {
+                collect_table_aliases_in_expr(selection, visitor);
+            }
+            if let Some(having) = &select.having {
+                collect_table_aliases_in_expr(having, visitor);
+            }
+            if let Some(qualify) = &select.qualify {
+                collect_table_aliases_in_expr(qualify, visitor);
+            }
+            // SELECT-list expressions (e.g. scalar subqueries).
+            for item in &select.projection {
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                        collect_table_aliases_in_expr(expr, visitor);
+                    }
+                    _ => {}
+                }
             }
         }
         SetExpr::Query(query) => collect_table_aliases_in_query(query, visitor),
@@ -258,6 +329,113 @@ fn collect_table_aliases_in_table_factor<F: FnMut(&Ident)>(
             collect_table_aliases_in_table_factor(table, visitor)
         }
         _ => {}
+    }
+}
+
+/// Recursively visits expression trees to collect table aliases from subqueries.
+fn collect_table_aliases_in_expr<F: FnMut(&Ident)>(expr: &Expr, visitor: &mut F) {
+    match expr {
+        Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
+            collect_table_aliases_in_query(query, visitor);
+        }
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
+            collect_table_aliases_in_expr(inner, visitor);
+            collect_table_aliases_in_query(subquery, visitor);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_table_aliases_in_expr(left, visitor);
+            collect_table_aliases_in_expr(right, visitor);
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => {
+            collect_table_aliases_in_expr(inner, visitor);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_table_aliases_in_expr(op, visitor);
+            }
+            for cw in conditions {
+                collect_table_aliases_in_expr(&cw.condition, visitor);
+                collect_table_aliases_in_expr(&cw.result, visitor);
+            }
+            if let Some(el) = else_result {
+                collect_table_aliases_in_expr(el, visitor);
+            }
+        }
+        Expr::Function(func) => {
+            if let sqlparser::ast::FunctionArguments::List(arg_list) = &func.args {
+                for arg in &arg_list.args {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        )
+                        | sqlparser::ast::FunctionArg::Named {
+                            arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => collect_table_aliases_in_expr(e, visitor),
+                        _ => {}
+                    }
+                }
+            } else if let sqlparser::ast::FunctionArguments::Subquery(query) = &func.args {
+                collect_table_aliases_in_query(query, visitor);
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_table_aliases_in_expr(inner, visitor);
+            collect_table_aliases_in_expr(low, visitor);
+            collect_table_aliases_in_expr(high, visitor);
+        }
+        Expr::InList { expr: inner, list, .. } => {
+            collect_table_aliases_in_expr(inner, visitor);
+            for item in list {
+                collect_table_aliases_in_expr(item, visitor);
+            }
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            collect_table_aliases_in_expr(inner, visitor);
+        }
+        _ => {}
+    }
+}
+
+fn join_constraint_expr(op: &sqlparser::ast::JoinOperator) -> Option<&Expr> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let constraint = match op {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c)
+        | JoinOperator::Semi(c)
+        | JoinOperator::LeftSemi(c)
+        | JoinOperator::RightSemi(c)
+        | JoinOperator::Anti(c)
+        | JoinOperator::LeftAnti(c)
+        | JoinOperator::RightAnti(c)
+        | JoinOperator::StraightJoin(c) => c,
+        JoinOperator::AsOf { constraint, .. } => constraint,
+        JoinOperator::CrossApply | JoinOperator::OuterApply => return None,
+    };
+    if let JoinConstraint::On(expr) = constraint {
+        Some(expr)
+    } else {
+        None
     }
 }
 
@@ -553,5 +731,30 @@ mod tests {
             &sql[autofix.edits[0].span.start..autofix.edits[0].span.end],
             " as "
         );
+    }
+
+    #[test]
+    fn flags_implicit_aliases_in_update_where_exists_subquery() {
+        let sql = "UPDATE t SET x = 1 WHERE EXISTS (SELECT 1 FROM users u)";
+        let issues = run(sql);
+        // `u` is implicit alias inside EXISTS subquery.
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_AL_001);
+    }
+
+    #[test]
+    fn skips_update_target_table_alias() {
+        // SQLFluff does not flag the UPDATE target's own alias.
+        let sql = "UPDATE users u SET u.x = 1";
+        let issues = run(sql);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn flags_implicit_aliases_in_delete_where_exists() {
+        let sql = "DELETE FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)";
+        let issues = run(sql);
+        // `u` in DELETE FROM + `o` in EXISTS subquery.
+        assert_eq!(issues.len(), 2);
     }
 }
