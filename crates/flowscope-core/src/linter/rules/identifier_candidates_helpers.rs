@@ -213,7 +213,25 @@ fn collect_assignment_target_identifiers(
     candidates: &mut Vec<IdentifierCandidate>,
 ) {
     match statement {
-        Statement::Insert(insert) => collect_assignment_targets(&insert.assignments, candidates),
+        Statement::Insert(insert) => {
+            collect_assignment_targets(&insert.assignments, candidates);
+            // ON CONFLICT / ON DUPLICATE KEY UPDATE
+            if let Some(on) = &insert.on {
+                match on {
+                    sqlparser::ast::OnInsert::OnConflict(on_conflict) => {
+                        if let sqlparser::ast::OnConflictAction::DoUpdate(do_update) =
+                            &on_conflict.action
+                        {
+                            collect_assignment_targets(&do_update.assignments, candidates);
+                        }
+                    }
+                    sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) => {
+                        collect_assignment_targets(assignments, candidates);
+                    }
+                    _ => {}
+                }
+            }
+        }
         Statement::Update { assignments, .. } => {
             collect_assignment_targets(assignments, candidates)
         }

@@ -21,6 +21,27 @@ pub fn visit_expressions<F: FnMut(&Expr)>(stmt: &Statement, visitor: &mut F) {
                     visit_expr(expr, visitor);
                 }
             }
+            // ON CONFLICT / ON DUPLICATE KEY UPDATE
+            if let Some(on) = &ins.on {
+                match on {
+                    OnInsert::OnConflict(on_conflict) => {
+                        if let OnConflictAction::DoUpdate(do_update) = &on_conflict.action {
+                            for assignment in &do_update.assignments {
+                                visit_expr(&assignment.value, visitor);
+                            }
+                            if let Some(selection) = &do_update.selection {
+                                visit_expr(selection, visitor);
+                            }
+                        }
+                    }
+                    OnInsert::DuplicateKeyUpdate(assignments) => {
+                        for assignment in assignments {
+                            visit_expr(&assignment.value, visitor);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if let Some(returning) = &ins.returning {
                 for item in returning {
                     visit_select_item_expressions(item, visitor);
