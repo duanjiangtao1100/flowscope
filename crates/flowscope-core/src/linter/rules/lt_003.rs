@@ -72,35 +72,32 @@ impl LintRule for LayoutOperators {
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
         let violations = operator_layout_violations(ctx, self.line_position);
-        if violations.is_empty() {
-            return Vec::new();
-        }
 
-        let ((start, end), _) = &violations[0];
-        let all_edits: Vec<Lt03AutofixEdit> = violations
-            .iter()
-            .flat_map(|(_, edits)| edits.iter().cloned())
-            .collect();
-
-        let mut issue = Issue::info(
-            issue_codes::LINT_LT_003,
-            "Operator line placement appears inconsistent.",
-        )
-        .with_statement(ctx.statement_index)
-        .with_span(ctx.span_from_statement_offset(*start, *end));
-        if !all_edits.is_empty() {
-            let edits = all_edits
-                .into_iter()
-                .map(|(edit_start, edit_end, replacement)| {
-                    IssuePatchEdit::new(
-                        ctx.span_from_statement_offset(edit_start, edit_end),
-                        &replacement,
-                    )
-                })
-                .collect();
-            issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
-        }
-        vec![issue]
+        violations
+            .into_iter()
+            .map(|((start, end), edits)| {
+                let mut issue = Issue::info(
+                    issue_codes::LINT_LT_003,
+                    "Operator line placement appears inconsistent.",
+                )
+                .with_statement(ctx.statement_index)
+                .with_span(ctx.span_from_statement_offset(start, end));
+                if !edits.is_empty() {
+                    let patch_edits = edits
+                        .into_iter()
+                        .map(|(edit_start, edit_end, replacement)| {
+                            IssuePatchEdit::new(
+                                ctx.span_from_statement_offset(edit_start, edit_end),
+                                &replacement,
+                            )
+                        })
+                        .collect();
+                    issue =
+                        issue.with_autofix_edits(IssueAutofixApplicability::Safe, patch_edits);
+                }
+                issue
+            })
+            .collect()
     }
 }
 
@@ -862,5 +859,14 @@ mod tests {
         );
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+    }
+
+    #[test]
+    fn emits_one_issue_per_trailing_operator() {
+        let sql = "SELECT a /\n b -\n c FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+        assert_eq!(issues[1].code, issue_codes::LINT_LT_003);
     }
 }
