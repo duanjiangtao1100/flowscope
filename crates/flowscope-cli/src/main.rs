@@ -20,9 +20,12 @@ use flowscope_export::{
     export_xlsx, ExportFormat, ExportNaming, MermaidView,
 };
 use is_terminal::IsTerminal;
+use rayon::prelude::*;
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cli::{Args, OutputFormat, ViewMode};
@@ -75,6 +78,11 @@ impl FixCandidateStats {
 struct LintFixExecution {
     outcome: FixOutcome,
     candidate_stats: FixCandidateStats,
+}
+
+enum LintFixComputation {
+    Success(LintFixExecution),
+    ParseError(String),
 }
 
 fn apply_lint_fixes_with_runtime_options(
@@ -237,14 +245,19 @@ fn run_serve_mode(args: Args) -> ExitCode {
 /// Analyzes each file individually with linting enabled, collects lint violations,
 /// and formats them in a sqlfluff-style report.
 fn run_lint(args: Args) -> Result<bool> {
-    use output::lint::offset_to_line_col;
-
     let started_at = Instant::now();
     let fix_runtime_options = LintFixRuntimeOptions::from_args(&args);
 
     validate_lint_output_format(args.format)?;
 
-    let mut lint_inputs = input::read_lint_input(&args.files)?;
+    let respect_gitignore = !args.no_respect_gitignore;
+    let lint_jobs = resolve_lint_jobs(args.jobs);
+    let lint_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(lint_jobs)
+        .build()
+        .context("Failed to create lint worker pool")?;
+    let mut lint_inputs =
+        lint_pool.install(|| input::read_lint_input(&args.files, respect_gitignore))?;
     let dialect = args.dialect.into();
     let rule_configs = parse_rule_configs_json(args.rule_configs.as_deref())?;
     let lint_config = LintConfig {
@@ -270,16 +283,33 @@ fn run_lint(args: Args) -> Result<bool> {
         let mut skipped_due_to_parse_errors = 0usize;
         let mut skipped_or_blocked_candidates = FixCandidateStats::default();
         let mut stdin_modified = false;
+        let progress = LintProgressBar::new("Fixing", lint_inputs.len(), args.quiet);
 
-        for lint_input in &mut lint_inputs {
-            let lint_fix_execution = match apply_lint_fixes_with_runtime_options(
-                &lint_input.source.content,
-                dialect,
-                &lint_config,
-                fix_runtime_options,
-            ) {
-                Ok(outcome) => outcome,
-                Err(err) => {
+        let fix_computations = lint_pool.install(|| {
+            let progress = progress.clone();
+            lint_inputs
+                .par_iter()
+                .map(|lint_input| {
+                    let result = match apply_lint_fixes_with_runtime_options(
+                        &lint_input.source.content,
+                        dialect,
+                        &lint_config,
+                        fix_runtime_options,
+                    ) {
+                        Ok(execution) => LintFixComputation::Success(execution),
+                        Err(err) => LintFixComputation::ParseError(err.to_string()),
+                    };
+                    progress.tick();
+                    result
+                })
+                .collect::<Vec<_>>()
+        });
+        progress.finish();
+
+        for (lint_input, fix_computation) in lint_inputs.iter_mut().zip(fix_computations) {
+            let lint_fix_execution = match fix_computation {
+                LintFixComputation::Success(execution) => execution,
+                LintFixComputation::ParseError(err) => {
                     skipped_due_to_parse_errors += 1;
                     skipped_or_blocked_candidates.skipped += 1;
                     if !args.quiet {
@@ -372,117 +402,42 @@ fn run_lint(args: Args) -> Result<bool> {
         }
     }
 
-    let mut file_results = Vec::with_capacity(lint_inputs.len());
-    let mut progress = LintProgressBar::new(lint_inputs.len(), args.quiet);
-
-    for lint_input in &lint_inputs {
-        let source = &lint_input.source;
-        #[cfg(not(feature = "templating"))]
-        let result = analyze(&AnalyzeRequest {
-            sql: source.content.clone(),
-            files: None,
-            dialect,
-            source_name: Some(source.name.clone()),
-            options: Some(AnalysisOptions {
-                lint: Some(lint_config.clone()),
-                ..Default::default()
-            }),
-            schema: None,
-        });
-
-        #[cfg(feature = "templating")]
-        let result = {
-            let request = AnalyzeRequest {
-                sql: source.content.clone(),
-                files: None,
-                dialect,
-                source_name: Some(source.name.clone()),
-                options: Some(AnalysisOptions {
-                    lint: Some(lint_config.clone()),
-                    ..Default::default()
-                }),
-                schema: None,
-                template_config: template_config.clone(),
-            };
-
-            let result = analyze(&request);
-            if template_config.is_none()
-                && contains_template_markers(&source.content)
-                && has_parse_errors(&result)
-            {
-                // SQLFluff defaults to templating-aware linting; retry as Jinja when a raw
-                // templated file would otherwise only produce parse errors.
-                let jinja_retry = analyze(&AnalyzeRequest {
-                    sql: source.content.clone(),
-                    files: None,
-                    dialect,
-                    source_name: Some(source.name.clone()),
-                    options: Some(AnalysisOptions {
-                        lint: Some(lint_config.clone()),
-                        ..Default::default()
-                    }),
-                    schema: None,
-                    template_config: Some(flowscope_core::TemplateConfig {
-                        mode: flowscope_core::TemplateMode::Jinja,
-                        context: std::collections::HashMap::new(),
-                    }),
-                });
-
-                if has_template_errors(&jinja_retry) {
-                    // Fallback to dbt-compatible macro stubs for common Jinja macros
-                    // (`ref`, `source`, etc.) when strict Jinja mode fails.
-                    analyze(&AnalyzeRequest {
-                        sql: source.content.clone(),
-                        files: None,
-                        dialect,
-                        source_name: Some(source.name.clone()),
-                        options: Some(AnalysisOptions {
-                            lint: Some(lint_config.clone()),
-                            ..Default::default()
-                        }),
-                        schema: None,
-                        template_config: Some(flowscope_core::TemplateConfig {
-                            mode: flowscope_core::TemplateMode::Dbt,
-                            context: std::collections::HashMap::new(),
-                        }),
-                    })
-                } else {
-                    jinja_retry
-                }
-            } else {
+    #[cfg(not(feature = "templating"))]
+    let file_results = lint_pool.install(|| {
+        let progress = LintProgressBar::new("Linting", lint_inputs.len(), args.quiet);
+        let progress_for_workers = progress.clone();
+        let results = lint_inputs
+            .par_iter()
+            .map(|lint_input| {
+                let result = analyze_lint_source(&lint_input.source, dialect, &lint_config);
+                progress_for_workers.tick();
                 result
-            }
-        };
-
-        let issues: Vec<LintIssue> = result
-            .issues
-            .iter()
-            .filter(|i| i.code.starts_with("LINT_") || i.severity == Severity::Error)
-            .map(|i| {
-                let (line, col) = i
-                    .span
-                    .as_ref()
-                    .map(|s| offset_to_line_col(&source.content, s.start))
-                    .unwrap_or((1, 1));
-
-                LintIssue {
-                    line,
-                    col,
-                    code: i.code.clone(),
-                    message: i.message.clone(),
-                    severity: i.severity,
-                }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        progress.finish();
+        results
+    });
 
-        file_results.push(FileLintResult {
-            name: source.name.clone(),
-            sql: source.content.clone(),
-            issues,
-        });
-        progress.tick();
-    }
-    progress.finish();
+    #[cfg(feature = "templating")]
+    let file_results = lint_pool.install(|| {
+        let progress = LintProgressBar::new("Linting", lint_inputs.len(), args.quiet);
+        let progress_for_workers = progress.clone();
+        let results = lint_inputs
+            .par_iter()
+            .map(|lint_input| {
+                let result = analyze_lint_source(
+                    &lint_input.source,
+                    dialect,
+                    &lint_config,
+                    template_config.clone(),
+                );
+                progress_for_workers.tick();
+                result
+            })
+            .collect::<Vec<_>>();
+        progress.finish();
+        results
+    });
 
     let has_violations = file_results.iter().any(|f| !f.issues.is_empty());
     let colored = args.output.is_none() && std::io::stdout().is_terminal();
@@ -497,6 +452,136 @@ fn run_lint(args: Args) -> Result<bool> {
     write_output(&args.output, &output_str)?;
 
     Ok(has_violations)
+}
+
+fn resolve_lint_jobs(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    })
+}
+
+fn to_file_lint_result(
+    source: &FileSource,
+    result: flowscope_core::AnalyzeResult,
+) -> FileLintResult {
+    use output::lint::offset_to_line_col;
+
+    let issues: Vec<LintIssue> = result
+        .issues
+        .iter()
+        .filter(|i| i.code.starts_with("LINT_") || i.severity == Severity::Error)
+        .map(|i| {
+            let (line, col) = i
+                .span
+                .as_ref()
+                .map(|s| offset_to_line_col(&source.content, s.start))
+                .unwrap_or((1, 1));
+
+            LintIssue {
+                line,
+                col,
+                code: i.code.clone(),
+                message: i.message.clone(),
+                severity: i.severity,
+            }
+        })
+        .collect();
+
+    FileLintResult {
+        name: source.name.clone(),
+        sql: source.content.clone(),
+        issues,
+    }
+}
+
+#[cfg(not(feature = "templating"))]
+fn analyze_lint_source(
+    source: &FileSource,
+    dialect: flowscope_core::Dialect,
+    lint_config: &LintConfig,
+) -> FileLintResult {
+    let result = analyze(&AnalyzeRequest {
+        sql: source.content.clone(),
+        files: None,
+        dialect,
+        source_name: Some(source.name.clone()),
+        options: Some(AnalysisOptions {
+            lint: Some(lint_config.clone()),
+            ..Default::default()
+        }),
+        schema: None,
+    });
+
+    to_file_lint_result(source, result)
+}
+
+#[cfg(feature = "templating")]
+fn analyze_lint_source(
+    source: &FileSource,
+    dialect: flowscope_core::Dialect,
+    lint_config: &LintConfig,
+    template_config: Option<flowscope_core::TemplateConfig>,
+) -> FileLintResult {
+    let request = AnalyzeRequest {
+        sql: source.content.clone(),
+        files: None,
+        dialect,
+        source_name: Some(source.name.clone()),
+        options: Some(AnalysisOptions {
+            lint: Some(lint_config.clone()),
+            ..Default::default()
+        }),
+        schema: None,
+        template_config: template_config.clone(),
+    };
+
+    let result = analyze(&request);
+    let result = if template_config.is_none()
+        && contains_template_markers(&source.content)
+        && has_parse_errors(&result)
+    {
+        let jinja_retry = analyze(&AnalyzeRequest {
+            sql: source.content.clone(),
+            files: None,
+            dialect,
+            source_name: Some(source.name.clone()),
+            options: Some(AnalysisOptions {
+                lint: Some(lint_config.clone()),
+                ..Default::default()
+            }),
+            schema: None,
+            template_config: Some(flowscope_core::TemplateConfig {
+                mode: flowscope_core::TemplateMode::Jinja,
+                context: std::collections::HashMap::new(),
+            }),
+        });
+
+        if has_template_errors(&jinja_retry) {
+            analyze(&AnalyzeRequest {
+                sql: source.content.clone(),
+                files: None,
+                dialect,
+                source_name: Some(source.name.clone()),
+                options: Some(AnalysisOptions {
+                    lint: Some(lint_config.clone()),
+                    ..Default::default()
+                }),
+                schema: None,
+                template_config: Some(flowscope_core::TemplateConfig {
+                    mode: flowscope_core::TemplateMode::Dbt,
+                    context: std::collections::HashMap::new(),
+                }),
+            })
+        } else {
+            jinja_retry
+        }
+    } else {
+        result
+    };
+
+    to_file_lint_result(source, result)
 }
 
 fn parse_rule_configs_json(
@@ -574,56 +659,80 @@ fn contains_template_markers(sql: &str) -> bool {
     sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
 }
 
+#[derive(Clone)]
 struct LintProgressBar {
+    inner: Arc<LintProgressState>,
+}
+
+struct LintProgressState {
     enabled: bool,
+    label: &'static str,
     total: usize,
-    current: usize,
+    current: AtomicUsize,
+    render_lock: Mutex<()>,
 }
 
 impl LintProgressBar {
     const WIDTH: usize = 30;
 
-    fn new(total: usize, quiet: bool) -> Self {
+    fn new(label: &'static str, total: usize, quiet: bool) -> Self {
         let enabled = !quiet && total > 0 && io::stderr().is_terminal();
         let progress = Self {
-            enabled,
-            total,
-            current: 0,
+            inner: Arc::new(LintProgressState {
+                enabled,
+                label,
+                total,
+                current: AtomicUsize::new(0),
+                render_lock: Mutex::new(()),
+            }),
         };
 
-        if progress.enabled {
+        if progress.inner.enabled {
             progress.render();
         }
 
         progress
     }
 
-    fn tick(&mut self) {
-        if !self.enabled {
+    fn tick(&self) {
+        if !self.inner.enabled {
             return;
         }
 
-        self.current = self.current.saturating_add(1).min(self.total);
+        self.inner.current.fetch_add(1, Ordering::Relaxed);
         self.render();
     }
 
     fn finish(&self) {
-        if self.enabled {
-            eprintln!();
+        if !self.inner.enabled {
+            return;
         }
+
+        self.render();
+        eprintln!();
     }
 
     fn render(&self) {
-        let filled = if self.total == 0 {
+        if !self.inner.enabled {
+            return;
+        }
+
+        let _render_guard = self.inner.render_lock.lock().expect("progress render lock");
+        let current = self
+            .inner
+            .current
+            .load(Ordering::Relaxed)
+            .min(self.inner.total);
+        let filled = if self.inner.total == 0 {
             0
         } else {
-            self.current * Self::WIDTH / self.total
+            current * Self::WIDTH / self.inner.total
         };
         let empty = Self::WIDTH - filled;
 
         eprint!(
-            "\rLinting [{:=>filled$}{:empty$}] {}/{}",
-            "", "", self.current, self.total
+            "\r{} [{:=>filled$}{:empty$}] {}/{}",
+            self.inner.label, "", "", current, self.inner.total
         );
         let _ = io::stderr().flush();
     }

@@ -82,6 +82,19 @@ pub struct Args {
     #[arg(long, requires = "lint", value_name = "JSON")]
     pub rule_configs: Option<String>,
 
+    /// Number of worker threads to use for lint/fix file processing
+    #[arg(
+        long,
+        requires = "lint",
+        value_name = "N",
+        value_parser = parse_positive_usize
+    )]
+    pub jobs: Option<usize>,
+
+    /// Disable `.gitignore` and standard ignore-file filtering during lint path discovery
+    #[arg(long, requires = "lint")]
+    pub no_respect_gitignore: bool,
+
     /// Suppress warnings on stderr
     #[arg(short, long)]
     pub quiet: bool,
@@ -179,6 +192,16 @@ pub enum OutputFormat {
     Xlsx,
     /// DuckDB database file
     Duckdb,
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{value}', expected a positive integer"))?;
+    if parsed == 0 {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
 
 /// Template mode for SQL preprocessing
@@ -287,6 +310,8 @@ mod tests {
         assert!(!args.show_fixes);
         assert!(args.exclude_rules.is_empty());
         assert!(args.rule_configs.is_none());
+        assert!(args.jobs.is_none());
+        assert!(!args.no_respect_gitignore);
     }
 
     #[test]
@@ -400,6 +425,36 @@ mod tests {
             args.rule_configs.as_deref(),
             Some(r#"{"structure.subquery":{"forbid_subquery_in":"both"}}"#)
         );
+    }
+
+    #[test]
+    fn test_lint_jobs_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--jobs", "4", "test.sql"]);
+        assert_eq!(args.jobs, Some(4));
+    }
+
+    #[test]
+    fn test_lint_jobs_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--jobs", "4", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lint_jobs_must_be_positive() {
+        let result = Args::try_parse_from(["flowscope", "--lint", "--jobs", "0", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lint_no_respect_gitignore_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--no-respect-gitignore", "test.sql"]);
+        assert!(args.no_respect_gitignore);
+    }
+
+    #[test]
+    fn test_lint_no_respect_gitignore_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--no-respect-gitignore", "test.sql"]);
+        assert!(result.is_err());
     }
 
     #[cfg(feature = "serve")]

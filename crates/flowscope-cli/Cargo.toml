@@ -45,6 +45,8 @@ thiserror = "2.0"
 tabled = "0.20"
 owo-colors = "4"
 is-terminal = "0.4"
+rayon = "1.10"
+ignore = "0.4"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 

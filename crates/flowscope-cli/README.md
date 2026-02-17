@@ -79,6 +79,9 @@ Options:
       --show-fixes         Show detailed skipped/blocked fix candidate stats (requires --lint)
       --exclude-rules <EXCLUDE_RULES>
                            Comma-separated lint rule codes to exclude
+      --jobs <N>           Number of worker threads for lint/fix file processing (requires --lint)
+      --no-respect-gitignore
+                           Disable `.gitignore` filtering during lint path discovery (requires --lint)
   -q, --quiet              Suppress warnings on stderr
   -c, --compact            Compact JSON output (no pretty-printing)
   -h, --help               Print help
@@ -95,6 +98,12 @@ flowscope --lint queries/*.sql
 
 # Lint every .sql file under a directory (recursive)
 flowscope --lint ./queries
+
+# Lint with a fixed worker count
+flowscope --lint --jobs 8 ./queries
+
+# Include files ignored by `.gitignore`
+flowscope --lint --no-respect-gitignore ./queries
 
 # Apply supported auto-fixes, then report remaining violations
 flowscope --lint --fix queries/*.sql

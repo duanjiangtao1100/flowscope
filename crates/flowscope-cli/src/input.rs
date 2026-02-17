@@ -2,6 +2,8 @@
 
 use anyhow::{Context, Result};
 use flowscope_core::FileSource;
+use ignore::WalkBuilder;
+use rayon::prelude::*;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -27,7 +29,7 @@ pub fn read_input(files: &[PathBuf]) -> Result<Vec<FileSource>> {
 ///
 /// Directory paths are expanded recursively and only `.sql` files are included.
 /// Direct file paths are always included (regardless of extension) for backwards compatibility.
-pub fn read_lint_input(paths: &[PathBuf]) -> Result<Vec<LintInputSource>> {
+pub fn read_lint_input(paths: &[PathBuf], respect_gitignore: bool) -> Result<Vec<LintInputSource>> {
     if paths.is_empty() {
         return read_from_stdin().map(|sources| {
             sources
@@ -37,13 +39,13 @@ pub fn read_lint_input(paths: &[PathBuf]) -> Result<Vec<LintInputSource>> {
         });
     }
 
-    let expanded_paths = expand_lint_paths(paths)?;
+    let expanded_paths = expand_lint_paths(paths, respect_gitignore)?;
     if expanded_paths.is_empty() {
         anyhow::bail!("No .sql files found in provided directories");
     }
 
     expanded_paths
-        .into_iter()
+        .into_par_iter()
         .map(|path| {
             let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read file: {}", path.display()))?;
@@ -89,7 +91,7 @@ fn read_from_files(files: &[PathBuf]) -> Result<Vec<FileSource>> {
         .collect()
 }
 
-fn expand_lint_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn expand_lint_paths(paths: &[PathBuf], respect_gitignore: bool) -> Result<Vec<PathBuf>> {
     let mut expanded_paths = Vec::new();
 
     for path in paths {
@@ -97,7 +99,11 @@ fn expand_lint_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
             .with_context(|| format!("Failed to read file metadata: {}", path.display()))?;
 
         if metadata.is_dir() {
-            collect_sql_files_recursive(path, &mut expanded_paths)?;
+            if respect_gitignore {
+                collect_sql_files_with_ignore(path, &mut expanded_paths)?;
+            } else {
+                collect_sql_files_recursive(path, &mut expanded_paths)?;
+            }
         } else {
             expanded_paths.push(path.clone());
         }
@@ -106,6 +112,26 @@ fn expand_lint_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     expanded_paths.sort();
     expanded_paths.dedup();
     Ok(expanded_paths)
+}
+
+fn collect_sql_files_with_ignore(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut builder = WalkBuilder::new(dir);
+    builder.standard_filters(true);
+    builder.require_git(false);
+    builder.hidden(false);
+
+    for entry in builder.build() {
+        let entry =
+            entry.with_context(|| format!("Failed to read directory: {}", dir.display()))?;
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() && is_sql_file(entry.path()) {
+            out.push(entry.path().to_path_buf());
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_sql_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -185,12 +211,35 @@ mod tests {
         std::fs::write(&sql_two, "SELECT 2").unwrap();
         std::fs::write(&txt_file, "SELECT 3").unwrap();
 
-        let inputs = read_lint_input(&[dir.path().to_path_buf()]).unwrap();
+        let inputs = read_lint_input(&[dir.path().to_path_buf()], true).unwrap();
         assert_eq!(inputs.len(), 2);
 
         let names: Vec<String> = inputs.into_iter().map(|i| i.source.name).collect();
         assert!(names.iter().any(|n| n.ends_with("one.sql")));
         assert!(names.iter().any(|n| n.ends_with("two.SQL")));
         assert!(!names.iter().any(|n| n.ends_with("ignore.txt")));
+    }
+
+    #[test]
+    fn test_read_lint_input_respects_gitignore() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.sql\n").unwrap();
+        let kept = dir.path().join("kept.sql");
+        let ignored = dir.path().join("ignored.sql");
+        std::fs::write(&kept, "SELECT 1").unwrap();
+        std::fs::write(&ignored, "SELECT 2").unwrap();
+
+        let respected = read_lint_input(&[dir.path().to_path_buf()], true).unwrap();
+        let respected_names: Vec<String> = respected.into_iter().map(|i| i.source.name).collect();
+        assert!(respected_names.iter().any(|n| n.ends_with("kept.sql")));
+        assert!(!respected_names.iter().any(|n| n.ends_with("ignored.sql")));
+
+        let not_respected = read_lint_input(&[dir.path().to_path_buf()], false).unwrap();
+        let not_respected_names: Vec<String> =
+            not_respected.into_iter().map(|i| i.source.name).collect();
+        assert!(not_respected_names.iter().any(|n| n.ends_with("kept.sql")));
+        assert!(not_respected_names
+            .iter()
+            .any(|n| n.ends_with("ignored.sql")));
     }
 }
