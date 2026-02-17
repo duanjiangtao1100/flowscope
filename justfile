@@ -420,6 +420,38 @@ sqlfluff-parity SQLFLUFF_DIR="":
     fi
     "$venv" scripts/sqlfluff-parity-report.py "$dir"
 
+# Compare FlowScope vs SQLFluff lint/fix behavior on a real SQL corpus
+sql-corpus-parity SQL_DIR="" SQLFLUFF_BIN="" DIALECT="postgres":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{SQL_DIR}}" ]; then
+        sql_dir="{{SQL_DIR}}"
+    elif [ -n "${SQL_DIR:-}" ]; then
+        sql_dir="$SQL_DIR"
+    else
+        echo "Usage: just sql-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "  or:  SQL_DIR=/path/to/sql-dir SQLFLUFF_BIN=/path/to/sqlfluff just sql-corpus-parity"
+        exit 1
+    fi
+    if [ -n "{{SQLFLUFF_BIN}}" ]; then
+        sqlfluff_bin="{{SQLFLUFF_BIN}}"
+    elif [ -n "${SQLFLUFF_BIN:-}" ]; then
+        sqlfluff_bin="$SQLFLUFF_BIN"
+    elif [ -n "${SQLFLUFF_DIR:-}" ] && [ -x "${SQLFLUFF_DIR}/.venv/bin/sqlfluff" ]; then
+        sqlfluff_bin="${SQLFLUFF_DIR}/.venv/bin/sqlfluff"
+    else
+        echo "SQLFluff binary not found."
+        echo "Provide it explicitly:"
+        echo "  just sql-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "or set SQLFLUFF_BIN=/path/to/sqlfluff"
+        echo "or set SQLFLUFF_DIR with a .venv/bin/sqlfluff binary."
+        exit 1
+    fi
+    python3 scripts/sql-corpus-parity-report.py \
+        --sql-dir "$sql_dir" \
+        --sqlfluff-bin "$sqlfluff_bin" \
+        --dialect "{{DIALECT}}"
+
 # Pre-release validation: all checks needed before tagging a release
 pre-release: check-generated check-all
     @echo "All pre-release checks passed!"

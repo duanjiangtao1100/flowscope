@@ -2628,7 +2628,10 @@ mod tests {
     fn insert_into_table_paren_allows_space() {
         // Space before ( in INSERT INTO table ( should be fine.
         let issues = run("INSERT INTO metrics.cold_start_daily (\n    workspace_id\n) SELECT 1");
-        let lt01 = issues.iter().filter(|i| i.code == "LT01").collect::<Vec<_>>();
+        let lt01 = issues
+            .iter()
+            .filter(|i| i.code == "LT01")
+            .collect::<Vec<_>>();
         assert!(
             lt01.is_empty(),
             "INSERT INTO table ( should not flag LT01, got: {lt01:?}"
@@ -2640,7 +2643,10 @@ mod tests {
         // CTE + INSERT INTO: both parsed-statement and fallback paths.
         let sql = "WITH starts AS (\n    SELECT 1\n)\nINSERT INTO metrics.cold_start_daily (\n    workspace_id\n) SELECT workspace_id FROM starts";
         let issues = run_with_dialect(sql, Dialect::Postgres);
-        let lt01 = issues.iter().filter(|i| i.code == "LT01").collect::<Vec<_>>();
+        let lt01 = issues
+            .iter()
+            .filter(|i| i.code == "LT01")
+            .collect::<Vec<_>>();
         assert!(
             lt01.is_empty(),
             "INSERT INTO table ( with CTE should not flag LT01, got: {lt01:?}"
@@ -2665,7 +2671,10 @@ FROM cte
 ON CONFLICT (workspace_id) DO UPDATE
     SET workspace_id = excluded.workspace_id";
         let issues = run_statementless_with_dialect(sql, Dialect::Postgres);
-        let lt01 = issues.iter().filter(|i| i.code == "LT01").collect::<Vec<_>>();
+        let lt01 = issues
+            .iter()
+            .filter(|i| i.code == "LT01")
+            .collect::<Vec<_>>();
         assert!(
             lt01.is_empty(),
             "INSERT INTO table ( with ON CONFLICT should not flag LT01, got: {lt01:?}"

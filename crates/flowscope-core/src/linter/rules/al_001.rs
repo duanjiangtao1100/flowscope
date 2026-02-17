@@ -335,7 +335,10 @@ fn collect_table_aliases_in_table_factor<F: FnMut(&Ident)>(
 /// Recursively visits expression trees to collect table aliases from subqueries.
 fn collect_table_aliases_in_expr<F: FnMut(&Ident)>(expr: &Expr, visitor: &mut F) {
     match expr {
-        Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
+        Expr::Subquery(query)
+        | Expr::Exists {
+            subquery: query, ..
+        } => {
             collect_table_aliases_in_query(query, visitor);
         }
         Expr::InSubquery {
@@ -350,7 +353,9 @@ fn collect_table_aliases_in_expr<F: FnMut(&Ident)>(expr: &Expr, visitor: &mut F)
             collect_table_aliases_in_expr(left, visitor);
             collect_table_aliases_in_expr(right, visitor);
         }
-        Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) | Expr::Cast { expr: inner, .. } => {
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. } => {
             collect_table_aliases_in_expr(inner, visitor);
         }
         Expr::Case {
@@ -398,7 +403,9 @@ fn collect_table_aliases_in_expr<F: FnMut(&Ident)>(expr: &Expr, visitor: &mut F)
             collect_table_aliases_in_expr(low, visitor);
             collect_table_aliases_in_expr(high, visitor);
         }
-        Expr::InList { expr: inner, list, .. } => {
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
             collect_table_aliases_in_expr(inner, visitor);
             for item in list {
                 collect_table_aliases_in_expr(item, visitor);
@@ -752,7 +759,8 @@ mod tests {
 
     #[test]
     fn flags_implicit_aliases_in_delete_where_exists() {
-        let sql = "DELETE FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)";
+        let sql =
+            "DELETE FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id)";
         let issues = run(sql);
         // `u` in DELETE FROM + `o` in EXISTS subquery.
         assert_eq!(issues.len(), 2);

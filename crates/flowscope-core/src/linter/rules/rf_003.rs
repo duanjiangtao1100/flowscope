@@ -1737,7 +1737,9 @@ mod tests {
         let sql = "SELECT my_tbl.bar, baz FROM my_tbl";
         let issues = run(sql);
         assert_eq!(issues.len(), 2);
-        assert!(issues.iter().all(|issue| issue.code == issue_codes::LINT_RF_003));
+        assert!(issues
+            .iter()
+            .all(|issue| issue.code == issue_codes::LINT_RF_003));
         let issue_with_fix = issues
             .iter()
             .find(|issue| issue.autofix.is_some())

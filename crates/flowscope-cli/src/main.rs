@@ -1,7 +1,7 @@
 //! FlowScope CLI - SQL lineage analyzer
 
 use flowscope_cli::cli;
-use flowscope_cli::fix::{apply_lint_fixes_with_options, FixOptions, FixOutcome};
+use flowscope_cli::fix::{apply_lint_fixes_with_options, FixCounts, FixOptions, FixOutcome};
 use flowscope_cli::input;
 #[cfg(feature = "metadata-provider")]
 use flowscope_cli::metadata;
@@ -35,6 +35,8 @@ use output::{format_lint_json, format_lint_results, format_table, FileLintResult
 const EXIT_FAILURE: u8 = 1;
 /// Configuration error (e.g. unsupported format for the given mode).
 const EXIT_CONFIG_ERROR: u8 = 66;
+/// Max bounded fix passes per file during `--lint --fix`.
+const MAX_LINT_FIX_PASSES: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LintFixRuntimeOptions {
@@ -59,6 +61,8 @@ struct FixCandidateStats {
     blocked: usize,
     blocked_unsafe: usize,
     blocked_display_only: usize,
+    blocked_protected_range: usize,
+    blocked_overlap_conflict: usize,
 }
 
 impl FixCandidateStats {
@@ -71,6 +75,8 @@ impl FixCandidateStats {
         self.blocked += other.blocked;
         self.blocked_unsafe += other.blocked_unsafe;
         self.blocked_display_only += other.blocked_display_only;
+        self.blocked_protected_range += other.blocked_protected_range;
+        self.blocked_overlap_conflict += other.blocked_overlap_conflict;
     }
 }
 
@@ -91,19 +97,51 @@ fn apply_lint_fixes_with_runtime_options(
     lint_config: &LintConfig,
     runtime_options: LintFixRuntimeOptions,
 ) -> std::result::Result<LintFixExecution, ParseError> {
-    let outcome = apply_lint_fixes_with_options(
-        sql,
-        dialect,
-        lint_config,
-        FixOptions {
-            include_unsafe_fixes: runtime_options.include_unsafe_fixes,
-            include_rewrite_candidates: runtime_options.legacy_ast_fixes,
-        },
-    )?;
-    let candidate_stats = collect_fix_candidate_stats(&outcome, runtime_options);
+    let fix_options = FixOptions {
+        include_unsafe_fixes: runtime_options.include_unsafe_fixes,
+        include_rewrite_candidates: runtime_options.legacy_ast_fixes,
+    };
+
+    let mut current_sql = sql.to_string();
+    let mut merged_counts = FixCounts::default();
+    let mut merged_candidate_stats = FixCandidateStats::default();
+    let mut any_changed = false;
+    let mut last_outcome = None;
+
+    for _pass in 0..MAX_LINT_FIX_PASSES {
+        let outcome =
+            apply_lint_fixes_with_options(&current_sql, dialect, lint_config, fix_options)?;
+        merged_counts.merge(&outcome.counts);
+        merged_candidate_stats.merge(collect_fix_candidate_stats(&outcome, runtime_options));
+
+        if outcome.changed {
+            any_changed = true;
+            current_sql = outcome.sql.clone();
+        }
+
+        let continue_fixing = outcome.changed
+            && !outcome.skipped_due_to_comments
+            && !outcome.skipped_due_to_regression;
+        last_outcome = Some(outcome);
+
+        if !continue_fixing {
+            break;
+        }
+    }
+
+    let mut outcome = last_outcome.expect("at least one fix pass should run");
+    if any_changed {
+        outcome.sql = current_sql;
+        outcome.changed = true;
+        outcome.counts = merged_counts;
+        // Multi-pass terminated after no further changes or bounded pass limit.
+        outcome.skipped_due_to_comments = false;
+        outcome.skipped_due_to_regression = false;
+    }
+
     Ok(LintFixExecution {
         outcome,
-        candidate_stats,
+        candidate_stats: merged_candidate_stats,
     })
 }
 
@@ -122,15 +160,17 @@ fn collect_fix_candidate_stats(
         0
     };
 
-    let blocked = blocked_unsafe
-        + blocked_display_only
-        + outcome.skipped_counts.protected_range_blocked
-        + outcome.skipped_counts.overlap_conflict_blocked;
+    let blocked_protected_range = outcome.skipped_counts.protected_range_blocked;
+    let blocked_overlap_conflict = outcome.skipped_counts.overlap_conflict_blocked;
+    let blocked =
+        blocked_unsafe + blocked_display_only + blocked_protected_range + blocked_overlap_conflict;
     FixCandidateStats {
         skipped: 0,
         blocked,
         blocked_unsafe,
         blocked_display_only,
+        blocked_protected_range,
+        blocked_overlap_conflict,
     }
 }
 
@@ -387,12 +427,14 @@ fn run_lint(args: Args) -> Result<bool> {
             if skipped_or_blocked_total > 0 {
                 if args.show_fixes {
                     eprintln!(
-                        "flowscope: skipped/blocked fix candidates: {} (skipped: {}, blocked: {}, unsafe blocked: {}, display-only blocked: {})",
+                        "flowscope: skipped/blocked fix candidates: {} (skipped: {}, blocked: {}, unsafe blocked: {}, display-only blocked: {}, protected-range blocked: {}, overlap-conflict blocked: {})",
                         skipped_or_blocked_total,
                         skipped_or_blocked_candidates.skipped,
                         skipped_or_blocked_candidates.blocked,
                         skipped_or_blocked_candidates.blocked_unsafe,
                         skipped_or_blocked_candidates.blocked_display_only,
+                        skipped_or_blocked_candidates.blocked_protected_range,
+                        skipped_or_blocked_candidates.blocked_overlap_conflict,
                     );
                 } else {
                     eprintln!(
@@ -401,7 +443,7 @@ fn run_lint(args: Args) -> Result<bool> {
                 }
             } else if args.show_fixes {
                 eprintln!(
-                    "flowscope: skipped/blocked fix candidates: 0 (skipped: 0, blocked: 0, unsafe blocked: 0, display-only blocked: 0)"
+                    "flowscope: skipped/blocked fix candidates: 0 (skipped: 0, blocked: 0, unsafe blocked: 0, display-only blocked: 0, protected-range blocked: 0, overlap-conflict blocked: 0)"
                 );
             }
         }

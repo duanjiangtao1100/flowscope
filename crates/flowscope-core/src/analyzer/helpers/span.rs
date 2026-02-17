@@ -174,11 +174,10 @@ fn find_keyword_case_insensitive(text: &str, keyword: &str) -> Option<usize> {
     while let Some(pos) = text_upper[search_pos..].find(keyword) {
         let abs_pos = search_pos + pos;
         // Check word boundary before
-        let before_ok = abs_pos == 0 || !text.as_bytes()[abs_pos - 1].is_ascii_alphanumeric();
+        let before_ok = abs_pos == 0 || !is_identifier_char_before(text, abs_pos);
         // Check word boundary after
         let after_pos = abs_pos + keyword.len();
-        let after_ok =
-            after_pos >= text.len() || !text.as_bytes()[after_pos].is_ascii_alphanumeric();
+        let after_ok = after_pos >= text.len() || !is_identifier_char_at(text, after_pos);
 
         if before_ok && after_ok {
             return Some(abs_pos);
@@ -268,10 +267,8 @@ fn match_identifier_at(text: &str, pos: usize, identifier: &str) -> Option<(usiz
     // Check for unquoted identifier with word boundary
     if remaining.to_ascii_uppercase().starts_with(&ident_upper) {
         let end_pos = identifier.len();
-        // Ensure word boundary after identifier (not alphanumeric and not underscore)
-        let after_ok = end_pos >= remaining.len()
-            || (!remaining.as_bytes()[end_pos].is_ascii_alphanumeric()
-                && remaining.as_bytes()[end_pos] != b'_');
+        // Ensure word boundary after identifier.
+        let after_ok = end_pos >= remaining.len() || !is_identifier_char_at(remaining, end_pos);
         if after_ok {
             return Some((pos, pos + identifier.len()));
         }
@@ -294,13 +291,17 @@ fn find_word_boundary_match(text: &str, identifier: &str) -> Option<(usize, usiz
     }
 
     for start in 0..=text_bytes.len() - ident_bytes.len() {
+        let end = start + ident_bytes.len();
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            continue;
+        }
+
         if !starts_with_ascii_case_insensitive(text_bytes, start, ident_bytes) {
             continue;
         }
 
-        let before_ok = start == 0 || !is_identifier_char(text_bytes[start - 1]);
-        let end = start + ident_bytes.len();
-        let after_ok = end == text_bytes.len() || !is_identifier_char(text_bytes[end]);
+        let before_ok = start == 0 || !is_identifier_char_before(text, start);
+        let after_ok = end == text_bytes.len() || !is_identifier_char_at(text, end);
 
         if before_ok && after_ok {
             return Some((start, end));
@@ -319,7 +320,11 @@ fn find_qualified_name(text: &str, qualified_name: &str) -> Option<(usize, usize
 
     let text_bytes = text.as_bytes();
     for start in 0..text_bytes.len() {
-        let before_ok = start == 0 || !is_identifier_char(text_bytes[start - 1]);
+        if !text.is_char_boundary(start) {
+            continue;
+        }
+
+        let before_ok = start == 0 || !is_identifier_char_before(text, start);
         if !before_ok {
             continue;
         }
@@ -347,7 +352,11 @@ fn find_qualified_name(text: &str, qualified_name: &str) -> Option<(usize, usize
             continue;
         }
 
-        let after_ok = current == text_bytes.len() || !is_identifier_char(text_bytes[current]);
+        if current < text_bytes.len() && !text.is_char_boundary(current) {
+            continue;
+        }
+
+        let after_ok = current == text_bytes.len() || !is_identifier_char_at(text, current);
         if after_ok {
             return Some((start, current));
         }
@@ -356,8 +365,20 @@ fn find_qualified_name(text: &str, qualified_name: &str) -> Option<(usize, usize
     None
 }
 
-fn is_identifier_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn is_identifier_char_before(text: &str, byte_offset: usize) -> bool {
+    text.get(..byte_offset)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_some_and(is_identifier_char)
+}
+
+fn is_identifier_char_at(text: &str, byte_offset: usize) -> bool {
+    text.get(byte_offset..)
+        .and_then(|suffix| suffix.chars().next())
+        .is_some_and(is_identifier_char)
 }
 
 fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
@@ -722,6 +743,22 @@ mod tests {
             },
             "should not match 'users' as part of 'users_table'"
         );
+    }
+
+    #[test]
+    fn test_word_boundary_unicode_suffix_no_match() {
+        let sql = "SELECT * FROM 表名";
+        // Should NOT match "表" because it's followed by a Unicode identifier char.
+        let span = find_identifier_span(sql, "表", 0);
+        assert_eq!(span, None);
+    }
+
+    #[test]
+    fn test_word_boundary_unicode_search_offset_no_partial_match() {
+        let sql = "SELECT 表 FROM 表名";
+        let first = find_identifier_span(sql, "表", 0).expect("first 表");
+        let second = find_identifier_span(sql, "表", first.end);
+        assert_eq!(second, None);
     }
 
     #[test]

@@ -138,25 +138,52 @@ fn lt08_violation_spans(
             if let Some((next_start, next_end)) = next_code_span {
                 let mut autofix_span = None;
                 let gap_start = close_abs + 1;
-                if gap_start < next_start {
-                    let gap = &ctx.sql[gap_start..next_start];
-                    let next_token = &ctx.sql[next_start..next_end];
-                    if gap.chars().all(char::is_whitespace)
-                        && !gap.contains('\n')
-                        && !gap.contains('\r')
-                        && next_token.eq_ignore_ascii_case("SELECT")
+                let next_token = &ctx.sql[next_start..next_end];
+
+                if matches!(next_token, "," if matches!(comma_line_position, CommaLinePosition::Trailing))
+                {
+                    let comma_end = next_end;
+                    let (_blank_lines_after_comma, next_after_comma) = suffix_summary_after_offset(
+                        ctx.sql,
+                        &tokens,
+                        comma_end,
+                        ctx.statement_range.end,
+                    );
+                    if let Some((after_comma_start, _after_comma_end)) = next_after_comma {
+                        if let Some((fix_start, fix_end)) =
+                            whitespace_gap_span(ctx.sql, comma_end, after_comma_start)
+                        {
+                            autofix_span =
+                                Some((fix_start - statement_start, fix_end - statement_start));
+                        }
+                    }
+                } else if next_token.eq_ignore_ascii_case("SELECT")
+                    || next_token.eq_ignore_ascii_case("INSERT")
+                    || next_token.eq_ignore_ascii_case("UPDATE")
+                    || next_token.eq_ignore_ascii_case("DELETE")
+                {
+                    if let Some((fix_start, fix_end)) =
+                        whitespace_gap_span(ctx.sql, gap_start, next_start)
                     {
                         autofix_span =
-                            Some((gap_start - statement_start, next_start - statement_start));
+                            Some((fix_start - statement_start, fix_end - statement_start));
+                    }
+                } else if matches!(comma_line_position, CommaLinePosition::Trailing) {
+                    let gap = &ctx.sql[gap_start..next_start];
+                    if let Some(comma_relative) = gap.rfind(',') {
+                        let after_comma = gap_start + comma_relative + 1;
+                        if let Some((fix_start, fix_end)) =
+                            whitespace_gap_span(ctx.sql, after_comma, next_start)
+                        {
+                            autofix_span =
+                                Some((fix_start - statement_start, fix_end - statement_start));
+                        }
                     }
                 } else if gap_start == next_start
                     && matches!(comma_line_position, CommaLinePosition::Leading)
+                    && next_token == ","
                 {
-                    let next_token = &ctx.sql[next_start..next_end];
-                    if next_token == "," {
-                        autofix_span =
-                            Some((gap_start - statement_start, gap_start - statement_start));
-                    }
+                    autofix_span = Some((gap_start - statement_start, gap_start - statement_start));
                 }
 
                 spans.push((
@@ -405,6 +432,18 @@ fn consume_text_for_blank_lines(text: &str, blank_lines: &mut usize, line_blank:
     }
 }
 
+fn whitespace_gap_span(sql: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    if start > end || end > sql.len() {
+        return None;
+    }
+    let gap = &sql[start..end];
+    if gap.chars().all(char::is_whitespace) {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
 fn is_trivia_token(token: &Token) -> bool {
     matches!(
         token,
@@ -506,10 +545,9 @@ mod tests {
         let newline_sql = "WITH cte AS (SELECT 1)\nSELECT * FROM cte";
         let newline_issues = run(newline_sql);
         assert!(!newline_issues.is_empty());
-        assert!(
-            newline_issues[0].autofix.is_none(),
-            "single-newline LT008 violation remains report-only"
-        );
+        let newline_fixed =
+            apply_issue_autofix(newline_sql, &newline_issues[0]).expect("apply newline autofix");
+        assert_eq!(newline_fixed, "WITH cte AS (SELECT 1)\n\nSELECT * FROM cte");
     }
 
     #[test]
@@ -581,6 +619,27 @@ SELECT * FROM b");
         assert_eq!(
             fixed,
             "with my_cte as (select 1)\n\n, other_cte as (select 1)\n\nselect * from my_cte\ncross join other_cte\n"
+        );
+    }
+
+    #[test]
+    fn trailing_comma_cte_autofix_inserts_blank_line_after_comma() {
+        let sql = "WITH a AS (SELECT 1),\nb AS (SELECT 2)\nSELECT * FROM b";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let mut edits = issues
+            .iter()
+            .filter_map(|issue| issue.autofix.as_ref())
+            .flat_map(|autofix| autofix.edits.clone())
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        let mut fixed = sql.to_string();
+        for edit in edits.into_iter().rev() {
+            fixed.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        assert_eq!(
+            fixed,
+            "WITH a AS (SELECT 1),\n\nb AS (SELECT 2)\n\nSELECT * FROM b"
         );
     }
 }

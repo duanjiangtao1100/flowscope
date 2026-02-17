@@ -92,8 +92,7 @@ impl LintRule for LayoutOperators {
                             )
                         })
                         .collect();
-                    issue =
-                        issue.with_autofix_edits(IssueAutofixApplicability::Safe, patch_edits);
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, patch_edits);
                 }
                 issue
             })

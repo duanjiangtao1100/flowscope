@@ -833,8 +833,7 @@ fn keyword_newline_violation_span(
                         token.span.start.column as usize,
                     );
                     if let Some(start) = select_start {
-                        let line_start =
-                            sql[..start].rfind('\n').map_or(0, |idx| idx + 1);
+                        let line_start = sql[..start].rfind('\n').map_or(0, |idx| idx + 1);
                         if sql[line_start..start].trim().is_empty() {
                             found = Some(token.span.start.line);
                             break;

@@ -88,13 +88,7 @@ fn check_query(
             check_query(&cte.query, ctx, allow_scalar, issues, cte_has_columns);
         }
     }
-    check_set_expr(
-        &query.body,
-        ctx,
-        allow_scalar,
-        issues,
-        has_cte_column_list,
-    );
+    check_set_expr(&query.body, ctx, allow_scalar, issues, has_cte_column_list);
 }
 
 fn check_set_expr(

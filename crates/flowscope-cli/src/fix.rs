@@ -8,7 +8,7 @@
 use crate::fix_engine::{
     apply_edits as apply_patch_edits, derive_protected_ranges, plan_fixes, BlockedReason,
     Edit as PatchEdit, Fix as PatchFix, FixApplicability as PatchApplicability,
-    ProtectedRange as PatchProtectedRange,
+    ProtectedRange as PatchProtectedRange, ProtectedRangeKind as PatchProtectedRangeKind,
 };
 use flowscope_core::linter::config::canonicalize_rule_code;
 use flowscope_core::{
@@ -45,6 +45,12 @@ impl FixCounts {
 
     pub fn get(&self, code: &str) -> usize {
         self.by_rule.get(code).copied().unwrap_or(0)
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        for (code, count) in &other.by_rule {
+            self.add(code, *count);
+        }
     }
 
     fn from_removed(before: &BTreeMap<String, usize>, after: &BTreeMap<String, usize>) -> Self {
@@ -213,7 +219,13 @@ pub fn apply_lint_fixes_with_options(
 
     let before_issues = lint_issues(sql, dialect, lint_config);
     let before_counts = lint_rule_counts_from_issues(&before_issues);
-    let core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
+    let mut core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
+    core_candidates.extend(build_al001_fallback_candidates(
+        sql,
+        dialect,
+        &before_issues,
+        lint_config,
+    ));
     let core_autofix_rules =
         collect_core_autofix_rules(&before_issues, fix_options.include_unsafe_fixes);
     let mut candidates = Vec::new();
@@ -234,7 +246,7 @@ pub fn apply_lint_fixes_with_options(
 
         let rewritten_sql = render_statements(&statements, sql);
         let rewritten_sql = if safe_rule_filter.allows(issue_codes::LINT_AL_001) {
-            rewritten_sql
+            apply_configured_table_alias_style(&rewritten_sql, dialect, lint_config)
         } else {
             preserve_original_table_alias_style(sql, &rewritten_sql, dialect)
         };
@@ -252,7 +264,7 @@ pub fn apply_lint_fixes_with_options(
             }
             let unsafe_sql = render_statements(&unsafe_statements, sql);
             let unsafe_sql = if rule_filter.allows(issue_codes::LINT_AL_001) {
-                unsafe_sql
+                apply_configured_table_alias_style(&unsafe_sql, dialect, lint_config)
             } else {
                 preserve_original_table_alias_style(sql, &unsafe_sql, dialect)
             };
@@ -298,6 +310,15 @@ pub fn apply_lint_fixes_with_options(
         ) {
             return Ok(outcome);
         }
+        if let Some(outcome) = try_incremental_core_fix_plan(
+            sql,
+            dialect,
+            lint_config,
+            &before_counts,
+            fix_options.include_unsafe_fixes,
+        ) {
+            return Ok(outcome);
+        }
 
         return Ok(FixOutcome {
             sql: sql.to_string(),
@@ -323,44 +344,58 @@ pub fn apply_lint_fixes_with_options(
         ) {
             return Ok(outcome);
         }
+        if let Some(outcome) = try_incremental_core_fix_plan(
+            sql,
+            dialect,
+            lint_config,
+            &before_counts,
+            fix_options.include_unsafe_fixes,
+        ) {
+            return Ok(outcome);
+        }
+    }
+
+    // Strict regression guard: never apply a fix set that increases total
+    // violations, even if some rules improved.
+    if after_total > before_total {
+        if let Some(outcome) = try_core_only_fix_plan(
+            sql,
+            dialect,
+            lint_config,
+            &before_counts,
+            &core_candidates,
+            &protected_ranges,
+            fix_options.include_unsafe_fixes,
+        ) {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = try_incremental_core_fix_plan(
+            sql,
+            dialect,
+            lint_config,
+            &before_counts,
+            fix_options.include_unsafe_fixes,
+        ) {
+            return Ok(outcome);
+        }
+
+        return Ok(FixOutcome {
+            sql: sql.to_string(),
+            counts: FixCounts::default(),
+            changed: false,
+            skipped_due_to_comments: false,
+            skipped_due_to_regression: true,
+            skipped_counts: planned.skipped,
+        });
     }
 
     if counts.total() == 0 {
-        // Regression guard: no rules improved. Flag as regression if total violations
-        // actually increased (text-fix side effects introduced new violations).
-        if after_total > before_total {
-            if let Some(outcome) = try_core_only_fix_plan(
-                sql,
-                dialect,
-                lint_config,
-                &before_counts,
-                &core_candidates,
-                &protected_ranges,
-                fix_options.include_unsafe_fixes,
-            ) {
-                return Ok(outcome);
-            }
-        }
-
-        if fixed_sql != sql
-            && allow_no_improvement_lt02_fix(&core_autofix_rules, &before_counts, &after_counts)
-        {
-            return Ok(FixOutcome {
-                sql: fixed_sql,
-                counts,
-                changed: true,
-                skipped_due_to_comments: false,
-                skipped_due_to_regression: false,
-                skipped_counts: planned.skipped,
-            });
-        }
-
         return Ok(FixOutcome {
             sql: sql.to_string(),
             counts,
             changed: false,
             skipped_due_to_comments: false,
-            skipped_due_to_regression: after_total > before_total,
+            skipped_due_to_regression: false,
             skipped_counts: planned.skipped,
         });
     }
@@ -646,26 +681,6 @@ fn core_autofix_rules_not_improved(
     })
 }
 
-fn allow_no_improvement_lt02_fix(
-    core_autofix_rules: &HashSet<String>,
-    before_counts: &BTreeMap<String, usize>,
-    after_counts: &BTreeMap<String, usize>,
-) -> bool {
-    if core_autofix_rules.len() != 1 || !core_autofix_rules.contains(issue_codes::LINT_LT_002) {
-        return false;
-    }
-
-    let before_lt02 = before_counts
-        .get(issue_codes::LINT_LT_002)
-        .copied()
-        .unwrap_or(0);
-    let after_lt02 = after_counts
-        .get(issue_codes::LINT_LT_002)
-        .copied()
-        .unwrap_or(0);
-    before_lt02 > 0 && before_lt02 == after_lt02
-}
-
 fn parse_errors_increased(
     before_counts: &BTreeMap<String, usize>,
     after_counts: &BTreeMap<String, usize>,
@@ -730,6 +745,254 @@ fn try_core_only_fix_plan(
     })
 }
 
+fn is_incremental_core_candidate(candidate: &FixCandidate, allow_unsafe: bool) -> bool {
+    if candidate.source != FixCandidateSource::CoreAutofix {
+        return false;
+    }
+
+    let Some(rule_code) = candidate.rule_code.as_deref() else {
+        return false;
+    };
+    if core_autofix_conflict_priority(Some(rule_code)) != 0 {
+        return false;
+    }
+
+    match candidate.applicability {
+        FixCandidateApplicability::Safe => true,
+        FixCandidateApplicability::Unsafe => allow_unsafe,
+        FixCandidateApplicability::DisplayOnly => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Al001AliasingPreference {
+    Explicit,
+    Implicit,
+}
+
+fn al001_aliasing_preference(lint_config: &LintConfig) -> Al001AliasingPreference {
+    if lint_config
+        .rule_option_str(issue_codes::LINT_AL_001, "aliasing")
+        .is_some_and(|value| value.eq_ignore_ascii_case("implicit"))
+    {
+        Al001AliasingPreference::Implicit
+    } else {
+        Al001AliasingPreference::Explicit
+    }
+}
+
+fn build_al001_fallback_candidates(
+    sql: &str,
+    dialect: Dialect,
+    issues: &[Issue],
+    lint_config: &LintConfig,
+) -> Vec<FixCandidate> {
+    let fallback_issues: Vec<&Issue> = issues
+        .iter()
+        .filter(|issue| {
+            issue.code.eq_ignore_ascii_case(issue_codes::LINT_AL_001) && issue.span.is_some()
+        })
+        .collect();
+    if fallback_issues.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(tokens) = alias_tokenize_with_offsets(sql, dialect) else {
+        return Vec::new();
+    };
+
+    let preference = al001_aliasing_preference(lint_config);
+    let mut candidates = Vec::new();
+    for issue in fallback_issues {
+        let Some(span) = issue.span else {
+            continue;
+        };
+        let alias_start = span.start.min(sql.len());
+        let previous_token = tokens
+            .iter()
+            .rev()
+            .find(|token| token.end <= alias_start && !is_alias_trivia_token(&token.token));
+
+        match preference {
+            Al001AliasingPreference::Explicit => {
+                if previous_token.is_some_and(|token| is_as_token(&token.token)) {
+                    continue;
+                }
+                let replacement = if has_whitespace_before_offset(sql, alias_start) {
+                    "AS "
+                } else {
+                    " AS "
+                };
+                candidates.push(FixCandidate {
+                    start: alias_start,
+                    end: alias_start,
+                    replacement: replacement.to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::CoreAutofix,
+                    rule_code: Some(issue_codes::LINT_AL_001.to_string()),
+                });
+            }
+            Al001AliasingPreference::Implicit => {
+                let Some(as_token) = previous_token.filter(|token| is_as_token(&token.token))
+                else {
+                    continue;
+                };
+                candidates.push(FixCandidate {
+                    start: as_token.start,
+                    end: alias_start,
+                    replacement: " ".to_string(),
+                    applicability: FixCandidateApplicability::Safe,
+                    source: FixCandidateSource::CoreAutofix,
+                    rule_code: Some(issue_codes::LINT_AL_001.to_string()),
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+fn merge_skipped_counts(total: &mut FixSkippedCounts, current: &FixSkippedCounts) {
+    total.unsafe_skipped += current.unsafe_skipped;
+    total.protected_range_blocked += current.protected_range_blocked;
+    total.overlap_conflict_blocked += current.overlap_conflict_blocked;
+    total.display_only += current.display_only;
+}
+
+fn try_incremental_core_fix_plan(
+    sql: &str,
+    dialect: Dialect,
+    lint_config: &LintConfig,
+    before_counts: &BTreeMap<String, usize>,
+    allow_unsafe: bool,
+) -> Option<FixOutcome> {
+    let mut current_sql = sql.to_string();
+    let mut current_counts = before_counts.clone();
+    let mut changed = false;
+    let mut skipped_counts = FixSkippedCounts::default();
+
+    const MAX_ITERATIONS: usize = 24;
+    for _ in 0..MAX_ITERATIONS {
+        let issues = lint_issues(&current_sql, dialect, lint_config);
+        let mut all_candidates = build_fix_candidates_from_issue_autofixes(&current_sql, &issues);
+        all_candidates.extend(build_al001_fallback_candidates(
+            &current_sql,
+            dialect,
+            &issues,
+            lint_config,
+        ));
+        let candidates = all_candidates
+            .into_iter()
+            .filter(|candidate| is_incremental_core_candidate(candidate, allow_unsafe))
+            .collect::<Vec<_>>();
+
+        if candidates.is_empty() {
+            break;
+        }
+
+        let mut by_rule: BTreeMap<String, Vec<FixCandidate>> = BTreeMap::new();
+        for candidate in candidates {
+            if let Some(rule_code) = candidate.rule_code.clone() {
+                by_rule.entry(rule_code).or_default().push(candidate);
+            }
+        }
+
+        if by_rule.is_empty() {
+            break;
+        }
+
+        let protected_ranges =
+            collect_comment_protected_ranges(&current_sql, dialect, !allow_unsafe);
+        let current_total: usize = current_counts.values().sum();
+
+        let mut best_rule: Option<String> = None;
+        let mut best_sql: Option<String> = None;
+        let mut best_counts: Option<BTreeMap<String, usize>> = None;
+        let mut best_removed = 0usize;
+        let mut best_after_total = usize::MAX;
+
+        for (rule_code, rule_candidates) in by_rule {
+            let planned = plan_fix_candidates(
+                &current_sql,
+                rule_candidates,
+                &protected_ranges,
+                allow_unsafe,
+            );
+            merge_skipped_counts(&mut skipped_counts, &planned.skipped);
+
+            if planned.edits.is_empty() {
+                continue;
+            }
+
+            let candidate_sql = apply_planned_edits(&current_sql, &planned.edits);
+            if candidate_sql == current_sql {
+                continue;
+            }
+
+            let candidate_counts = lint_rule_counts(&candidate_sql, dialect, lint_config);
+            if parse_errors_increased(&current_counts, &candidate_counts) {
+                continue;
+            }
+
+            let candidate_after_total: usize = candidate_counts.values().sum();
+            if candidate_after_total > current_total {
+                continue;
+            }
+
+            let candidate_removed =
+                FixCounts::from_removed(&current_counts, &candidate_counts).total();
+            if candidate_removed == 0 {
+                continue;
+            }
+
+            let better = candidate_removed > best_removed
+                || (candidate_removed == best_removed && candidate_after_total < best_after_total)
+                || (candidate_removed == best_removed
+                    && candidate_after_total == best_after_total
+                    && best_rule
+                        .as_ref()
+                        .is_none_or(|current_best| rule_code < *current_best));
+
+            if better {
+                best_removed = candidate_removed;
+                best_after_total = candidate_after_total;
+                best_rule = Some(rule_code);
+                best_sql = Some(candidate_sql);
+                best_counts = Some(candidate_counts);
+            }
+        }
+
+        let Some(next_sql) = best_sql else {
+            break;
+        };
+        let Some(next_counts) = best_counts else {
+            break;
+        };
+
+        current_sql = next_sql;
+        current_counts = next_counts;
+        changed = true;
+    }
+
+    if !changed || current_sql == sql {
+        return None;
+    }
+
+    let final_counts = FixCounts::from_removed(before_counts, &current_counts);
+    if final_counts.total() == 0 {
+        return None;
+    }
+
+    Some(FixOutcome {
+        sql: current_sql,
+        counts: final_counts,
+        changed: true,
+        skipped_due_to_comments: false,
+        skipped_due_to_regression: false,
+        skipped_counts,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct TableAliasOccurrence {
     alias_key: String,
@@ -775,6 +1038,58 @@ fn preserve_original_table_alias_style(
     apply_byte_removals(fixed_sql, removals)
 }
 
+fn apply_configured_table_alias_style(
+    sql: &str,
+    dialect: Dialect,
+    lint_config: &LintConfig,
+) -> String {
+    let prefer_implicit = matches!(
+        al001_aliasing_preference(lint_config),
+        Al001AliasingPreference::Implicit
+    );
+    enforce_table_alias_style(sql, dialect, prefer_implicit)
+}
+
+fn enforce_table_alias_style(sql: &str, dialect: Dialect, prefer_implicit: bool) -> String {
+    let Some(aliases) = table_alias_occurrences(sql, dialect) else {
+        return sql.to_string();
+    };
+
+    if prefer_implicit {
+        let removals: Vec<(usize, usize)> = aliases
+            .into_iter()
+            .filter_map(|alias| {
+                if alias.explicit_as {
+                    alias.as_start.map(|as_start| (as_start, alias.alias_start))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        return apply_byte_removals(sql, removals);
+    }
+
+    let insertions: Vec<(usize, &'static str)> = aliases
+        .into_iter()
+        .filter(|alias| !alias.explicit_as)
+        .map(|alias| {
+            let insertion = if has_whitespace_before_offset(sql, alias.alias_start) {
+                "AS "
+            } else {
+                " AS "
+            };
+            (alias.alias_start, insertion)
+        })
+        .collect();
+    apply_byte_insertions(sql, insertions)
+}
+
+fn has_whitespace_before_offset(sql: &str, offset: usize) -> bool {
+    sql.get(..offset)
+        .and_then(|prefix| prefix.chars().next_back())
+        .is_some_and(char::is_whitespace)
+}
+
 fn apply_byte_removals(sql: &str, mut removals: Vec<(usize, usize)>) -> String {
     if removals.is_empty() {
         return sql.to_string();
@@ -789,6 +1104,38 @@ fn apply_byte_removals(sql: &str, mut removals: Vec<(usize, usize)>) -> String {
             out.replace_range(start..end, "");
         }
     }
+    out
+}
+
+fn apply_byte_insertions(sql: &str, mut insertions: Vec<(usize, &'static str)>) -> String {
+    if insertions.is_empty() {
+        return sql.to_string();
+    }
+
+    insertions.retain(|(offset, _)| *offset <= sql.len());
+    if insertions.is_empty() {
+        return sql.to_string();
+    }
+
+    insertions
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+    insertions.dedup_by(|left, right| left.0 == right.0);
+
+    let extra_len: usize = insertions
+        .iter()
+        .map(|(_, insertion)| insertion.len())
+        .sum();
+    let mut out = String::with_capacity(sql.len() + extra_len);
+    let mut cursor = 0usize;
+    for (offset, insertion) in insertions {
+        if offset < cursor || offset > sql.len() {
+            continue;
+        }
+        out.push_str(&sql[cursor..offset]);
+        out.push_str(insertion);
+        cursor = offset;
+    }
+    out.push_str(&sql[cursor..]);
     out
 }
 
@@ -981,6 +1328,14 @@ fn build_fix_candidates_from_issue_values(
             .get("code")
             .and_then(serde_json::Value::as_str)
             .map(|code| code.to_string());
+        if issue_rule_code
+            .as_deref()
+            .is_some_and(|code| code.eq_ignore_ascii_case(issue_codes::LINT_AL_001))
+        {
+            // AL01 core-autofix edits can be malformed in complex statement shapes.
+            // We generate robust AL01 candidates from spans separately.
+            continue;
+        }
         let Some(autofix) = issue.get("autofix").or_else(|| issue.get("autoFix")) else {
             continue;
         };
@@ -1293,6 +1648,9 @@ fn collect_comment_protected_ranges(
     }
 
     derive_protected_ranges(sql, dialect)
+        .into_iter()
+        .filter(|range| matches!(range.kind, PatchProtectedRangeKind::TemplateTag))
+        .collect()
 }
 
 fn derive_localized_span_edits(original: &str, rewritten: &str) -> Vec<SpanEdit> {
@@ -1447,7 +1805,9 @@ fn table_alias_occurrences(sql: &str, dialect: Dialect) -> Option<Vec<TableAlias
 
     let mut occurrences = Vec::with_capacity(aliases.len());
     for alias in aliases {
-        let (alias_start, _alias_end) = alias_ident_span_offsets(sql, &alias)?;
+        let Some((alias_start, _alias_end)) = alias_ident_span_offsets(sql, &alias) else {
+            continue;
+        };
         let previous_token = tokens
             .iter()
             .rev()
@@ -2909,47 +3269,28 @@ mod tests {
     }
 
     #[test]
-    fn allow_no_improvement_lt02_fix_requires_only_lt02_core_rule() {
-        let core_rules = std::collections::HashSet::from([issue_codes::LINT_LT_002.to_string()]);
+    fn lint_improvements_can_mask_total_violation_regressions() {
         let before = std::collections::BTreeMap::from([
-            (issue_codes::LINT_LT_002.to_string(), 1usize),
-            (issue_codes::PARSE_ERROR.to_string(), 2usize),
+            (issue_codes::LINT_LT_002.to_string(), 2usize),
+            (issue_codes::LINT_LT_001.to_string(), 0usize),
         ]);
         let after = std::collections::BTreeMap::from([
             (issue_codes::LINT_LT_002.to_string(), 1usize),
-            (issue_codes::PARSE_ERROR.to_string(), 2usize),
+            (issue_codes::LINT_LT_001.to_string(), 2usize),
         ]);
-        assert!(allow_no_improvement_lt02_fix(&core_rules, &before, &after));
+        let removed = FixCounts::from_removed(&before, &after);
+        let before_total: usize = before.values().sum();
+        let after_total: usize = after.values().sum();
 
-        let mixed_rules = std::collections::HashSet::from([
-            issue_codes::LINT_LT_002.to_string(),
-            issue_codes::LINT_LT_001.to_string(),
-        ]);
-        assert!(!allow_no_improvement_lt02_fix(
-            &mixed_rules,
-            &before,
-            &after
-        ));
-    }
-
-    #[test]
-    fn allow_no_improvement_lt02_fix_requires_stable_lt02_count() {
-        let core_rules = std::collections::HashSet::from([issue_codes::LINT_LT_002.to_string()]);
-        let before = std::collections::BTreeMap::from([(issue_codes::LINT_LT_002.to_string(), 2)]);
-        let improved =
-            std::collections::BTreeMap::from([(issue_codes::LINT_LT_002.to_string(), 1)]);
-        let regressed =
-            std::collections::BTreeMap::from([(issue_codes::LINT_LT_002.to_string(), 3)]);
-        assert!(!allow_no_improvement_lt02_fix(
-            &core_rules,
-            &before,
-            &improved
-        ));
-        assert!(!allow_no_improvement_lt02_fix(
-            &core_rules,
-            &before,
-            &regressed
-        ));
+        assert_eq!(
+            removed.total(),
+            1,
+            "a rule-level improvement can still be observed"
+        );
+        assert!(
+            after_total > before_total,
+            "strict regression guard must reject net-violation increases"
+        );
     }
 
     fn assert_rule_case(
@@ -4233,16 +4574,17 @@ mod tests {
 
     #[test]
     fn planner_blocks_protected_ranges_and_applies_non_overlapping_edits() {
-        let sql = "-- keep\nSELECT 1";
+        let sql = "SELECT '{{foo}}' AS templated, 1";
         let protected = collect_comment_protected_ranges(sql, Dialect::Generic, true);
+        let template_idx = sql.find("{{foo}}").expect("template exists");
         let one_idx = sql.rfind('1').expect("digit exists");
 
         let planned = plan_fix_candidates(
             sql,
             vec![
                 FixCandidate {
-                    start: 0,
-                    end: 7,
+                    start: template_idx,
+                    end: template_idx + "{{foo}}".len(),
                     replacement: String::new(),
                     applicability: FixCandidateApplicability::Safe,
                     source: FixCandidateSource::PrimaryRewrite,
@@ -4263,8 +4605,8 @@ mod tests {
 
         let applied = apply_planned_edits(sql, &planned.edits);
         assert!(
-            applied.contains("-- keep"),
-            "comment should remain: {applied}"
+            applied.contains("{{foo}}"),
+            "template span should remain protected: {applied}"
         );
         assert!(
             applied.ends_with("2"),
@@ -5083,6 +5425,58 @@ mod tests {
             0,
             "AL001 should be resolved under implicit mode: {}",
             out.sql
+        );
+    }
+
+    #[test]
+    fn table_alias_occurrences_handles_with_insert_select_aliases() {
+        let sql = r#"
+WITH params AS (
+    SELECT now() - interval '1 day' AS period_start, now() AS period_end
+),
+overall AS (
+    SELECT route, nav_type, mark FROM metrics.page_performance
+),
+device_breakdown AS (
+    SELECT route, nav_type, mark FROM (
+        SELECT route, nav_type, mark FROM metrics.page_performance
+    ) sub
+),
+network_breakdown AS (
+    SELECT route, nav_type, mark FROM (
+        SELECT route, nav_type, mark FROM metrics.page_performance
+    ) sub
+),
+version_breakdown AS (
+    SELECT route, nav_type, mark FROM (
+        SELECT route, nav_type, mark FROM metrics.page_performance
+    ) sub
+)
+INSERT INTO metrics.page_performance_summary (route, period_start, period_end, nav_type, mark)
+SELECT o.route, p.period_start, p.period_end, o.nav_type, o.mark
+FROM overall o
+CROSS JOIN params p
+LEFT JOIN device_breakdown d ON d.route = o.route
+LEFT JOIN network_breakdown n ON n.route = o.route
+LEFT JOIN version_breakdown v ON v.route = o.route
+ON CONFLICT (route, period_start, nav_type, mark) DO UPDATE SET
+    period_end = EXCLUDED.period_end;
+"#;
+
+        let occurrences = table_alias_occurrences(sql, Dialect::Postgres)
+            .expect("alias occurrences should parse");
+        let implicit_count = occurrences
+            .iter()
+            .filter(|alias| !alias.explicit_as)
+            .count();
+        assert!(
+            implicit_count >= 8,
+            "expected implicit aliases in CTE+INSERT query, got {}: {:?}",
+            implicit_count,
+            occurrences
+                .iter()
+                .map(|alias| (&alias.alias_key, alias.explicit_as))
+                .collect::<Vec<_>>()
         );
     }
 
