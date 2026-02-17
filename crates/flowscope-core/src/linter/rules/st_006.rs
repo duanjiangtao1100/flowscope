@@ -493,7 +493,14 @@ struct PositionedToken {
 
 #[derive(Clone, Debug)]
 struct SelectProjectionSegment {
-    item_spans: Vec<Span>,
+    items: Vec<SelectProjectionItem>,
+}
+
+#[derive(Clone, Debug)]
+struct SelectProjectionItem {
+    core_span: Span,
+    leading_span: Span,
+    trailing_span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -623,7 +630,7 @@ fn st006_autofix_candidates_for_context(
             break;
         }
         let violation = &violations[violation_idx];
-        if segment.item_spans.len() != violation.bands.len() {
+        if segment.items.len() != violation.bands.len() {
             continue;
         }
 
@@ -661,13 +668,13 @@ fn st006_violation_spans(ctx: &LintContext, violations: &[ViolationInfo]) -> Vec
             break;
         }
         let violation = &violations[violation_idx];
-        if segment.item_spans.len() != violation.bands.len() {
+        if segment.items.len() != violation.bands.len() {
             continue;
         }
 
         // Use the first item span as the violation location.
-        if let Some(first) = segment.item_spans.first() {
-            spans.push(*first);
+        if let Some(first) = segment.items.first() {
+            spans.push(first.core_span);
         }
         violation_idx += 1;
     }
@@ -726,7 +733,7 @@ fn select_projection_segments(tokens: &[PositionedToken]) -> Vec<SelectProjectio
             continue;
         }
 
-        let item_spans = projection_item_spans(
+        let items = projection_items(
             tokens,
             &significant_positions,
             &depths,
@@ -734,11 +741,11 @@ fn select_projection_segments(tokens: &[PositionedToken]) -> Vec<SelectProjectio
             from_position,
             base_depth,
         );
-        if item_spans.is_empty() {
+        if items.is_empty() {
             continue;
         }
 
-        segments.push(SelectProjectionSegment { item_spans });
+        segments.push(SelectProjectionSegment { items });
     }
 
     segments
@@ -783,44 +790,83 @@ fn from_position_for_select(
     })
 }
 
-fn projection_item_spans(
+fn projection_items(
     tokens: &[PositionedToken],
     significant_positions: &[usize],
     depths: &[usize],
     start_position: usize,
     from_position: usize,
     base_depth: usize,
-) -> Vec<Span> {
+) -> Vec<SelectProjectionItem> {
     if start_position >= from_position {
         return Vec::new();
     }
 
-    let mut spans = Vec::new();
+    let mut core_items: Vec<(usize, usize, Option<usize>)> = Vec::new();
     let mut item_start = start_position;
 
     for position in start_position..from_position {
         let token = &tokens[significant_positions[position]].token;
         if depths[position] == base_depth && matches!(token, Token::Comma) {
             if item_start < position {
-                if let Some(span) =
-                    span_from_positions(tokens, significant_positions, item_start, position - 1)
-                {
-                    spans.push(span);
-                }
+                core_items.push((item_start, position - 1, Some(position)));
             }
             item_start = position + 1;
         }
     }
 
     if item_start < from_position {
-        if let Some(span) =
-            span_from_positions(tokens, significant_positions, item_start, from_position - 1)
-        {
-            spans.push(span);
+        core_items.push((item_start, from_position - 1, None));
+    }
+
+    if core_items.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::with_capacity(core_items.len());
+    let mut previous_comma_end = 0usize;
+    for (index, (core_start_position, core_end_position, comma_position)) in
+        core_items.iter().copied().enumerate()
+    {
+        let Some(core_span) = span_from_positions(
+            tokens,
+            significant_positions,
+            core_start_position,
+            core_end_position,
+        ) else {
+            return Vec::new();
+        };
+
+        let leading_start = if index == 0 {
+            core_span.start
+        } else {
+            previous_comma_end
+        };
+        let leading_end = core_span.start;
+
+        let trailing_end = if let Some(comma_position) = comma_position {
+            tokens[significant_positions[comma_position]].start
+        } else {
+            core_span.end
+        };
+        if trailing_end < core_span.end {
+            return Vec::new();
+        }
+
+        let leading_span = Span::new(leading_start, leading_end);
+        let trailing_span = Span::new(core_span.end, trailing_end);
+        items.push(SelectProjectionItem {
+            core_span,
+            leading_span,
+            trailing_span,
+        });
+
+        if let Some(comma_position) = comma_position {
+            previous_comma_end = tokens[significant_positions[comma_position]].end;
         }
     }
 
-    spans
+    items
 }
 
 fn span_from_positions(
@@ -845,45 +891,87 @@ fn projection_reorder_candidate_by_band(
     segment: &SelectProjectionSegment,
     bands: &[u8],
 ) -> Option<St006AutofixCandidate> {
-    if segment.item_spans.len() != bands.len() {
+    if segment.items.len() != bands.len() {
         return None;
     }
 
     let replace_span = Span::new(
-        segment.item_spans.first()?.start,
-        segment.item_spans.last()?.end,
+        segment.items.first()?.core_span.start,
+        segment.items.last()?.core_span.end,
     );
     if replace_span.start >= replace_span.end || replace_span.end > sql.len() {
         return None;
     }
-    if segment_contains_comment(tokens, replace_span) {
-        return None;
-    }
 
-    let mut item_texts = Vec::with_capacity(segment.item_spans.len());
-    for span in &segment.item_spans {
-        if span.start >= span.end || span.end > sql.len() {
+    let mut normalized_items = Vec::with_capacity(segment.items.len());
+    for item in &segment.items {
+        let core_span = item.core_span;
+        if core_span.start >= core_span.end || core_span.end > sql.len() {
             return None;
         }
-        let text = sql[span.start..span.end].trim();
-        if text.is_empty() || text.contains('\n') || text.contains('\r') {
+        if span_contains_comment(tokens, core_span)
+            || span_contains_comment(tokens, item.trailing_span)
+        {
             return None;
         }
-        item_texts.push(text.to_string());
+        let text = sql[core_span.start..core_span.end].trim();
+        let Some(normalized) = normalize_projection_item_text(text) else {
+            return None;
+        };
+
+        let leading = if item.leading_span.start < item.leading_span.end
+            && item.leading_span.end <= sql.len()
+        {
+            &sql[item.leading_span.start..item.leading_span.end]
+        } else {
+            ""
+        };
+        let trailing = if item.trailing_span.start < item.trailing_span.end
+            && item.trailing_span.end <= sql.len()
+        {
+            &sql[item.trailing_span.start..item.trailing_span.end]
+        } else {
+            ""
+        };
+        normalized_items.push((normalized, leading, trailing));
     }
 
     // Stable sort by band — items with same band keep their relative order.
-    let mut indexed: Vec<(usize, u8, &str)> = item_texts
+    let mut indexed: Vec<(usize, u8)> = normalized_items
         .iter()
         .enumerate()
         .zip(bands.iter())
-        .map(|((i, text), &band)| (i, band, text.as_str()))
+        .map(|((i, _), &band)| (i, band))
         .collect();
-    indexed.sort_by_key(|&(i, band, _)| (band, i));
+    indexed.sort_by_key(|&(i, band)| (band, i));
 
-    let reordered: Vec<&str> = indexed.iter().map(|&(_, _, text)| text).collect();
-    let replacement = reordered.join(", ");
-    if replacement.is_empty() || replacement == sql[replace_span.start..replace_span.end].trim() {
+    let original_segment = &sql[replace_span.start..replace_span.end];
+    let replacement = if original_segment.contains('\n') || original_segment.contains('\r') {
+        let indent = indent_prefix_for_offset(sql, segment.items.first()?.core_span.start);
+        let default_separator = format!(",\n{indent}");
+        let mut rewritten = String::new();
+        for (position, &(item_index, _)) in indexed.iter().enumerate() {
+            let (core_text, leading, trailing) = &normalized_items[item_index];
+            if position > 0 {
+                if leading.is_empty() {
+                    rewritten.push_str(&default_separator);
+                } else {
+                    rewritten.push(',');
+                    rewritten.push_str(leading);
+                }
+            }
+            rewritten.push_str(core_text);
+            rewritten.push_str(trailing);
+        }
+        rewritten
+    } else {
+        indexed
+            .iter()
+            .map(|(item_index, _)| normalized_items[*item_index].0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if replacement.is_empty() || replacement == original_segment {
         return None;
     }
 
@@ -893,10 +981,54 @@ fn projection_reorder_candidate_by_band(
     })
 }
 
-fn segment_contains_comment(tokens: &[PositionedToken], span: Span) -> bool {
+fn span_contains_comment(tokens: &[PositionedToken], span: Span) -> bool {
+    if span.start >= span.end {
+        return false;
+    }
     tokens
         .iter()
         .any(|token| token.start >= span.start && token.end <= span.end && is_comment(&token.token))
+}
+
+fn normalize_projection_item_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains('\n') && !trimmed.contains('\r') {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.contains('\'') || trimmed.contains('"') || trimmed.contains('`') {
+        return Some(trimmed.to_string());
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len());
+    let mut pending_space = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push(ch);
+        pending_space = false;
+    }
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn indent_prefix_for_offset(sql: &str, offset: usize) -> String {
+    let start = sql[..offset].rfind('\n').map_or(0, |idx| idx + 1);
+    sql[start..offset]
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1453,42 @@ SELECT * FROM (SELECT CASE WHEN COL > 1 THEN 'x' ELSE 'y' END AS A, COL AS B FRO
         let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
         let fixed = apply_edits(sql, &autofix.edits);
         assert_eq!(fixed, "SELECT b_field, DATE_TRUNC('DAY', end_time) AS time_day FROM table_name GROUP BY time_day, b_field");
+    }
+
+    #[test]
+    fn autofix_reorders_multiline_targets_without_quotes() {
+        let sql = "SELECT\n    SUM(a) AS total,\n    a\nFROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("a,\n    SUM(a) AS total"),
+            "expected reordered multiline projection, got: {fixed}"
+        );
+
+        parse_sql(&fixed).expect("fixed SQL should remain parseable");
+    }
+
+    #[test]
+    fn autofix_reorders_multiline_targets_with_inter_item_comment() {
+        let sql = "SELECT\n    -- total usage for period\n    SUM(a) AS total,\n    a\nFROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0].autofix.as_ref().expect("expected ST006 autofix");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("-- total usage for period"),
+            "expected inter-item comment to be preserved, got: {fixed}"
+        );
+        assert!(
+            fixed.contains("a,\n    SUM(a) AS total"),
+            "expected reordered projection, got: {fixed}"
+        );
+
+        parse_sql(&fixed).expect("fixed SQL should remain parseable");
     }
 
     #[test]

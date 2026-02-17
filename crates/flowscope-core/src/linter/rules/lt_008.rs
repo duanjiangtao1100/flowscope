@@ -155,6 +155,15 @@ fn lt08_violation_spans(
                         {
                             autofix_span =
                                 Some((fix_start - statement_start, fix_end - statement_start));
+                        } else if let Some(comment_start) =
+                            first_comment_start_in_range(&tokens, comma_end, after_comma_start)
+                        {
+                            if let Some((fix_start, fix_end)) =
+                                whitespace_gap_span(ctx.sql, comma_end, comment_start)
+                            {
+                                autofix_span =
+                                    Some((fix_start - statement_start, fix_end - statement_start));
+                            }
                         }
                     }
                 } else if next_token.eq_ignore_ascii_case("SELECT")
@@ -177,6 +186,15 @@ fn lt08_violation_spans(
                         {
                             autofix_span =
                                 Some((fix_start - statement_start, fix_end - statement_start));
+                        } else if let Some(comment_start) =
+                            first_comment_start_in_range(&tokens, after_comma, next_start)
+                        {
+                            if let Some((fix_start, fix_end)) =
+                                whitespace_gap_span(ctx.sql, after_comma, comment_start)
+                            {
+                                autofix_span =
+                                    Some((fix_start - statement_start, fix_end - statement_start));
+                            }
                         }
                     }
                 } else if gap_start == next_start
@@ -453,6 +471,29 @@ fn is_trivia_token(token: &Token) -> bool {
     )
 }
 
+fn is_comment_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Whitespace(Whitespace::SingleLineComment { .. })
+            | Token::Whitespace(Whitespace::MultiLineComment(_))
+    )
+}
+
+fn first_comment_start_in_range(
+    tokens: &[LocatedToken],
+    start_offset: usize,
+    end_offset: usize,
+) -> Option<usize> {
+    tokens
+        .iter()
+        .find(|token| {
+            token.start >= start_offset
+                && token.start < end_offset
+                && is_comment_token(&token.token)
+        })
+        .map(|token| token.start)
+}
+
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
     if line == 0 || column == 0 {
         return None;
@@ -640,6 +681,27 @@ SELECT * FROM b");
         assert_eq!(
             fixed,
             "WITH a AS (SELECT 1),\n\nb AS (SELECT 2)\n\nSELECT * FROM b"
+        );
+    }
+
+    #[test]
+    fn trailing_comma_cte_autofix_preserves_comment_between_ctes() {
+        let sql = "WITH a AS (SELECT 1),\n-- keep this note\nb AS (SELECT 2)\nSELECT * FROM b";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let mut edits = issues
+            .iter()
+            .filter_map(|issue| issue.autofix.as_ref())
+            .flat_map(|autofix| autofix.edits.clone())
+            .collect::<Vec<_>>();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        let mut fixed = sql.to_string();
+        for edit in edits.into_iter().rev() {
+            fixed.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        assert_eq!(
+            fixed,
+            "WITH a AS (SELECT 1),\n\n-- keep this note\nb AS (SELECT 2)\n\nSELECT * FROM b"
         );
     }
 }

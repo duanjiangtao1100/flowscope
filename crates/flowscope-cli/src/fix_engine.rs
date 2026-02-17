@@ -5,7 +5,7 @@
 //! - `apply_edits()` applies byte-range replacements end-to-start.
 //! - protected range helpers mark SQL comments/string literals and template tags.
 
-use flowscope_core::Dialect;
+use flowscope_core::{issue_codes, Dialect};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -367,6 +367,11 @@ pub fn plan_fixes(
         }
 
         for touched in touched_protected_ranges(&fix.edits, &normalized_protected_ranges) {
+            if touched.kind == ProtectedRangeKind::TemplateTag
+                && template_edits_allowed(&fix.rule_code)
+            {
+                continue;
+            }
             reasons.push(BlockedReason::TouchesProtectedRange {
                 kind: touched.kind,
                 start_byte: touched.start_byte,
@@ -558,6 +563,10 @@ fn normalize_protected_ranges(mut ranges: Vec<ProtectedRange>) -> Vec<ProtectedR
     });
     ranges.dedup();
     ranges
+}
+
+fn template_edits_allowed(rule_code: &str) -> bool {
+    rule_code.eq_ignore_ascii_case(issue_codes::LINT_LT_005)
 }
 
 fn is_edit_range_valid_for_source(source: &str, edit: &Edit) -> bool {
@@ -803,5 +812,23 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn planner_allows_lt05_edits_that_move_template_tags() {
+        let source = "SELECT {{ foo }} FROM tbl";
+        let protected = derive_protected_ranges(source, Dialect::Generic);
+        let fix = safe_fix(
+            "LINT_LT_005",
+            0,
+            None,
+            0,
+            source.len(),
+            "SELECT {{ foo }}\nFROM tbl",
+        );
+
+        let plan = plan_fixes(source, vec![fix], &[FixApplicability::Safe], &protected);
+        assert_eq!(plan.accepted.len(), 1);
+        assert!(plan.blocked.is_empty());
     }
 }

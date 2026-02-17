@@ -136,7 +136,7 @@ fn check_table_factor_joins(
         seen_sources.push(base);
     }
 
-    for join in joins {
+    for (join_index, join) in joins.iter().enumerate() {
         // Recurse into nested join relations on the right side.
         if let TableFactor::NestedJoin {
             table_with_joins, ..
@@ -168,37 +168,44 @@ fn check_table_factor_joins(
                     })
                     .cloned();
 
-                if let Some(previous) = matching_previous {
-                    let left = preference.left_source(current, previous.as_str());
-                    let right = preference.right_source(current, previous.as_str());
+                if matching_previous.is_some() {
+                    let mut issue_span = expr_statement_offsets(ctx, on_expr)
+                        .map(|(expr_start, expr_end)| {
+                            ctx.span_from_statement_offset(expr_start, expr_end)
+                        })
+                        .unwrap_or_else(|| Span::new(0, 0));
+                    let mut edits: Vec<IssuePatchEdit> = Vec::new();
 
                     if let Some((span, replacement)) =
-                        join_condition_autofix(ctx, on_expr, left, right)
+                        join_condition_autofix_for_sources(ctx, on_expr, current, seen_sources)
                     {
-                        issues.push(
-                            Issue::info(
-                                issue_codes::LINT_ST_009,
-                                "Join condition ordering appears inconsistent with configured preference.",
-                            )
-                            .with_statement(ctx.statement_index)
-                            .with_span(span)
-                            .with_autofix_edits(
-                                IssueAutofixApplicability::Safe,
-                                vec![IssuePatchEdit::new(span, replacement)],
-                            ),
-                        );
-                    } else if let Some((expr_start, expr_end)) =
-                        expr_statement_offsets(ctx, on_expr)
-                    {
-                        let span = ctx.span_from_statement_offset(expr_start, expr_end);
-                        issues.push(
-                            Issue::info(
-                                issue_codes::LINT_ST_009,
-                                "Join condition ordering appears inconsistent with configured preference.",
-                            )
-                            .with_statement(ctx.statement_index)
-                            .with_span(span),
-                        );
+                        issue_span = span;
+                        edits.push(IssuePatchEdit::new(span, replacement));
+                    }
+
+                    let mut seen_for_following = seen_sources.clone();
+                    if let Some(name) = join_name.as_ref() {
+                        seen_for_following.push(name.clone());
+                    }
+                    edits.extend(collect_following_join_autofixes(
+                        &joins[join_index + 1..],
+                        &seen_for_following,
+                        preference,
+                        ctx,
+                    ));
+
+                    if issue_span.start != issue_span.end {
+                        let mut issue = Issue::info(
+                            issue_codes::LINT_ST_009,
+                            "Join condition ordering appears inconsistent with configured preference.",
+                        )
+                        .with_statement(ctx.statement_index)
+                        .with_span(issue_span);
+                        if !edits.is_empty() {
+                            issue =
+                                issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+                        }
+                        issues.push(issue);
                     }
                 }
             }
@@ -208,6 +215,44 @@ fn check_table_factor_joins(
             seen_sources.push(name);
         }
     }
+}
+
+fn collect_following_join_autofixes(
+    joins: &[sqlparser::ast::Join],
+    seen_sources: &[String],
+    preference: PreferredFirstTableInJoinClause,
+    ctx: &LintContext,
+) -> Vec<IssuePatchEdit> {
+    let mut seen = seen_sources.to_vec();
+    let mut edits = Vec::new();
+
+    for join in joins {
+        let join_name = table_factor_reference_name(&join.relation);
+        if let (Some(current), Some(on_expr)) = (join_name.as_ref(), join_on_expr(&join.join_operator))
+        {
+            let matching_previous = seen
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    let left = preference.left_source(current, candidate.as_str());
+                    let right = preference.right_source(current, candidate.as_str());
+                    has_join_pair(on_expr, left, right)
+                })
+                .cloned();
+            if matching_previous.is_some() {
+                if let Some((span, replacement)) =
+                    join_condition_autofix_for_sources(ctx, on_expr, current, &seen)
+                {
+                    edits.push(IssuePatchEdit::new(span, replacement));
+                }
+            }
+        }
+        if let Some(name) = join_name {
+            seen.push(name);
+        }
+    }
+
+    edits
 }
 
 fn is_comparison_operator(op: &BinaryOperator) -> bool {
@@ -285,35 +330,46 @@ fn has_join_pair(expr: &Expr, left_source_name: &str, right_source_name: &str) -
 
 /// Produce source-text-level edits that swap individual reversed comparison
 /// pairs while preserving original formatting, quoting, and keyword casing.
-fn join_condition_autofix(
+fn join_condition_autofix_for_sources(
     ctx: &LintContext,
     on_expr: &Expr,
     current_source: &str,
-    previous_source: &str,
+    previous_sources: &[String],
 ) -> Option<(Span, String)> {
-    let sql = ctx.statement_sql();
-
-    // Collect text-level edits for each reversed pair.
-    let mut edits: Vec<(usize, usize, String)> = Vec::new();
-    collect_reversed_pair_edits(ctx, on_expr, current_source, previous_source, &mut edits);
-
-    if edits.is_empty() {
+    if previous_sources.is_empty() {
         return None;
     }
-
-    // Sort edits by position (ascending) for deterministic application.
-    edits.sort_by_key(|(start, _, _)| *start);
-
-    // Build replacement by applying text edits to the overall ON expression
-    // source span.
+    let sql = ctx.statement_sql();
     let (expr_start, expr_end) = expr_statement_offsets(ctx, on_expr)?;
     if expr_start > expr_end || expr_end > sql.len() {
         return None;
     }
     let expr_span = ctx.span_from_statement_offset(expr_start, expr_end);
+    let expr_source = &sql[expr_start..expr_end];
 
-    let source = &sql[expr_start..expr_end];
-    let mut result = String::with_capacity(source.len());
+    // Collect text-level edits for each reversed pair.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    for previous_source in previous_sources {
+        collect_reversed_pair_edits(ctx, on_expr, current_source, previous_source, &mut edits);
+    }
+
+    if edits.is_empty() {
+        return ast_join_condition_autofix_for_sources(
+            on_expr,
+            expr_span,
+            expr_source,
+            current_source,
+            previous_sources,
+        );
+    }
+
+    // Sort edits by position (ascending) for deterministic application.
+    edits.sort_by_key(|(start, _, _)| *start);
+    edits.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1 && left.2 == right.2);
+
+    // Build replacement by applying text edits to the overall ON expression
+    // source span.
+    let mut result = String::with_capacity(expr_source.len());
     let mut cursor = expr_start;
 
     for (edit_start, edit_end, replacement) in &edits {
@@ -323,18 +379,149 @@ fn join_condition_autofix(
             || *edit_start < cursor
         {
             // Overlapping edits — bail out to avoid corruption.
-            return None;
+            return ast_join_condition_autofix_for_sources(
+                on_expr,
+                expr_span,
+                expr_source,
+                current_source,
+                previous_sources,
+            );
         }
         result.push_str(&sql[cursor..*edit_start]);
         result.push_str(replacement);
         cursor = *edit_end;
     }
     if cursor > expr_end {
-        return None;
+        return ast_join_condition_autofix_for_sources(
+            on_expr,
+            expr_span,
+            expr_source,
+            current_source,
+            previous_sources,
+        );
     }
     result.push_str(&sql[cursor..expr_end]);
 
     Some((expr_span, result))
+}
+
+fn ast_join_condition_autofix_for_sources(
+    on_expr: &Expr,
+    expr_span: Span,
+    expr_source: &str,
+    current_source: &str,
+    previous_sources: &[String],
+) -> Option<(Span, String)> {
+    // AST rendering would drop comments; avoid this fallback on commented ON clauses.
+    if expr_source.contains("--") || expr_source.contains("/*") {
+        return None;
+    }
+    if previous_sources.is_empty() {
+        return None;
+    }
+
+    let mut rewritten = on_expr.clone();
+    let mut changed = false;
+    for previous_source in previous_sources {
+        changed |= swap_reversed_pairs_ast(&mut rewritten, current_source, previous_source);
+    }
+    if !changed {
+        return None;
+    }
+    let replacement = rewritten.to_string();
+    if replacement == expr_source {
+        return None;
+    }
+    Some((expr_span, replacement))
+}
+
+fn swap_reversed_pairs_ast(expr: &mut Expr, current_source: &str, previous_source: &str) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if is_comparison_operator(op) {
+                let left_prefix = expr_qualified_prefix(left);
+                let right_prefix = expr_qualified_prefix(right);
+                if left_prefix.as_deref() == Some(current_source)
+                    && right_prefix.as_deref() == Some(previous_source)
+                {
+                    std::mem::swap(left, right);
+                    *op = flipped_comparison_operator(op);
+                    return true;
+                }
+            }
+
+            let left_changed = swap_reversed_pairs_ast(left, current_source, previous_source);
+            let right_changed = swap_reversed_pairs_ast(right, current_source, previous_source);
+            left_changed || right_changed
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner)
+        | Expr::Cast { expr: inner, .. } => {
+            swap_reversed_pairs_ast(inner, current_source, previous_source)
+        }
+        Expr::InList {
+            expr: target, list, ..
+        } => {
+            let mut changed = swap_reversed_pairs_ast(target, current_source, previous_source);
+            for item in list {
+                changed |= swap_reversed_pairs_ast(item, current_source, previous_source);
+            }
+            changed
+        }
+        Expr::Between {
+            expr: target,
+            low,
+            high,
+            ..
+        } => {
+            swap_reversed_pairs_ast(target, current_source, previous_source)
+                | swap_reversed_pairs_ast(low, current_source, previous_source)
+                | swap_reversed_pairs_ast(high, current_source, previous_source)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let mut changed = false;
+            if let Some(operand) = operand {
+                changed |= swap_reversed_pairs_ast(operand, current_source, previous_source);
+            }
+            for case_when in conditions {
+                changed |= swap_reversed_pairs_ast(
+                    &mut case_when.condition,
+                    current_source,
+                    previous_source,
+                );
+                changed |=
+                    swap_reversed_pairs_ast(&mut case_when.result, current_source, previous_source);
+            }
+            if let Some(else_result) = else_result {
+                changed |= swap_reversed_pairs_ast(else_result, current_source, previous_source);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn flipped_comparison_operator(op: &BinaryOperator) -> BinaryOperator {
+    match op {
+        BinaryOperator::Lt => BinaryOperator::Gt,
+        BinaryOperator::Gt => BinaryOperator::Lt,
+        BinaryOperator::LtEq => BinaryOperator::GtEq,
+        BinaryOperator::GtEq => BinaryOperator::LtEq,
+        _ => op.clone(),
+    }
 }
 
 /// Walk the AST and collect source-text edits for each reversed comparison
@@ -543,11 +730,16 @@ fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
     None
 }
 
+fn normalize_source_name(name: &str) -> String {
+    name.trim_matches(|ch| matches!(ch, '"' | '`' | '\'' | '[' | ']'))
+        .to_ascii_uppercase()
+}
+
 fn expr_qualified_prefix(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() > 1 => {
-            parts.first().map(|ident| ident.value.to_ascii_uppercase())
-        }
+        Expr::CompoundIdentifier(parts) if parts.len() > 1 => parts
+            .get(parts.len().saturating_sub(2))
+            .map(|ident| normalize_source_name(&ident.value)),
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => expr_qualified_prefix(inner),
@@ -767,7 +959,126 @@ mod tests {
         let fixed = apply_edits(sql, &issues[0].autofix.as_ref().unwrap().edits);
         assert_eq!(
             fixed,
-            "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on foo.a != bar.a\n    and foo.b < bar.b\n    and foo.c >= bar.c\nleft join baz\n    on baz.a <> foo.a\n    and baz.b >= foo.b\n    and baz.c < foo.c\n"
+            "select\n    foo.a,\n    bar.b,\n    baz.c\nfrom foo\nleft join bar\n    on foo.a != bar.a\n    and foo.b < bar.b\n    and foo.c >= bar.c\nleft join baz\n    on foo.a <> baz.a\n    and foo.b <= baz.b\n    and foo.c > baz.c\n"
+        );
+    }
+
+    #[test]
+    fn autofix_handles_reversed_join_with_additional_same_table_filter() {
+        let sql = "select wur.id from ledger.work_unit_run as wur inner join ledger.work_unit as wu on wu.id = wur.work_unit_id and wu.type = 'job'";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert!(!autofix.edits.is_empty());
+
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("wur.work_unit_id = wu.id"),
+            "expected reordered join predicate, got: {fixed}"
+        );
+        assert!(
+            fixed.contains("wu.type = 'job'"),
+            "expected same-table predicate to be preserved, got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn emits_autofix_for_reversed_workspace_join_after_ordered_prior_join() {
+        let sql = "select wur.id from ledger.work_unit_run as wur join ledger.work_unit as wu on wur.work_unit_id = wu.id and wu.type = 'job' inner join ledger.workspace as ws on ws.id = wu.workspace_id left join ledger.usage_line_item as uli on uli.job_run_id = wur.external_run_id";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("wu.workspace_id = ws.id"),
+            "expected reordered workspace join predicate, got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn emits_autofix_for_schema_qualified_reversed_join_condition() {
+        let sql = "select ledger.work_unit_run.id from ledger.work_unit_run join ledger.work_unit on ledger.work_unit.id = ledger.work_unit_run.work_unit_id";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert!(!autofix.edits.is_empty());
+
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select ledger.work_unit_run.id from ledger.work_unit_run join ledger.work_unit on ledger.work_unit_run.work_unit_id = ledger.work_unit.id"
+        );
+    }
+
+    #[test]
+    fn emits_autofix_for_quoted_schema_qualified_reversed_join_condition() {
+        let sql = "select \"ledger\".\"work_unit_run\".\"id\" from \"ledger\".\"work_unit_run\" join \"ledger\".\"work_unit\" on \"ledger\".\"work_unit\".\"id\" = \"ledger\".\"work_unit_run\".\"work_unit_id\"";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        assert!(!autofix.edits.is_empty());
+
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert_eq!(
+            fixed,
+            "select \"ledger\".\"work_unit_run\".\"id\" from \"ledger\".\"work_unit_run\" join \"ledger\".\"work_unit\" on \"ledger\".\"work_unit_run\".\"work_unit_id\" = \"ledger\".\"work_unit\".\"id\""
+        );
+    }
+
+    #[test]
+    fn emits_autofix_for_reversed_join_inside_cte_with_additional_join() {
+        let sql = "WITH active_jobs AS (\n  SELECT wu.id, wur.id\n  FROM raw.lakeflow_jobs AS j\n  INNER JOIN ledger.work_unit AS wu ON wu.external_id = j.job_id AND wu.type = 'job'\n  INNER JOIN ledger.work_unit_run AS wur ON wur.work_unit_id = wu.id\n)\nSELECT * FROM active_jobs";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("j.job_id = wu.external_id"),
+            "expected first join to be reordered, got: {fixed}"
+        );
+        assert!(
+            fixed.contains("wu.id = wur.work_unit_id"),
+            "expected second join to be reordered in same patch, got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn emits_autofix_for_workspace_join_after_inner_chain() {
+        let sql = "SELECT wur.id\nFROM ledger.work_unit_run AS wur\nINNER JOIN ledger.work_unit AS wu ON wur.work_unit_id = wu.id AND wu.type = 'job'\nINNER JOIN ledger.workspace AS ws ON ws.id = wu.workspace_id";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("wu.workspace_id = ws.id"),
+            "expected workspace join predicate reorder, got: {fixed}"
         );
     }
 }

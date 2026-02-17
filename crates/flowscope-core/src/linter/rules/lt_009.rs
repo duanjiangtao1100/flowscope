@@ -164,7 +164,8 @@ fn lt09_violation_spans(
         let fix_span = if is_single_target {
             safe_single_target_collapse_span(sql, &tokens, layout)
         } else {
-            safe_from_newline_fix_span(sql, &tokens, layout)
+            safe_multi_target_reflow_span(sql, &tokens, layout)
+                .or_else(|| safe_from_newline_fix_span(sql, &tokens, layout))
         };
 
         spans.push(((start, end), fix_span));
@@ -754,6 +755,59 @@ fn safe_from_newline_fix_span(
     }
 }
 
+fn safe_multi_target_reflow_span(
+    sql: &str,
+    tokens: &[TokenWithSpan],
+    layout: &SelectClauseLayout,
+) -> Option<Lt09AutofixEdits> {
+    if layout.target_ranges.len() < 2 {
+        return None;
+    }
+
+    let from_idx = layout.from_idx?;
+
+    let first_target_idx = layout
+        .target_ranges
+        .first()
+        .map(|(start_idx, _)| *start_idx)?;
+    let last_pre_target_idx = (layout.select_idx..first_target_idx)
+        .rev()
+        .find(|&idx| !is_ignorable_layout_token(&tokens[idx].token))?;
+
+    if (last_pre_target_idx + 1..from_idx).any(|idx| comment_token_text(&tokens[idx]).is_some()) {
+        return None;
+    }
+
+    let (_, replace_start) = token_with_span_offsets(sql, &tokens[last_pre_target_idx])?;
+    let (replace_end, _) = token_with_span_offsets(sql, &tokens[from_idx])?;
+    if replace_start > replace_end || replace_end > sql.len() {
+        return None;
+    }
+
+    let (select_start, _) = token_with_span_offsets(sql, &tokens[layout.select_idx])?;
+    let base_indent = detect_indent(sql, select_start);
+    let target_indent = format!("{base_indent}    ");
+
+    let mut replacement = String::from('\n');
+    for (idx, (target_start_idx, target_end_idx)) in layout.target_ranges.iter().enumerate() {
+        let (target_start, _) = token_with_span_offsets(sql, &tokens[*target_start_idx])?;
+        let (_, target_end) = token_with_span_offsets(sql, &tokens[target_end_idx - 1])?;
+        if target_start > target_end || target_end > sql.len() {
+            return None;
+        }
+
+        replacement.push_str(&target_indent);
+        replacement.push_str(&sql[target_start..target_end]);
+        if idx + 1 < layout.target_ranges.len() {
+            replacement.push(',');
+        }
+        replacement.push('\n');
+    }
+    replacement.push_str(&base_indent);
+
+    Some(vec![(replace_start, replace_end, replacement)])
+}
+
 fn only_from_shares_last_target_line_violation(
     layout: &SelectClauseLayout,
     tokens: &[TokenWithSpan],
@@ -1040,18 +1094,29 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "select\n  a,\n  b,\n  c\nfrom x");
+        assert_eq!(fixed, "select\n    a,\n    b,\n    c\nfrom x");
     }
 
     #[test]
-    fn dense_multi_target_layout_violation_remains_report_only() {
+    fn dense_multi_target_layout_violation_autofixes_to_one_target_per_line() {
         let sql = "SELECT a,b,c,d,e FROM t";
         let issues = run(sql);
         assert!(!issues.is_empty());
-        assert!(
-            issues[0].autofix.is_none(),
-            "dense same-line target violations remain report-only in conservative LT009 migration"
-        );
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT\n    a,\n    b,\n    c,\n    d,\n    e\nFROM t");
+    }
+
+    #[test]
+    fn wrapped_multi_target_layout_autofixes_when_from_is_on_next_line() {
+        let sql = "SELECT a, b, c,\n  d\nFROM t";
+        let issues = run(sql);
+        assert!(!issues.is_empty());
+        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT\n    a,\n    b,\n    c,\n    d\nFROM t");
     }
 
     #[test]

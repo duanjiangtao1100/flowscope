@@ -291,12 +291,11 @@ pub fn apply_lint_fixes_with_options(
         &protected_ranges,
         fix_options.include_unsafe_fixes,
     );
-    let fixed_sql = apply_planned_edits(sql, &planned.edits);
-
-    let after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
-    let counts = FixCounts::from_removed(&before_counts, &after_counts);
+    let mut fixed_sql = apply_planned_edits(sql, &planned.edits);
+    let mut after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
     let before_total: usize = before_counts.values().sum();
     let after_total: usize = after_counts.values().sum();
+    let mut skipped_counts = planned.skipped.clone();
 
     if parse_errors_increased(&before_counts, &after_counts) {
         if let Some(outcome) = try_core_only_fix_plan(
@@ -326,7 +325,7 @@ pub fn apply_lint_fixes_with_options(
             changed: false,
             skipped_due_to_comments: false,
             skipped_due_to_regression: true,
-            skipped_counts: planned.skipped,
+            skipped_counts,
         });
     }
 
@@ -356,8 +355,11 @@ pub fn apply_lint_fixes_with_options(
     }
 
     // Strict regression guard: never apply a fix set that increases total
-    // violations, even if some rules improved.
-    if after_total > before_total {
+    // violations, and also retry with core-only planning when net totals are
+    // flat but per-rule regressions mask improvements.
+    let masked_or_worse = after_total > before_total
+        || (after_total == before_total && after_counts != before_counts);
+    if masked_or_worse {
         if let Some(outcome) = try_core_only_fix_plan(
             sql,
             dialect,
@@ -385,9 +387,25 @@ pub fn apply_lint_fixes_with_options(
             changed: false,
             skipped_due_to_comments: false,
             skipped_due_to_regression: true,
-            skipped_counts: planned.skipped,
+            skipped_counts,
         });
     }
+
+    if !fix_options.include_rewrite_candidates && skipped_counts.overlap_conflict_blocked > 0 {
+        if let Some(incremental) = try_incremental_core_fix_plan(
+            &fixed_sql,
+            dialect,
+            lint_config,
+            &after_counts,
+            fix_options.include_unsafe_fixes,
+        ) {
+            merge_skipped_counts(&mut skipped_counts, &incremental.skipped_counts);
+            fixed_sql = incremental.sql;
+            after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
+        }
+    }
+
+    let counts = FixCounts::from_removed(&before_counts, &after_counts);
 
     if counts.total() == 0 {
         return Ok(FixOutcome {
@@ -396,7 +414,7 @@ pub fn apply_lint_fixes_with_options(
             changed: false,
             skipped_due_to_comments: false,
             skipped_due_to_regression: false,
-            skipped_counts: planned.skipped,
+            skipped_counts,
         });
     }
     let changed = fixed_sql != sql;
@@ -407,7 +425,7 @@ pub fn apply_lint_fixes_with_options(
         changed,
         skipped_due_to_comments: false,
         skipped_due_to_regression: false,
-        skipped_counts: planned.skipped,
+        skipped_counts,
     })
 }
 
@@ -750,10 +768,7 @@ fn is_incremental_core_candidate(candidate: &FixCandidate, allow_unsafe: bool) -
         return false;
     }
 
-    let Some(rule_code) = candidate.rule_code.as_deref() else {
-        return false;
-    };
-    if core_autofix_conflict_priority(Some(rule_code)) != 0 {
+    if candidate.rule_code.is_none() {
         return false;
     }
 
@@ -870,6 +885,8 @@ fn try_incremental_core_fix_plan(
     let mut current_counts = before_counts.clone();
     let mut changed = false;
     let mut skipped_counts = FixSkippedCounts::default();
+    let mut seen_sql = HashSet::new();
+    seen_sql.insert(current_sql.clone());
 
     const MAX_ITERATIONS: usize = 24;
     for _ in 0..MAX_ITERATIONS {
@@ -968,6 +985,9 @@ fn try_incremental_core_fix_plan(
         let Some(next_counts) = best_counts else {
             break;
         };
+        if !seen_sql.insert(next_sql.clone()) {
+            break;
+        }
 
         current_sql = next_sql;
         current_counts = next_counts;
@@ -1139,7 +1159,7 @@ fn apply_byte_insertions(sql: &str, mut insertions: Vec<(usize, &'static str)>) 
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SpanEdit {
     start: usize,
     end: usize,
@@ -1227,6 +1247,8 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_001)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_006)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_009)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_008)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_012)
@@ -1564,9 +1586,13 @@ fn plan_fix_candidates(
         .into_iter()
         .enumerate()
         .map(|(idx, candidate)| {
+            let rule_code = candidate
+                .rule_code
+                .clone()
+                .unwrap_or_else(|| format!("PATCH_{:?}_{idx}", candidate.source));
             let source_priority = fix_candidate_source_priority(&candidate);
             let mut fix = PatchFix::new(
-                format!("PATCH_{:?}_{idx}", candidate.source),
+                rule_code,
                 patch_applicability(candidate.applicability),
                 vec![PatchEdit::replace(
                     candidate.start,
@@ -4720,6 +4746,43 @@ mod tests {
             applied, "SELECT coalesce(x > 0, false) FROM t\n",
             "unexpected ST002 planned edits with skipped={:?}",
             planned.skipped
+        );
+    }
+
+    #[test]
+    fn incremental_core_plan_applies_st009_even_when_not_top_priority() {
+        let sql = "select foo.a, bar.b from foo left join bar on bar.a = foo.a";
+        let lint_config = default_lint_config();
+        let before_counts = lint_rule_counts(sql, Dialect::Generic, &lint_config);
+        assert_eq!(
+            before_counts
+                .get(issue_codes::LINT_ST_009)
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+
+        let out = try_incremental_core_fix_plan(
+            sql,
+            Dialect::Generic,
+            &lint_config,
+            &before_counts,
+            false,
+        )
+        .expect("expected incremental ST009 fix");
+        assert!(
+            out.sql.contains("foo.a = bar.a"),
+            "expected ST009 join condition reorder, got: {}",
+            out.sql
+        );
+
+        let after_counts = lint_rule_counts(&out.sql, Dialect::Generic, &lint_config);
+        assert_eq!(
+            after_counts
+                .get(issue_codes::LINT_ST_009)
+                .copied()
+                .unwrap_or(0),
+            0
         );
     }
 

@@ -424,6 +424,7 @@ fn rewrite_lt05_code_line(line: &str, max_line_length: usize) -> Option<String> 
         .or_else(|| rewrite_function_alias_line(line, max_line_length))
         .or_else(|| rewrite_function_equals_line(line, max_line_length))
         .or_else(|| rewrite_clause_break_line(line, max_line_length))
+        .or_else(|| rewrite_whitespace_wrap_line(line, max_line_length))
 }
 
 fn rewrite_inline_comment_line(
@@ -735,6 +736,133 @@ fn rfind_ascii_case_insensitive_before(haystack: &str, needle: &str, end: usize)
     haystack[..end.min(haystack.len())]
         .to_ascii_lowercase()
         .rfind(&needle.to_ascii_lowercase())
+}
+
+fn rewrite_whitespace_wrap_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length {
+        return None;
+    }
+    if line.contains("--") || line.contains("/*") || line.contains("*/") {
+        return None;
+    }
+
+    let indent = leading_whitespace_prefix(line);
+    let indent_chars = indent.chars().count();
+    let continuation_indent = format!("{indent}    ");
+    let continuation_chars = continuation_indent.chars().count();
+    let mut remaining = line[indent.len()..].trim_end().to_string();
+    if remaining.is_empty() {
+        return None;
+    }
+
+    let mut wrapped = Vec::new();
+    let mut first = true;
+    loop {
+        let limit = if first {
+            max_line_length.saturating_sub(indent_chars)
+        } else {
+            max_line_length.saturating_sub(continuation_chars)
+        };
+        if limit < 8 || remaining.chars().count() <= limit {
+            break;
+        }
+
+        let split_at = wrap_split_index(&remaining, limit)?;
+        let head = remaining[..split_at].trim_end();
+        let tail = remaining[split_at..].trim_start();
+        if head.is_empty() || tail.is_empty() {
+            return None;
+        }
+
+        if first {
+            wrapped.push(format!("{indent}{head}"));
+            first = false;
+        } else {
+            wrapped.push(format!("{continuation_indent}{head}"));
+        }
+        remaining = tail.to_string();
+    }
+
+    if wrapped.is_empty() {
+        return None;
+    }
+
+    if first {
+        wrapped.push(format!("{indent}{remaining}"));
+    } else {
+        wrapped.push(format!("{continuation_indent}{remaining}"));
+    }
+    Some(wrapped.join("\n"))
+}
+
+fn wrap_split_index(content: &str, char_limit: usize) -> Option<usize> {
+    if char_limit == 0 {
+        return None;
+    }
+
+    #[derive(Clone, Copy)]
+    enum ScanMode {
+        Outside,
+        SingleQuote,
+        DoubleQuote,
+        BacktickQuote,
+    }
+
+    let mut split_at = None;
+    let mut mode = ScanMode::Outside;
+    let mut iter = content.char_indices().enumerate().peekable();
+    while let Some((char_idx, (byte_idx, ch))) = iter.next() {
+        if char_idx >= char_limit {
+            break;
+        }
+
+        match mode {
+            ScanMode::Outside => {
+                if ch.is_whitespace() {
+                    split_at = Some(byte_idx);
+                    continue;
+                }
+                mode = match ch {
+                    '\'' => ScanMode::SingleQuote,
+                    '"' => ScanMode::DoubleQuote,
+                    '`' => ScanMode::BacktickQuote,
+                    _ => ScanMode::Outside,
+                };
+            }
+            ScanMode::SingleQuote => {
+                if ch == '\'' {
+                    if iter
+                        .peek()
+                        .is_some_and(|(_, (_, next_ch))| *next_ch == '\'')
+                    {
+                        let _ = iter.next();
+                    } else {
+                        mode = ScanMode::Outside;
+                    }
+                }
+            }
+            ScanMode::DoubleQuote => {
+                if ch == '"' {
+                    if iter.peek().is_some_and(|(_, (_, next_ch))| *next_ch == '"') {
+                        let _ = iter.next();
+                    } else {
+                        mode = ScanMode::Outside;
+                    }
+                }
+            }
+            ScanMode::BacktickQuote => {
+                if ch == '`' {
+                    if iter.peek().is_some_and(|(_, (_, next_ch))| *next_ch == '`') {
+                        let _ = iter.next();
+                    } else {
+                        mode = ScanMode::Outside;
+                    }
+                }
+            }
+        }
+    }
+
+    split_at.filter(|byte_idx| *byte_idx > 0)
 }
 
 fn line_is_comment_only_tokenized(
@@ -1375,5 +1503,31 @@ mod tests {
             fixed,
             "SELECT\n    my_function(col1 + col2, arg2, arg3)\n        over (\n            partition by col3, col4\n            order by col5 rows between unbounded preceding and current row\n        )\n        as my_relatively_long_alias,\n    my_other_function(col6, col7 + col8, arg4)\n        as my_other_relatively_long_alias,\n    my_expression_function(col6, col7 + col8, arg4)\n    = col9 + col10 as another_relatively_long_alias\nFROM my_table\n"
         );
+    }
+
+    #[test]
+    fn autofix_wraps_generic_long_predicate_line() {
+        let sql = "    WHEN uli.usage_start_time >= params.as_of_date - MAKE_INTERVAL(days => params.window_days) AND uli.usage_start_time < params.as_of_date\n";
+        let mut edits = long_line_autofix_edits(sql, 80, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+
+        assert_ne!(fixed, sql);
+        for line in fixed.lines() {
+            assert!(
+                line.chars().count() <= 80,
+                "expected wrapped line <= 80 chars, got {}: {line}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn generic_wrap_keeps_quoted_literals_intact() {
+        let sql = "SELECT CONCAT('hello world this is a long literal', col1, col2, col3, col4, col5, col6) FROM t\n";
+        let mut edits = long_line_autofix_edits(sql, 60, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+
+        assert_ne!(fixed, sql);
+        assert!(fixed.contains("'hello world this is a long literal'"));
     }
 }
