@@ -1081,4 +1081,27 @@ mod tests {
             "expected workspace join predicate reorder, got: {fixed}"
         );
     }
+
+    #[test]
+    fn emits_autofix_for_workspace_join_inside_cte_chain() {
+        let sql = "WITH job_run_costs AS (\n    SELECT\n        wur.id AS work_unit_run_id,\n        wu.workspace_id\n    FROM ledger.work_unit_run AS wur\n    INNER\n    JOIN ledger.work_unit AS wu ON wur.work_unit_id = wu.id AND wu.type = 'job'\n    INNER JOIN ledger.workspace AS ws ON ws.id = wu.workspace_id\n)\nSELECT * FROM job_run_costs";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert!(
+            issues[0].autofix.is_some(),
+            "expected ST009 autofix metadata for CTE join chain"
+        );
+        let fixed = apply_edits(
+            sql,
+            &issues[0]
+                .autofix
+                .as_ref()
+                .expect("expected ST009 autofix metadata")
+                .edits,
+        );
+        assert!(
+            fixed.contains("wu.workspace_id = ws.id"),
+            "expected workspace join predicate reorder, got: {fixed}"
+        );
+    }
 }

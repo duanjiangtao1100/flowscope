@@ -117,6 +117,9 @@ struct ViolationInfo {
     bands: Vec<u8>,
     /// Whether the SELECT has implicit column references (GROUP BY 1, 2).
     has_implicit_refs: bool,
+    /// Rendered first projection item hint used to align AST violations with
+    /// token-scanned projection segments.
+    first_item_hint: String,
 }
 
 /// Check if a SELECT's projection ordering violates band order.
@@ -148,6 +151,11 @@ fn check_select_order(select: &Select) -> Option<ViolationInfo> {
     Some(ViolationInfo {
         bands,
         has_implicit_refs,
+        first_item_hint: select
+            .projection
+            .first()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default(),
     })
 }
 
@@ -633,6 +641,9 @@ fn st006_autofix_candidates_for_context(
         if segment.items.len() != violation.bands.len() {
             continue;
         }
+        if !segment_first_item_matches(ctx.sql, segment, &violation.first_item_hint) {
+            continue;
+        }
 
         // Skip autofix if implicit column references exist.
         if violation.has_implicit_refs {
@@ -669,6 +680,9 @@ fn st006_violation_spans(ctx: &LintContext, violations: &[ViolationInfo]) -> Vec
         }
         let violation = &violations[violation_idx];
         if segment.items.len() != violation.bands.len() {
+            continue;
+        }
+        if !segment_first_item_matches(ctx.sql, segment, &violation.first_item_hint) {
             continue;
         }
 
@@ -910,7 +924,7 @@ fn projection_reorder_candidate_by_band(
             return None;
         }
         if span_contains_comment(tokens, core_span)
-            || span_contains_comment(tokens, item.trailing_span)
+            || trailing_span_has_inline_comment(tokens, sql, core_span, item.trailing_span)
         {
             return None;
         }
@@ -990,37 +1004,52 @@ fn span_contains_comment(tokens: &[PositionedToken], span: Span) -> bool {
         .any(|token| token.start >= span.start && token.end <= span.end && is_comment(&token.token))
 }
 
+fn trailing_span_has_inline_comment(
+    tokens: &[PositionedToken],
+    sql: &str,
+    core_span: Span,
+    trailing_span: Span,
+) -> bool {
+    if trailing_span.start >= trailing_span.end {
+        return false;
+    }
+    tokens.iter().any(|token| {
+        if token.start < trailing_span.start || token.end > trailing_span.end || !is_comment(&token.token)
+        {
+            return false;
+        }
+        if token.start <= core_span.end || token.start > sql.len() || core_span.end > sql.len() {
+            return true;
+        }
+        let between = &sql[core_span.end..token.start];
+        !between.contains('\n') && !between.contains('\r')
+    })
+}
+
 fn normalize_projection_item_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if !trimmed.contains('\n') && !trimmed.contains('\r') {
-        return Some(trimmed.to_string());
-    }
-    if trimmed.contains('\'') || trimmed.contains('"') || trimmed.contains('`') {
-        return Some(trimmed.to_string());
-    }
+    Some(trimmed.to_string())
+}
 
-    let mut normalized = String::with_capacity(trimmed.len());
-    let mut pending_space = false;
-    for ch in trimmed.chars() {
-        if ch.is_whitespace() {
-            pending_space = true;
-            continue;
-        }
-        if pending_space && !normalized.is_empty() {
-            normalized.push(' ');
-        }
-        normalized.push(ch);
-        pending_space = false;
+fn segment_first_item_matches(sql: &str, segment: &SelectProjectionSegment, hint: &str) -> bool {
+    let Some(first_item) = segment.items.first() else {
+        return false;
+    };
+    let span = first_item.core_span;
+    if span.start >= span.end || span.end > sql.len() {
+        return false;
     }
+    normalize_item_hint(&sql[span.start..span.end]) == normalize_item_hint(hint)
+}
 
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+fn normalize_item_hint(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect()
 }
 
 fn indent_prefix_for_offset(sql: &str, offset: usize) -> String {
@@ -1488,6 +1517,23 @@ SELECT * FROM (SELECT CASE WHEN COL > 1 THEN 'x' ELSE 'y' END AS A, COL AS B FRO
             "expected reordered projection, got: {fixed}"
         );
 
+        parse_sql(&fixed).expect("fixed SQL should remain parseable");
+    }
+
+    #[test]
+    fn autofix_reorders_trailing_simple_column_after_subquery_expressions() {
+        let sql = "SELECT\n    a.table_full_name AS table_a,\n    b.table_full_name AS table_b,\n    (\n        SELECT count(*)\n        FROM unnest(a.columns) AS ac\n        WHERE ac = ANY(b.columns)\n    ) AS intersection_size,\n    a.column_count + b.column_count - (\n        SELECT count(*)\n        FROM unnest(a.columns) AS ac\n        WHERE ac = ANY(b.columns)\n    ) AS union_size,\n    a.connector_id\nFROM table_columns AS a\nINNER JOIN table_columns AS b\n    ON a.connector_id = b.connector_id";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST006 autofix metadata");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("a.connector_id,\n    (\n        SELECT count(*)"),
+            "expected simple trailing column to move before complex expressions, got: {fixed}"
+        );
         parse_sql(&fixed).expect("fixed SQL should remain parseable");
     }
 
