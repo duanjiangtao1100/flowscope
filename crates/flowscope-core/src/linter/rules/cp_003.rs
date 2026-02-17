@@ -484,6 +484,7 @@ fn is_non_function_sql_keyword(value: &str) -> bool {
             // DML/DDL clause heads
             | "VALUES" | "SET" | "INTO" | "FROM" | "WHERE" | "HAVING"
             | "SELECT" | "TABLE" | "JOIN"
+            | "CONFLICT"
             // Set operations and CTE
             | "UNION" | "INTERSECT" | "EXCEPT" | "WITH" | "RECURSIVE"
             // CASE expression parts
@@ -514,7 +515,6 @@ fn is_data_type_keyword(value: &str) -> bool {
             | "INT64"
             | "FLOAT64"
             | "BYTES"
-            | "DATE"
             | "TIME"
             | "TIMESTAMP"
             | "INTERVAL"
@@ -602,6 +602,21 @@ mod tests {
     #[test]
     fn does_not_flag_consistent_function_case() {
         assert!(run("SELECT lower(x), upper(y) FROM t").is_empty());
+    }
+
+    #[test]
+    fn on_conflict_clause_keyword_is_not_treated_as_function_name() {
+        let sql = "INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET updated_at = now(), touched_at = NOW()";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_CP_003);
+    }
+
+    #[test]
+    fn date_function_calls_are_tracked() {
+        let issues = run("SELECT date(ts), DATE(ts) FROM t");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_CP_003);
     }
 
     #[test]

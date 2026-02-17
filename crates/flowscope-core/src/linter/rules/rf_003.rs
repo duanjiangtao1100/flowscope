@@ -91,6 +91,7 @@ impl LintRule for ReferencesConsistent {
 
         let all_statement_sources = collect_statement_source_names(statement);
         let mut mixed_count = 0usize;
+        let mut consistency_transition_count = 0usize;
         let mut autofix_edits_raw: Vec<Rf003AutofixEdit> = Vec::new();
 
         visit_selects_in_statement(statement, &mut |select| {
@@ -129,6 +130,14 @@ impl LintRule for ReferencesConsistent {
                 .violation(qualified, unqualified)
             {
                 mixed_count += 1;
+                if self.single_table_references == SingleTableReferencesMode::Consistent
+                    && qualified > 0
+                    && unqualified > 0
+                {
+                    // SQLFluff emits an additional "inconsistent with previous
+                    // references" issue per mixed single-source SELECT.
+                    consistency_transition_count += 1;
+                }
 
                 let target_style = match self.single_table_references {
                     SingleTableReferencesMode::Consistent
@@ -198,8 +207,8 @@ impl LintRule for ReferencesConsistent {
 
         // Emit one issue per violating reference at its specific position
         // (SQLFluff reports per-reference, not per-SELECT).
-        if !autofix_edits.is_empty() {
-            return autofix_edits
+        if !autofix_edits.is_empty() || consistency_transition_count > 0 {
+            let mut issues: Vec<Issue> = autofix_edits
                 .into_iter()
                 .map(|edit| {
                     let span = Span::new(edit.span.start, edit.span.end);
@@ -212,6 +221,14 @@ impl LintRule for ReferencesConsistent {
                     .with_autofix_edits(IssueAutofixApplicability::Safe, vec![edit])
                 })
                 .collect();
+            issues.extend((0..consistency_transition_count).map(|_| {
+                Issue::info(
+                    issue_codes::LINT_RF_003,
+                    "Avoid mixing qualified and unqualified references.",
+                )
+                .with_statement(ctx.statement_index)
+            }));
+            return issues;
         }
 
         // Fallback: no per-reference edits available, emit per-SELECT issues.
@@ -1719,11 +1736,15 @@ mod tests {
     fn flags_mixed_qualification_single_table() {
         let sql = "SELECT my_tbl.bar, baz FROM my_tbl";
         let issues = run(sql);
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].code, issue_codes::LINT_RF_003);
-        let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|issue| issue.code == issue_codes::LINT_RF_003));
+        let issue_with_fix = issues
+            .iter()
+            .find(|issue| issue.autofix.is_some())
+            .expect("issue with autofix");
+        let autofix = issue_with_fix.autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        let fixed = apply_issue_autofix(sql, issue_with_fix).expect("apply autofix");
         assert_eq!(fixed, "SELECT my_tbl.bar, my_tbl.baz FROM my_tbl");
     }
 
@@ -1742,7 +1763,7 @@ mod tests {
     #[test]
     fn flags_mixed_qualification_in_subquery() {
         let issues = run("SELECT * FROM (SELECT my_tbl.bar, baz FROM my_tbl)");
-        assert_eq!(issues.len(), 1);
+        assert_eq!(issues.len(), 2);
     }
 
     #[test]
@@ -1754,7 +1775,7 @@ mod tests {
     #[test]
     fn flags_mixed_qualification_with_qualified_wildcard() {
         let issues = run("SELECT my_tbl.*, bar FROM my_tbl");
-        assert_eq!(issues.len(), 1);
+        assert_eq!(issues.len(), 2);
     }
 
     #[test]

@@ -127,7 +127,13 @@ fn collect_table_factor_identifiers(
     }
 
     match table_factor {
-        TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, args, .. } => {
+            // Postgres/MSSQL table-valued function calls are represented as
+            // TableFactor::Table with `args=Some(...)`. Function names belong
+            // to CP03/LT06, not identifier rules such as CP02/RF04.
+            if args.is_some() {
+                return;
+            }
             for part in &name.0 {
                 if let Some(ident) = part.as_ident() {
                     push_ident_candidate(ident, IdentifierKind::Other, candidates);

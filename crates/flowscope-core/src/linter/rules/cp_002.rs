@@ -135,10 +135,7 @@ impl LintRule for CapitalisationIdentifiers {
             .into_iter()
             .map(|edit| {
                 let span = ctx.span_from_statement_offset(edit.start, edit.end);
-                let patch = IssuePatchEdit::new(
-                    Span::new(span.start, span.end),
-                    edit.replacement,
-                );
+                let patch = IssuePatchEdit::new(Span::new(span.start, span.end), edit.replacement);
                 Issue::info(
                     issue_codes::LINT_CP_002,
                     "Identifiers use inconsistent capitalisation.",
@@ -1085,6 +1082,13 @@ mod tests {
     #[test]
     fn does_not_flag_consistent_identifiers() {
         assert!(run("SELECT col_one, col_two FROM t").is_empty());
+    }
+
+    #[test]
+    fn does_not_treat_table_valued_function_name_as_identifier() {
+        // Postgres table-valued function names in FROM should be handled by
+        // function/layout rules, not identifier-case consistency.
+        assert!(run("SELECT x FROM FOO(1) AS x").is_empty());
     }
 
     #[test]

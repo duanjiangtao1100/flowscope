@@ -185,6 +185,12 @@ fn comma_spacing_violations(
             continue;
         }
 
+        // PostgreSQL cast precision/scale commas (e.g. `::numeric(5,2)`) are
+        // part of a data-type declaration, not list separators.
+        if is_postgres_cast_precision_scale_comma(&tokens, index, prev_sig_idx, next_sig_idx) {
+            continue;
+        }
+
         // Use byte-gaps rather than token line metadata. In parser-recovery and
         // template-heavy inputs, token line numbers can drift while offsets
         // remain reliable.
@@ -257,6 +263,48 @@ fn comma_spacing_violations(
     }
 
     violations
+}
+
+fn is_postgres_cast_precision_scale_comma(
+    tokens: &[TokenWithSpan],
+    comma_idx: usize,
+    prev_sig_idx: usize,
+    next_sig_idx: usize,
+) -> bool {
+    if !matches!(tokens[comma_idx].token, Token::Comma) {
+        return false;
+    }
+    if !matches!(tokens[prev_sig_idx].token, Token::Number(_, _)) {
+        return false;
+    }
+    if !matches!(tokens[next_sig_idx].token, Token::Number(_, _)) {
+        return false;
+    }
+
+    let Some(lparen_idx) = tokens[..prev_sig_idx]
+        .iter()
+        .rposition(|candidate| !is_trivia_token(&candidate.token))
+    else {
+        return false;
+    };
+    if !matches!(tokens[lparen_idx].token, Token::LParen) {
+        return false;
+    }
+
+    let Some(type_name_idx) = tokens[..lparen_idx]
+        .iter()
+        .rposition(|candidate| !is_trivia_token(&candidate.token))
+    else {
+        return false;
+    };
+    if !matches!(tokens[type_name_idx].token, Token::Word(_)) {
+        return false;
+    }
+
+    tokens[..type_name_idx]
+        .iter()
+        .rposition(|candidate| !is_trivia_token(&candidate.token))
+        .is_some_and(|cast_marker_idx| matches!(tokens[cast_marker_idx].token, Token::DoubleColon))
 }
 
 /// Generate autofix edits to move a comma across a line break.
@@ -735,6 +783,11 @@ mod tests {
     #[test]
     fn does_not_flag_spaced_commas() {
         assert!(run("SELECT a, b FROM t").is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_comma_in_cast_precision_scale() {
+        assert!(run("SELECT (a / b)::numeric(5,2) FROM t").is_empty());
     }
 
     #[test]

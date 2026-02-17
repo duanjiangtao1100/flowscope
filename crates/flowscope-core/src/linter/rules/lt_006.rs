@@ -7,6 +7,7 @@ use crate::linter::rule::{LintContext, LintRule};
 use crate::linter::visit::visit_expressions;
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
 use sqlparser::ast::{Expr, Statement};
+use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::collections::HashSet;
 
@@ -76,6 +77,9 @@ fn function_spacing_issue_span(
         let word_upper = word.value.to_ascii_uppercase();
         if !tracked_function_names.contains(&word_upper) && !is_always_function_keyword(&word_upper)
         {
+            continue;
+        }
+        if word_upper == "EXISTS" && !is_select_projection_exists(&tokens, index) {
             continue;
         }
 
@@ -221,7 +225,22 @@ fn is_trivia_token(token: &Token) -> bool {
 }
 
 fn is_always_function_keyword(word: &str) -> bool {
-    matches!(word, "CAST" | "TRY_CAST" | "SAFE_CAST" | "CONVERT")
+    matches!(
+        word,
+        "CAST" | "TRY_CAST" | "SAFE_CAST" | "CONVERT" | "EXISTS"
+    )
+}
+
+fn is_select_projection_exists(tokens: &[TokenWithSpan], exists_index: usize) -> bool {
+    let Some(prev_index) = prev_non_trivia_index(tokens, exists_index) else {
+        return false;
+    };
+
+    match &tokens[prev_index].token {
+        Token::Comma => true,
+        Token::Word(word) => word.keyword == Keyword::SELECT,
+        _ => false,
+    }
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -392,6 +411,20 @@ mod tests {
         let issues = run("SELECT CAST (1 AS INT)");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_006);
+    }
+
+    #[test]
+    fn flags_space_between_exists_keyword_and_paren() {
+        let sql = "SELECT EXISTS (SELECT 1) AS has_rows";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
+        assert_eq!(fixed, "SELECT EXISTS(SELECT 1) AS has_rows");
+    }
+
+    #[test]
+    fn does_not_flag_where_exists_predicate_spacing() {
+        assert!(run("SELECT 1 FROM t WHERE NOT EXISTS (SELECT 1)").is_empty());
     }
 
     #[test]

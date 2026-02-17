@@ -6,7 +6,7 @@
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
-use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
+use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::Statement;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
@@ -308,6 +308,65 @@ impl LintRule for LayoutIndent {
                 && left.replacement == right.replacement
         });
 
+        // SQLFluff parity for PostgreSQL-heavy corpora: LT02 reports per
+        // indentation location rather than one statement-level aggregate.
+        // Restrict this to leading-indentation edits only.
+        let per_line_indent_edits: Vec<Lt02AutofixEdit> = if ctx.dialect() == Dialect::Postgres {
+            autofix_edits
+                .iter()
+                .filter(|edit| is_leading_indent_patch(statement_sql, edit))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let leading_indent_starts: HashSet<usize> = per_line_indent_edits
+            .iter()
+            .map(|edit| edit.start)
+            .collect();
+        let postgres_extra_issue_spans: Vec<(usize, usize)> = if ctx.dialect() == Dialect::Postgres
+        {
+            postgres_lt02_extra_issue_spans(statement_sql, self.indent_unit, self.tab_space_size)
+                .into_iter()
+                .filter(|(start, _end)| !leading_indent_starts.contains(start))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !per_line_indent_edits.is_empty() || !postgres_extra_issue_spans.is_empty() {
+            let mut issues: Vec<Issue> = per_line_indent_edits
+                .into_iter()
+                .map(|edit| {
+                    let patch = IssuePatchEdit::new(
+                        ctx.span_from_statement_offset(edit.start, edit.end),
+                        edit.replacement,
+                    );
+                    let span = Span::new(patch.span.start, patch.span.end);
+                    Issue::info(
+                        issue_codes::LINT_LT_002,
+                        "Indentation appears inconsistent.",
+                    )
+                    .with_statement(ctx.statement_index)
+                    .with_span(span)
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, vec![patch])
+                })
+                .collect();
+
+            for (start, end) in postgres_extra_issue_spans {
+                let span = ctx.span_from_statement_offset(start, end);
+                issues.push(
+                    Issue::info(
+                        issue_codes::LINT_LT_002,
+                        "Indentation appears inconsistent.",
+                    )
+                    .with_statement(ctx.statement_index)
+                    .with_span(span),
+                );
+            }
+
+            return issues;
+        }
+
         let autofix_edits: Vec<_> = autofix_edits
             .into_iter()
             .map(|edit| {
@@ -324,6 +383,423 @@ impl LintRule for LayoutIndent {
 
         vec![issue]
     }
+}
+
+fn is_leading_indent_patch(statement_sql: &str, edit: &Lt02AutofixEdit) -> bool {
+    if !edit.replacement.chars().all(|ch| matches!(ch, ' ' | '\t')) {
+        return false;
+    }
+    if edit.start > statement_sql.len() {
+        return false;
+    }
+    let line_start = statement_sql[..edit.start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    edit.start == line_start
+}
+
+fn postgres_lt02_extra_issue_spans(
+    statement_sql: &str,
+    indent_unit: usize,
+    tab_space_size: usize,
+) -> Vec<(usize, usize)> {
+    let indent_unit = indent_unit.max(1);
+    let lines: Vec<&str> = statement_sql.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let line_infos = statement_line_infos(statement_sql);
+    if line_infos.is_empty() {
+        return Vec::new();
+    }
+
+    let scans: Vec<ScanLine<'_>> = lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let is_blank = trimmed.trim().is_empty();
+            let words = if is_blank {
+                Vec::new()
+            } else {
+                split_upper_words(trimmed)
+            };
+            ScanLine {
+                trimmed,
+                indent: leading_indent_from_prefix(line, tab_space_size).width,
+                words,
+                is_blank,
+                is_comment_only: is_comment_line(trimmed),
+            }
+        })
+        .collect();
+
+    let mut issue_spans: Vec<(usize, usize)> = Vec::new();
+    let mut set_block_expected_indent: Option<usize> = None;
+    let sql_len = statement_sql.len();
+
+    for idx in 0..scans.len() {
+        let line = &scans[idx];
+        if line.is_blank || line.is_comment_only || contains_template_marker(line.trimmed) {
+            continue;
+        }
+
+        if let Some(expected_set_indent) = set_block_expected_indent {
+            if starts_with_assignment(line.trimmed) {
+                if line.indent != expected_set_indent {
+                    push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                }
+            } else {
+                let first = line.words.first().map(String::as_str);
+                if !matches!(first, Some("SET"))
+                    && (is_clause_boundary(first, line.trimmed) || line.trimmed.starts_with(';'))
+                {
+                    set_block_expected_indent = None;
+                }
+            }
+        }
+
+        let first = line.words.first().map(String::as_str);
+        let second = line.words.get(1).map(String::as_str);
+
+        if matches!(first, Some("WHERE")) && line.words.len() > 1 {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_first = scans[next_idx].words.first().map(String::as_str);
+                if matches!(next_first, Some("AND" | "OR")) {
+                    if let Some(rel) = content_offset_after_keyword(line.trimmed, "WHERE") {
+                        push_trimmed_offset_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            idx,
+                            rel,
+                            sql_len,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("SET")) && line.words.len() > 1 {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if starts_with_assignment(scans[next_idx].trimmed) {
+                    if let Some(rel) = content_offset_after_keyword(line.trimmed, "SET") {
+                        push_trimmed_offset_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            idx,
+                            rel,
+                            sql_len,
+                        );
+                    }
+                }
+            }
+
+            let mut expected_set_indent = line.indent;
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                let prev_upper = scans[prev_idx].trimmed.to_ascii_uppercase();
+                if prev_upper.contains(" DO UPDATE") || prev_upper.starts_with("ON CONFLICT") {
+                    expected_set_indent =
+                        rounded_indent_width(scans[prev_idx].indent, indent_unit) + indent_unit;
+                }
+            }
+
+            if line.indent != expected_set_indent {
+                push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+            }
+            set_block_expected_indent = Some(expected_set_indent + indent_unit);
+        }
+
+        if is_join_clause(first, second) {
+            let upper = line.trimmed.to_ascii_uppercase();
+            if upper.ends_with(" ON") || upper.ends_with(" ON (") {
+                if let Some(space_before_on) = upper.rfind(" ON") {
+                    let on_offset = space_before_on + 1;
+                    push_trimmed_offset_issue_span(
+                        &mut issue_spans,
+                        &line_infos,
+                        idx,
+                        on_offset,
+                        sql_len,
+                    );
+                }
+                push_join_on_block_indent_spans(
+                    &mut issue_spans,
+                    &line_infos,
+                    &scans,
+                    idx,
+                    indent_unit,
+                    sql_len,
+                );
+            }
+        }
+
+        if matches!(first, Some("SELECT")) && line.words.len() > 1 && line.trimmed.contains(',') {
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                let prev_upper = scans[prev_idx].trimmed.to_ascii_uppercase();
+                if prev_upper.contains("UNION") {
+                    if let Some(rel) = content_offset_after_keyword(line.trimmed, "SELECT") {
+                        push_trimmed_offset_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            idx,
+                            rel,
+                            sql_len,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("CASE")) {
+            let upper = line.trimmed.to_ascii_uppercase();
+            if let Some(rel) = upper.find(" WHEN ").map(|offset| offset + 1) {
+                push_trimmed_offset_issue_span(&mut issue_spans, &line_infos, idx, rel, sql_len);
+            }
+        }
+
+        if matches!(first, Some("ON")) && line.words.len() > 1 {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_first = scans[next_idx].words.first().map(String::as_str);
+                if matches!(next_first, Some("AND" | "OR")) {
+                    if let Some(rel) = content_offset_after_keyword(line.trimmed, "ON") {
+                        push_trimmed_offset_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            idx,
+                            rel,
+                            sql_len,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("AND" | "OR")) {
+            if let Some(anchor_idx) = find_andor_anchor(&scans, idx) {
+                let base_indent =
+                    rounded_indent_width(scans[anchor_idx].indent, indent_unit) + indent_unit;
+                let depth = paren_depth_between(&scans, anchor_idx, idx);
+                if depth > 0 {
+                    let expected_indent = base_indent + depth * indent_unit;
+                    if line.indent != expected_indent {
+                        push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                    }
+                }
+            }
+        }
+
+        if line.trimmed.starts_with(')') {
+            let tail = line.trimmed[1..].trim_start();
+            let simple_close_tail =
+                if tail.is_empty() || tail.starts_with(';') || tail.starts_with("--") {
+                    true
+                } else if let Some(after_comma) = tail.strip_prefix(',') {
+                    let after_comma = after_comma.trim_start();
+                    after_comma.is_empty() || after_comma.starts_with("--")
+                } else {
+                    false
+                };
+            if !simple_close_tail {
+                continue;
+            }
+
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                let prev_first = scans[prev_idx].words.first().map(String::as_str);
+                if matches!(prev_first, Some("AND" | "OR")) {
+                    if let Some(anchor_idx) = find_andor_anchor(&scans, idx) {
+                        let base_indent =
+                            rounded_indent_width(scans[anchor_idx].indent, indent_unit)
+                                + indent_unit;
+                        let depth = paren_depth_between(&scans, anchor_idx, idx);
+                        let expected_indent = base_indent + depth.saturating_sub(1) * indent_unit;
+                        if line.indent != expected_indent {
+                            push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    issue_spans.sort_unstable();
+    issue_spans.dedup();
+    issue_spans
+}
+
+fn push_line_start_issue_span(
+    issue_spans: &mut Vec<(usize, usize)>,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    sql_len: usize,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let start = line_info.start.min(sql_len);
+    let end = (start + 1).min(sql_len);
+    issue_spans.push((start, end.max(start)));
+}
+
+fn push_trimmed_offset_issue_span(
+    issue_spans: &mut Vec<(usize, usize)>,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    trimmed_offset: usize,
+    sql_len: usize,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+
+    let start = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(trimmed_offset)
+        .min(sql_len);
+    let end = (start + 1).min(sql_len);
+    issue_spans.push((start, end.max(start)));
+}
+
+fn starts_with_assignment(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    if bytes.is_empty() || !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return false;
+    }
+
+    let mut index = 1usize;
+    while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+        index += 1;
+    }
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+
+    index < bytes.len() && bytes[index] == b'='
+}
+
+fn content_offset_after_keyword(trimmed: &str, keyword: &str) -> Option<usize> {
+    if trimmed.len() < keyword.len()
+        || !trimmed
+            .get(..keyword.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
+    {
+        return None;
+    }
+
+    let mut index = keyword.len();
+    let first_after = trimmed[index..].chars().next()?;
+    if !first_after.is_whitespace() {
+        return None;
+    }
+
+    while let Some(ch) = trimmed[index..].chars().next() {
+        if ch.is_whitespace() {
+            index += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    (index < trimmed.len()).then_some(index)
+}
+
+fn push_join_on_block_indent_spans(
+    issue_spans: &mut Vec<(usize, usize)>,
+    line_infos: &[StatementLineInfo],
+    scans: &[ScanLine<'_>],
+    join_line_idx: usize,
+    indent_unit: usize,
+    sql_len: usize,
+) {
+    let Some(join_line) = scans.get(join_line_idx) else {
+        return;
+    };
+    let join_indent = rounded_indent_width(join_line.indent, indent_unit);
+    let base_indent = join_indent + (indent_unit * 2);
+    let on_has_open_paren = join_line.trimmed.to_ascii_uppercase().ends_with(" ON (");
+    let mut depth: isize = if on_has_open_paren { 1 } else { 0 };
+
+    let mut idx = join_line_idx + 1;
+    while idx < scans.len() {
+        let line = &scans[idx];
+        if line.is_blank || line.is_comment_only || contains_template_marker(line.trimmed) {
+            idx += 1;
+            continue;
+        }
+
+        let first = line.words.first().map(String::as_str);
+        let is_continuation_line = matches!(first, Some("AND" | "OR" | "NOT" | "EXISTS"))
+            || line.trimmed.starts_with(')')
+            || line.trimmed.starts_with('(');
+        if !is_continuation_line && is_clause_boundary(first, line.trimmed) {
+            break;
+        }
+
+        let logical_depth = if on_has_open_paren {
+            depth.saturating_sub(1) as usize
+        } else {
+            depth.max(0) as usize
+        };
+        let expected_indent = if line.trimmed.starts_with(')') {
+            if logical_depth > 0 {
+                base_indent + ((logical_depth - 1) * indent_unit)
+            } else {
+                join_indent + indent_unit
+            }
+        } else {
+            base_indent + (logical_depth * indent_unit)
+        };
+
+        if line.indent != expected_indent {
+            push_line_start_issue_span(issue_spans, line_infos, idx, sql_len);
+        }
+
+        depth += paren_delta_simple(line.trimmed);
+        if depth < 0 {
+            depth = 0;
+        }
+        idx += 1;
+    }
+}
+
+fn find_andor_anchor(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
+    (0..from_idx)
+        .rev()
+        .find_map(|idx| {
+            let line = &scans[idx];
+            if line.is_blank || line.is_comment_only {
+                return None;
+            }
+            let first = line.words.first().map(String::as_str);
+            if matches!(first, Some("WHERE" | "ON" | "HAVING")) {
+                return Some(idx);
+            }
+            if is_clause_boundary(first, line.trimmed) && !matches!(first, Some("AND" | "OR")) {
+                return Some(usize::MAX);
+            }
+            None
+        })
+        .and_then(|idx| (idx != usize::MAX).then_some(idx))
+}
+
+fn paren_depth_between(scans: &[ScanLine<'_>], start_idx: usize, end_idx: usize) -> usize {
+    if start_idx >= end_idx || end_idx > scans.len() {
+        return 0;
+    }
+
+    let depth = scans[start_idx..end_idx]
+        .iter()
+        .fold(0isize, |acc, line| acc + paren_delta_simple(line.trimmed));
+
+    depth.max(0) as usize
+}
+
+fn paren_delta_simple(text: &str) -> isize {
+    text.chars().fold(0isize, |acc, ch| match ch {
+        '(' => acc + 1,
+        ')' => acc - 1,
+        _ => acc,
+    })
 }
 
 fn first_line_is_indented(ctx: &LintContext) -> bool {
@@ -1674,6 +2150,7 @@ struct StatementLineInfo {
     indent_end: usize,
 }
 
+#[derive(Clone)]
 struct Lt02AutofixEdit {
     start: usize,
     end: usize,

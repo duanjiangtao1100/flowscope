@@ -14,6 +14,7 @@ use sqlparser::ast::{
     Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
 };
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
+use std::collections::{HashMap, HashSet};
 
 pub struct StructureColumnOrder;
 
@@ -54,8 +55,7 @@ impl LintRule for StructureColumnOrder {
                 .with_statement(ctx.statement_index)
                 .with_span(span);
                 if let Some(edits) = r.edits {
-                    issue =
-                        issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
+                    issue = issue.with_autofix_edits(IssueAutofixApplicability::Safe, edits);
                 }
                 Some(issue)
             })
@@ -229,19 +229,17 @@ fn visit_order_safe_selects<F: FnMut(&Select)>(statement: &Statement, visitor: &
 }
 
 fn visit_query_selects<F: FnMut(&Select)>(query: &Query, visitor: &mut F, in_set_operation: bool) {
+    let order_sensitive_ctes = order_sensitive_cte_names_for_query(query);
+
     // Visit CTE definitions — these may or may not be order-sensitive.
-    // A CTE is order-sensitive if referenced in a set operation whose leaf
-    // SELECTs use wildcards (SELECT *), since reordering the CTE projection
-    // would change the set operation result. When the set operation's leaf
-    // SELECTs use explicit columns (SELECT a, b), CTE order is irrelevant.
-    //
-    // Note: when the body is INSERT/UPDATE/DELETE/MERGE (e.g.
-    // `WITH cte AS (...) INSERT INTO ...`), CTEs are still visited — SQLFluff
-    // only skips the INSERT body's own SELECT, not the CTE definitions.
+    // A CTE is order-sensitive if its output order can flow into a wildcard
+    // set operation (`SELECT * ... UNION ...`), including transitive chains
+    // such as `base -> union_cte -> final_select`.
     if let Some(with) = &query.with {
-        let body_is_set = matches!(query.body.as_ref(), SetExpr::SetOperation { .. });
-        let cte_order_matters = body_is_set && set_expr_has_wildcard_select(&query.body);
         for cte in &with.cte_tables {
+            let cte_name = cte.alias.name.value.to_ascii_uppercase();
+            let cte_order_matters =
+                in_set_operation || order_sensitive_ctes.contains(cte_name.as_str());
             visit_query_selects(&cte.query, visitor, cte_order_matters);
         }
     }
@@ -341,6 +339,123 @@ fn visit_expr_selects<F: FnMut(&Select)>(expr: &Expr, visitor: &mut F) {
             if let Some(e) = else_result {
                 visit_expr_selects(e, visitor);
             }
+        }
+        _ => {}
+    }
+}
+
+fn order_sensitive_cte_names_for_query(query: &Query) -> HashSet<String> {
+    let Some(with) = &query.with else {
+        return HashSet::new();
+    };
+
+    let cte_names: HashSet<String> = with
+        .cte_tables
+        .iter()
+        .map(|cte| cte.alias.name.value.to_ascii_uppercase())
+        .collect();
+    if cte_names.is_empty() {
+        return HashSet::new();
+    }
+
+    // Build direct CTE dependency edges per CTE.
+    let mut deps_by_cte: HashMap<String, HashSet<String>> = HashMap::new();
+    for cte in &with.cte_tables {
+        let mut deps = HashSet::new();
+        collect_cte_references_in_set_expr(&cte.query.body, &cte_names, &mut deps);
+        deps_by_cte.insert(cte.alias.name.value.to_ascii_uppercase(), deps);
+    }
+
+    // Seed order-sensitive CTEs from wildcard set operations in this query
+    // body and in CTE bodies that are themselves wildcard set operations.
+    let mut sensitive = HashSet::new();
+    if matches!(query.body.as_ref(), SetExpr::SetOperation { .. })
+        && set_expr_has_wildcard_select(&query.body)
+    {
+        collect_cte_references_in_set_expr(&query.body, &cte_names, &mut sensitive);
+    }
+    for cte in &with.cte_tables {
+        if matches!(cte.query.body.as_ref(), SetExpr::SetOperation { .. })
+            && set_expr_has_wildcard_select(&cte.query.body)
+        {
+            collect_cte_references_in_set_expr(&cte.query.body, &cte_names, &mut sensitive);
+        }
+    }
+
+    // Propagate sensitivity transitively through CTE dependency edges.
+    let mut stack: Vec<String> = sensitive.iter().cloned().collect();
+    while let Some(current) = stack.pop() {
+        let Some(deps) = deps_by_cte.get(&current) else {
+            continue;
+        };
+        for dep in deps {
+            if sensitive.insert(dep.clone()) {
+                stack.push(dep.clone());
+            }
+        }
+    }
+
+    sensitive
+}
+
+fn collect_cte_references_in_set_expr(
+    set_expr: &SetExpr,
+    cte_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match set_expr {
+        SetExpr::Select(select) => collect_cte_references_in_select(select, cte_names, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_cte_references_in_set_expr(left, cte_names, out);
+            collect_cte_references_in_set_expr(right, cte_names, out);
+        }
+        SetExpr::Query(query) => collect_cte_references_in_set_expr(&query.body, cte_names, out),
+        _ => {}
+    }
+}
+
+fn collect_cte_references_in_select(
+    select: &Select,
+    cte_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    for table in &select.from {
+        collect_cte_references_in_table_factor(&table.relation, cte_names, out);
+        for join in &table.joins {
+            collect_cte_references_in_table_factor(&join.relation, cte_names, out);
+        }
+    }
+}
+
+fn collect_cte_references_in_table_factor(
+    table_factor: &TableFactor,
+    cte_names: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match table_factor {
+        TableFactor::Table { name, .. } => {
+            if let Some(ident) = name.0.last().and_then(|part| part.as_ident()) {
+                let upper = ident.value.to_ascii_uppercase();
+                if cte_names.contains(upper.as_str()) {
+                    out.insert(upper);
+                }
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_cte_references_in_set_expr(&subquery.body, cte_names, out);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_cte_references_in_table_factor(&table_with_joins.relation, cte_names, out);
+            for join in &table_with_joins.joins {
+                collect_cte_references_in_table_factor(&join.relation, cte_names, out);
+            }
+        }
+        TableFactor::Pivot { table, .. }
+        | TableFactor::Unpivot { table, .. }
+        | TableFactor::MatchRecognize { table, .. } => {
+            collect_cte_references_in_table_factor(table, cte_names, out);
         }
         _ => {}
     }
@@ -1057,6 +1172,27 @@ SELECT A, B FROM T2";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_ST_006);
+    }
+
+    #[test]
+    fn pass_transitive_cte_dependency_into_wildcard_set_operation() {
+        // base_a/base_b feed wildcard UNION CTE `combined`, so their projection
+        // order is semantically significant and ST06 should not apply.
+        let sql = "\
+WITH base_a AS (
+  SELECT MAX(a) AS mx, b FROM t
+),
+base_b AS (
+  SELECT MAX(c) AS mx, d FROM t2
+),
+combined AS (
+  SELECT * FROM base_a
+  UNION ALL
+  SELECT * FROM base_b
+)
+SELECT mx, b FROM combined";
+        let issues = run(sql);
+        assert!(issues.is_empty());
     }
 
     #[test]

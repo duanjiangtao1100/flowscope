@@ -275,7 +275,12 @@ fn run_lint(args: Args) -> Result<bool> {
         }
     });
 
+    let mut fix_elapsed = None;
     if args.fix {
+        if !args.quiet {
+            eprintln!("flowscope: phase 1/2 applying fixes");
+        }
+        let fix_started_at = Instant::now();
         let mut total_applied = 0usize;
         let mut files_modified = 0usize;
         let mut skipped_due_to_comments = 0usize;
@@ -283,7 +288,7 @@ fn run_lint(args: Args) -> Result<bool> {
         let mut skipped_due_to_parse_errors = 0usize;
         let mut skipped_or_blocked_candidates = FixCandidateStats::default();
         let mut stdin_modified = false;
-        let progress = LintProgressBar::new("Fixing", lint_inputs.len(), args.quiet);
+        let progress = LintProgressBar::new("Phase 1/2 Fixing", lint_inputs.len(), args.quiet);
 
         let fix_computations = lint_pool.install(|| {
             let progress = progress.clone();
@@ -400,11 +405,27 @@ fn run_lint(args: Args) -> Result<bool> {
                 );
             }
         }
+
+        fix_elapsed = Some(fix_started_at.elapsed());
     }
+
+    if !args.quiet {
+        if args.fix {
+            eprintln!("flowscope: phase 2/2 linting post-fix inputs");
+        } else {
+            eprintln!("flowscope: phase 1/1 linting inputs");
+        }
+    }
+    let lint_started_at = Instant::now();
 
     #[cfg(not(feature = "templating"))]
     let file_results = lint_pool.install(|| {
-        let progress = LintProgressBar::new("Linting", lint_inputs.len(), args.quiet);
+        let label = if args.fix {
+            "Phase 2/2 Linting"
+        } else {
+            "Linting"
+        };
+        let progress = LintProgressBar::new(label, lint_inputs.len(), args.quiet);
         let progress_for_workers = progress.clone();
         let results = lint_inputs
             .par_iter()
@@ -420,7 +441,12 @@ fn run_lint(args: Args) -> Result<bool> {
 
     #[cfg(feature = "templating")]
     let file_results = lint_pool.install(|| {
-        let progress = LintProgressBar::new("Linting", lint_inputs.len(), args.quiet);
+        let label = if args.fix {
+            "Phase 2/2 Linting"
+        } else {
+            "Linting"
+        };
+        let progress = LintProgressBar::new(label, lint_inputs.len(), args.quiet);
         let progress_for_workers = progress.clone();
         let results = lint_inputs
             .par_iter()
@@ -438,6 +464,22 @@ fn run_lint(args: Args) -> Result<bool> {
         progress.finish();
         results
     });
+    let lint_elapsed = lint_started_at.elapsed();
+
+    if !args.quiet {
+        if let Some(fix_elapsed) = fix_elapsed {
+            eprintln!(
+                "flowscope: phase timing: fix={} lint={}",
+                format_cli_elapsed(fix_elapsed),
+                format_cli_elapsed(lint_elapsed)
+            );
+        } else {
+            eprintln!(
+                "flowscope: phase timing: lint={}",
+                format_cli_elapsed(lint_elapsed)
+            );
+        }
+    }
 
     let has_violations = file_results.iter().any(|f| !f.issues.is_empty());
     let colored = args.output.is_none() && std::io::stdout().is_terminal();
@@ -460,6 +502,17 @@ fn resolve_lint_jobs(jobs: Option<usize>) -> usize {
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(1)
     })
+}
+
+fn format_cli_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs >= 1.0 {
+        format!("{secs:.2}s")
+    } else if elapsed.as_millis() >= 1 {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{}us", elapsed.as_micros())
+    }
 }
 
 fn to_file_lint_result(

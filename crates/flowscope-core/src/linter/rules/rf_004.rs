@@ -420,7 +420,13 @@ fn normalize_token(token: &str) -> String {
 
 fn is_keyword(token: &str) -> bool {
     let upper = token.trim().to_ascii_uppercase();
-    ALL_KEYWORDS.binary_search(&upper.as_str()).is_ok() && !is_non_keyword_identifier(&upper)
+    (ALL_KEYWORDS.binary_search(&upper.as_str()).is_ok() || is_sqlfluff_extra_keyword(&upper))
+        && !is_non_keyword_identifier(&upper)
+}
+
+fn is_sqlfluff_extra_keyword(upper: &str) -> bool {
+    // SQLFluff treats COST as a keyword for PostgreSQL, while sqlparser does not.
+    matches!(upper, "COST")
 }
 
 /// Returns true for words that sqlparser includes in `ALL_KEYWORDS` but that
@@ -504,6 +510,13 @@ mod tests {
     #[test]
     fn flags_unquoted_keyword_projection_alias() {
         let issues = run("SELECT amount AS sum FROM t");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_RF_004);
+    }
+
+    #[test]
+    fn flags_cost_alias_as_keyword_identifier() {
+        let issues = run("SELECT 1 AS cost");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_RF_004);
     }
