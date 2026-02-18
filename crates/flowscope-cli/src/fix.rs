@@ -358,7 +358,13 @@ pub fn apply_lint_fixes_with_options(
     // violations, and also retry with core-only planning when net totals are
     // flat but per-rule regressions mask improvements.
     let masked_or_worse = after_total > before_total
-        || (after_total == before_total && after_counts != before_counts);
+        || (after_total == before_total
+            && after_counts != before_counts
+            && core_autofix_rules_not_improved(
+                &before_counts,
+                &after_counts,
+                &core_autofix_rules,
+            ));
     if masked_or_worse {
         if let Some(outcome) = try_core_only_fix_plan(
             sql,
@@ -5811,4 +5817,5 @@ ON CONFLICT (route, period_start, nav_type, mark) DO UPDATE SET
             "second pass should be idempotent aside from trailing-whitespace normalization"
         );
     }
+
 }

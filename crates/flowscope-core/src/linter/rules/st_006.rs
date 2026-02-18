@@ -923,9 +923,7 @@ fn projection_reorder_candidate_by_band(
         if core_span.start >= core_span.end || core_span.end > sql.len() {
             return None;
         }
-        if span_contains_comment(tokens, core_span)
-            || trailing_span_has_inline_comment(tokens, sql, core_span, item.trailing_span)
-        {
+        if trailing_span_has_inline_comment(tokens, sql, core_span, item.trailing_span) {
             return None;
         }
         let text = sql[core_span.start..core_span.end].trim();
@@ -993,15 +991,6 @@ fn projection_reorder_candidate_by_band(
         span: replace_span,
         edits: vec![IssuePatchEdit::new(replace_span, replacement)],
     })
-}
-
-fn span_contains_comment(tokens: &[PositionedToken], span: Span) -> bool {
-    if span.start >= span.end {
-        return false;
-    }
-    tokens
-        .iter()
-        .any(|token| token.start >= span.start && token.end <= span.end && is_comment(&token.token))
 }
 
 fn trailing_span_has_inline_comment(

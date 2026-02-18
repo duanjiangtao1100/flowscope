@@ -395,6 +395,17 @@ fn column_identity_expr<'a>(
 // ---------------------------------------------------------------------------
 
 fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usize)> {
+    if ctx.statement_range.start > 0 {
+        if let Some((start, end)) = expr_span_offsets(ctx.sql, expr) {
+            if start >= ctx.statement_range.start && end <= ctx.statement_range.end {
+                return Some((
+                    start - ctx.statement_range.start,
+                    end - ctx.statement_range.start,
+                ));
+            }
+        }
+    }
+
     if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
         return Some((start, end));
     }
@@ -404,10 +415,7 @@ fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usiz
         return None;
     }
 
-    Some((
-        start - ctx.statement_range.start,
-        end - ctx.statement_range.start,
-    ))
+    Some((start - ctx.statement_range.start, end - ctx.statement_range.start))
 }
 
 fn expr_span_offsets(sql: &str, expr: &Expr) -> Option<(usize, usize)> {

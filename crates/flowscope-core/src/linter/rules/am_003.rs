@@ -44,9 +44,21 @@ impl LintRule for AmbiguousOrderBy {
 
                 if clauses_align {
                     let clause_fix = &clause_autofixes[index];
-                    issue = issue.with_span(clause_fix.span).with_autofix_edits(
+                    let span =
+                        ctx.span_from_statement_offset(clause_fix.span.start, clause_fix.span.end);
+                    let edits = clause_fix
+                        .edits
+                        .iter()
+                        .map(|edit| {
+                            IssuePatchEdit::new(
+                                ctx.span_from_statement_offset(edit.span.start, edit.span.end),
+                                edit.replacement.clone(),
+                            )
+                        })
+                        .collect();
+                    issue = issue.with_span(span).with_autofix_edits(
                         IssueAutofixApplicability::Safe,
-                        clause_fix.edits.clone(),
+                        edits,
                     );
                 }
 
@@ -665,4 +677,5 @@ mod tests {
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(fixed, "SELECT * FROM t ORDER BY a DESC, b ASC NULLS LAST");
     }
+
 }

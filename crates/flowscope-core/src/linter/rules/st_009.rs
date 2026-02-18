@@ -664,6 +664,21 @@ fn flip_operator_text(gap: &str, op: &BinaryOperator) -> String {
 }
 
 fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usize)> {
+    // Statement ranges may intentionally trim leading comments/whitespace.
+    // SQLParser span line/column coordinates are often absolute to the
+    // original document, so prefer document-level offset conversion when the
+    // statement does not start at byte 0.
+    if ctx.statement_range.start > 0 {
+        if let Some((start, end)) = expr_span_offsets(ctx.sql, expr) {
+            if start >= ctx.statement_range.start && end <= ctx.statement_range.end {
+                return Some((
+                    start - ctx.statement_range.start,
+                    end - ctx.statement_range.start,
+                ));
+            }
+        }
+    }
+
     if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
         return Some((start, end));
     }
@@ -672,11 +687,7 @@ fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usiz
     if start < ctx.statement_range.start || end > ctx.statement_range.end {
         return None;
     }
-
-    Some((
-        start - ctx.statement_range.start,
-        end - ctx.statement_range.start,
-    ))
+    Some((start - ctx.statement_range.start, end - ctx.statement_range.start))
 }
 
 fn expr_span_offsets(sql: &str, expr: &Expr) -> Option<(usize, usize)> {
@@ -1104,4 +1115,33 @@ mod tests {
             "expected workspace join predicate reorder, got: {fixed}"
         );
     }
+
+    #[test]
+    fn autofix_handles_insert_select_with_on_conflict_join_chain() {
+        let sql = "INSERT INTO metrics.page_performance_summary (\n    route,\n    period_start,\n    period_end,\n    nav_type,\n    mark\n)\nSELECT\n    o.route,\n    p.period_start,\n    p.period_end,\n    o.nav_type,\n    o.mark\nFROM overall AS o\nCROSS JOIN params AS p\nLEFT JOIN device_breakdown AS d\n    ON d.route = o.route AND d.nav_type = o.nav_type AND d.mark = o.mark\nLEFT JOIN network_breakdown AS n\n    ON n.route = o.route AND n.nav_type = o.nav_type AND n.mark = o.mark\nLEFT JOIN version_breakdown AS v\n    ON v.route = o.route AND v.nav_type = o.nav_type AND v.mark = o.mark\nON CONFLICT (route, period_start, nav_type, mark) DO UPDATE SET\n    period_end = excluded.period_end;\n";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let autofix = issues[0]
+            .autofix
+            .as_ref()
+            .expect("expected ST009 autofix metadata");
+        let fixed = apply_edits(sql, &autofix.edits);
+        assert!(
+            fixed.contains("ON o.route = d.route AND o.nav_type = d.nav_type AND o.mark = d.mark"),
+            "expected first join reordered, got: {fixed}"
+        );
+        assert!(
+            fixed.contains("ON o.route = n.route AND o.nav_type = n.nav_type AND o.mark = n.mark"),
+            "expected second join reordered, got: {fixed}"
+        );
+        assert!(
+            fixed.contains("ON o.route = v.route AND o.nav_type = v.nav_type AND o.mark = v.mark"),
+            "expected third join reordered, got: {fixed}"
+        );
+        assert!(
+            fixed.contains("ON CONFLICT (route, period_start, nav_type, mark) DO UPDATE SET"),
+            "expected ON CONFLICT clause preserved, got: {fixed}"
+        );
+    }
+
 }

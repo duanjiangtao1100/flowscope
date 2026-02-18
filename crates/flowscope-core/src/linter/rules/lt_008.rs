@@ -123,7 +123,7 @@ fn lt08_violation_spans(
     let mut spans = Vec::new();
 
     for cte in &with_clause.cte_tables {
-        let Some(close_abs) = token_start_offset(ctx.sql, &cte.closing_paren_token.0) else {
+        let Some(close_abs) = token_start_offset_for_context(ctx, &cte.closing_paren_token.0) else {
             continue;
         };
 
@@ -178,9 +178,8 @@ fn lt08_violation_spans(
                             Some((fix_start - statement_start, fix_end - statement_start));
                     }
                 } else if matches!(comma_line_position, CommaLinePosition::Trailing) {
-                    let gap = &ctx.sql[gap_start..next_start];
-                    if let Some(comma_relative) = gap.rfind(',') {
-                        let after_comma = gap_start + comma_relative + 1;
+                    if let Some(after_comma) = first_comma_end_in_range(&tokens, gap_start, next_start)
+                    {
                         if let Some((fix_start, fix_end)) =
                             whitespace_gap_span(ctx.sql, after_comma, next_start)
                         {
@@ -389,6 +388,27 @@ fn token_start_offset(sql: &str, token: &TokenWithSpan) -> Option<usize> {
     )
 }
 
+fn token_start_offset_for_context(ctx: &LintContext, token: &TokenWithSpan) -> Option<usize> {
+    if ctx.statement_range.start > 0 {
+        if let Some(abs_start) = token_start_offset(ctx.sql, token) {
+            if abs_start >= ctx.statement_range.start && abs_start < ctx.statement_range.end {
+                return Some(abs_start);
+            }
+        }
+
+        if let Some(rel_start) = token_start_offset(ctx.statement_sql(), token) {
+            let abs_start = ctx.statement_range.start + rel_start;
+            if abs_start < ctx.statement_range.end {
+                return Some(abs_start);
+            }
+        }
+
+        return None;
+    }
+
+    token_start_offset(ctx.statement_sql(), token).or_else(|| token_start_offset(ctx.sql, token))
+}
+
 fn suffix_summary_after_offset(
     sql: &str,
     tokens: &[LocatedToken],
@@ -492,6 +512,19 @@ fn first_comment_start_in_range(
                 && is_comment_token(&token.token)
         })
         .map(|token| token.start)
+}
+
+fn first_comma_end_in_range(
+    tokens: &[LocatedToken],
+    start_offset: usize,
+    end_offset: usize,
+) -> Option<usize> {
+    tokens
+        .iter()
+        .find(|token| {
+            token.start >= start_offset && token.start < end_offset && matches!(token.token, Token::Comma)
+        })
+        .map(|token| token.end)
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -704,4 +737,5 @@ SELECT * FROM b");
             "WITH a AS (SELECT 1),\n\n-- keep this note\nb AS (SELECT 2)\n\nSELECT * FROM b"
         );
     }
+
 }
