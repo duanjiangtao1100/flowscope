@@ -56,10 +56,9 @@ impl LintRule for AmbiguousOrderBy {
                             )
                         })
                         .collect();
-                    issue = issue.with_span(span).with_autofix_edits(
-                        IssueAutofixApplicability::Safe,
-                        edits,
-                    );
+                    issue = issue
+                        .with_span(span)
+                        .with_autofix_edits(IssueAutofixApplicability::Safe, edits);
                 }
 
                 issue
@@ -677,5 +676,4 @@ mod tests {
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(fixed, "SELECT * FROM t ORDER BY a DESC, b ASC NULLS LAST");
     }
-
 }

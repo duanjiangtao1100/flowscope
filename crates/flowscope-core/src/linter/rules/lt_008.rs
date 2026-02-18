@@ -123,7 +123,8 @@ fn lt08_violation_spans(
     let mut spans = Vec::new();
 
     for cte in &with_clause.cte_tables {
-        let Some(close_abs) = token_start_offset_for_context(ctx, &cte.closing_paren_token.0) else {
+        let Some(close_abs) = token_start_offset_for_context(ctx, &cte.closing_paren_token.0)
+        else {
             continue;
         };
 
@@ -178,7 +179,8 @@ fn lt08_violation_spans(
                             Some((fix_start - statement_start, fix_end - statement_start));
                     }
                 } else if matches!(comma_line_position, CommaLinePosition::Trailing) {
-                    if let Some(after_comma) = first_comma_end_in_range(&tokens, gap_start, next_start)
+                    if let Some(after_comma) =
+                        first_comma_end_in_range(&tokens, gap_start, next_start)
                     {
                         if let Some((fix_start, fix_end)) =
                             whitespace_gap_span(ctx.sql, after_comma, next_start)
@@ -522,7 +524,9 @@ fn first_comma_end_in_range(
     tokens
         .iter()
         .find(|token| {
-            token.start >= start_offset && token.start < end_offset && matches!(token.token, Token::Comma)
+            token.start >= start_offset
+                && token.start < end_offset
+                && matches!(token.token, Token::Comma)
         })
         .map(|token| token.end)
 }
@@ -737,5 +741,4 @@ SELECT * FROM b");
             "WITH a AS (SELECT 1),\n\n-- keep this note\nb AS (SELECT 2)\n\nSELECT * FROM b"
         );
     }
-
 }

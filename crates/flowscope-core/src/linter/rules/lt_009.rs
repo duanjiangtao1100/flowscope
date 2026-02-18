@@ -1105,7 +1105,10 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT\n    a,\n    b,\n    c,\n    d,\n    e\nFROM t");
+        assert_eq!(
+            fixed,
+            "SELECT\n    a,\n    b,\n    c,\n    d,\n    e\nFROM t"
+        );
     }
 
     #[test]

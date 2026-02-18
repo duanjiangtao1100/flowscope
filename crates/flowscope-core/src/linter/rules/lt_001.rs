@@ -114,8 +114,7 @@ impl LintRule for LayoutSpacing {
                 self.ignore_templated_areas,
                 self.alignment_options(),
             ));
-            violations.sort_unstable_by_key(|(span, _)| *span);
-            violations.dedup_by_key(|(span, _)| *span);
+            merge_violations_by_span(&mut violations);
         }
 
         violations
@@ -147,6 +146,32 @@ type Lt01Span = (usize, usize);
 type Lt01AutofixEdit = (usize, usize, String);
 type Lt01Violation = (Lt01Span, Vec<Lt01AutofixEdit>);
 type Lt01TemplateSpan = (usize, usize);
+
+fn merge_violations_by_span(violations: &mut Vec<Lt01Violation>) {
+    violations.sort_unstable_by_key(|(span, _)| *span);
+    let mut merged: Vec<Lt01Violation> = Vec::with_capacity(violations.len());
+
+    for (span, edits) in violations.drain(..) {
+        if let Some((last_span, last_edits)) = merged.last_mut() {
+            if *last_span == span {
+                if last_edits.is_empty() && !edits.is_empty() {
+                    *last_edits = edits;
+                } else if !last_edits.is_empty() && !edits.is_empty() {
+                    for edit in edits {
+                        if !last_edits.contains(&edit) {
+                            last_edits.push(edit);
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        merged.push((span, edits));
+    }
+
+    *violations = merged;
+}
 
 #[derive(Clone, Copy)]
 struct Lt01AlignmentOptions {
@@ -186,7 +211,6 @@ fn spacing_violations(
         &templated_spans,
         &mut violations,
     );
-    collect_exists_line_paren_violations(sql, &tokens, &mut violations);
     if !ignore_templated_areas {
         collect_template_string_spacing_violations(sql, dialect, &templated_spans, &mut violations);
     }
@@ -530,6 +554,15 @@ fn collect_pair_spacing_violations(
                     violations.push((span, vec![edit]));
                     continue;
                 }
+                if gap.is_empty() && is_exists_keyword_token(&left.token) {
+                    // Zero-width inserts are filtered by the fix planner.
+                    // Replace the EXISTS token itself to preserve fixability.
+                    let replacement = format!("{} ", &sql[left_start..left_end]);
+                    let span = (left_start, left_end);
+                    let edit = (left_start, left_end, replacement);
+                    violations.push((span, vec![edit]));
+                    continue;
+                }
                 // Either missing space (gap is empty) or excessive space (multiple spaces).
                 let span = (left_end, right_start);
                 let edit = (left_end, right_start, " ".to_string());
@@ -861,6 +894,10 @@ fn is_type_keyword_for_bracket(token: &Token) -> bool {
     } else {
         false
     }
+}
+
+fn is_exists_keyword_token(token: &Token) -> bool {
+    matches!(token, Token::Word(word) if word.keyword == Keyword::EXISTS)
 }
 
 /// Check if a token is a DDL keyword after which the next word is an object name
@@ -1274,6 +1311,12 @@ fn expected_spacing_before_lparen(
                     return ExpectedSpacing::NoneInline;
                 }
             }
+            if w.value.eq_ignore_ascii_case("EXISTS") {
+                if exists_requires_space_before_lparen(tokens, left_idx) {
+                    return ExpectedSpacing::Single;
+                }
+                return ExpectedSpacing::Skip;
+            }
             // Keywords that should have a space before (
             if is_keyword_requiring_space_before_paren(w.keyword) {
                 // AS in CTE: `AS (` should be single-inline (collapse newlines to space)
@@ -1321,6 +1364,40 @@ fn expected_spacing_before_lparen(
     }
 }
 
+fn exists_requires_space_before_lparen(tokens: &[TokenWithSpan], left_idx: usize) -> bool {
+    let Some(prev_idx) = prev_non_trivia_index(tokens, left_idx) else {
+        return false;
+    };
+
+    match &tokens[prev_idx].token {
+        Token::Word(word) => {
+            matches!(
+                word.keyword,
+                Keyword::AND
+                    | Keyword::OR
+                    | Keyword::NOT
+                    | Keyword::WHERE
+                    | Keyword::HAVING
+                    | Keyword::WHEN
+                    | Keyword::THEN
+                    | Keyword::ELSE
+            ) || matches!(
+                word.value.to_ascii_uppercase().as_str(),
+                "AND" | "OR" | "NOT" | "WHERE" | "HAVING" | "WHEN" | "THEN" | "ELSE"
+            )
+        }
+        Token::RParen
+        | Token::LParen
+        | Token::Eq
+        | Token::Neq
+        | Token::Lt
+        | Token::Gt
+        | Token::LtEq
+        | Token::GtEq => true,
+        _ => false,
+    }
+}
+
 /// Keywords that should have a space before `(`.
 fn is_keyword_requiring_space_before_paren(keyword: Keyword) -> bool {
     matches!(
@@ -1332,7 +1409,6 @@ fn is_keyword_requiring_space_before_paren(keyword: Keyword) -> bool {
             | Keyword::ON
             | Keyword::WHERE
             | Keyword::IN
-            | Keyword::EXISTS
             | Keyword::BETWEEN
             | Keyword::WHEN
             | Keyword::THEN
@@ -1430,50 +1506,6 @@ fn overlaps_template_span(spans: &[Lt01TemplateSpan], start: usize, end: usize) 
     spans
         .iter()
         .any(|(template_start, template_end)| start < *template_end && end > *template_start)
-}
-
-// ---------------------------------------------------------------------------
-// EXISTS-on-new-line special check (report-only, no autofix)
-// ---------------------------------------------------------------------------
-
-fn collect_exists_line_paren_violations(
-    sql: &str,
-    tokens: &[TokenWithSpan],
-    violations: &mut Vec<Lt01Violation>,
-) {
-    for (index, token) in tokens.iter().enumerate() {
-        let Token::Word(word) = &token.token else {
-            continue;
-        };
-        if word.keyword != Keyword::EXISTS {
-            continue;
-        }
-
-        let Some(next_index) = next_non_trivia_index(tokens, index + 1) else {
-            continue;
-        };
-        if !matches!(tokens[next_index].token, Token::LParen) {
-            continue;
-        }
-        if !has_trivia_between(tokens, index, next_index) {
-            continue;
-        }
-
-        if previous_line_ends_with_boolean_keyword(tokens, index) {
-            continue;
-        }
-
-        let Some((exists_start, _)) = token_offsets(sql, token) else {
-            continue;
-        };
-        if !line_prefix_is_whitespace(sql, exists_start) {
-            continue;
-        }
-
-        if let Some((paren_start, _)) = token_offsets(sql, &tokens[next_index]) {
-            violations.push((single_char_span(sql, paren_start), Vec::new()));
-        }
-    }
 }
 
 fn collect_ansi_national_string_literal_violations(
@@ -1791,25 +1823,6 @@ fn tokenized_for_context(ctx: &LintContext) -> Option<Vec<TokenWithSpan>> {
     })
 }
 
-fn previous_line_ends_with_boolean_keyword(tokens: &[TokenWithSpan], index: usize) -> bool {
-    let Some(prev_index) = prev_non_trivia_index(tokens, index) else {
-        return false;
-    };
-    let Token::Word(prev_word) = &tokens[prev_index].token else {
-        return false;
-    };
-    if !matches!(prev_word.keyword, Keyword::AND | Keyword::OR | Keyword::NOT) {
-        return false;
-    }
-
-    tokens[prev_index].span.end.line < tokens[index].span.start.line
-}
-
-fn line_prefix_is_whitespace(sql: &str, offset: usize) -> bool {
-    let line_start = sql[..offset].rfind('\n').map_or(0, |index| index + 1);
-    sql[line_start..offset].chars().all(char::is_whitespace)
-}
-
 fn token_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
     let start = line_col_to_offset(
         sql,
@@ -1822,11 +1835,6 @@ fn token_offsets(sql: &str, token: &TokenWithSpan) -> Option<(usize, usize)> {
         token.span.end.column as usize,
     )?;
     Some((start, end))
-}
-
-fn single_char_span(sql: &str, start: usize) -> (usize, usize) {
-    let end = (start + 1).min(sql.len());
-    (start, end)
 }
 
 fn next_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
@@ -1847,13 +1855,6 @@ fn prev_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<u
         }
     }
     None
-}
-
-fn has_trivia_between(tokens: &[TokenWithSpan], left: usize, right: usize) -> bool {
-    right > left + 1
-        && tokens[left + 1..right]
-            .iter()
-            .any(|token| is_trivia_token(&token.token))
 }
 
 fn is_trivia_token(token: &Token) -> bool {
@@ -2550,16 +2551,22 @@ mod tests {
         assert_eq!(fixed, "SELECT payload ->> 'id' FROM t");
     }
 
-    // --- EXISTS layout test ---
+    #[test]
+    fn does_not_flag_exists_without_space_before_parenthesis() {
+        let no_space = "SELECT\n    EXISTS(\n        SELECT 1\n    ) AS has_row\nFROM t";
+        assert!(run(no_space).is_empty());
+    }
 
     #[test]
-    fn flags_exists_parenthesis_layout_case() {
-        let issues = run("SELECT\n    EXISTS (\n        SELECT 1\n    ) AS has_row");
-        assert!(!issues.is_empty());
-        assert!(
-            issues.iter().all(|issue| issue.autofix.is_none()),
-            "EXISTS newline layout violations remain report-only"
-        );
+    fn merge_violations_prefers_fixable_duplicate_span() {
+        let mut violations = vec![
+            ((10, 10), Vec::new()),
+            ((10, 10), vec![(10, 10, " ".to_string())]),
+        ];
+        merge_violations_by_span(&mut violations);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].0, (10, 10));
+        assert_eq!(violations[0].1, vec![(10, 10, " ".to_string())]);
     }
 
     // --- Safe pass cases ---

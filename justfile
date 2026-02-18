@@ -452,6 +452,53 @@ sql-corpus-parity SQL_DIR="" SQLFLUFF_BIN="" DIALECT="postgres":
         --sqlfluff-bin "$sqlfluff_bin" \
         --dialect "{{DIALECT}}"
 
+# LT02-only corpus parity workbench (indentation engine project)
+lt02-corpus-parity SQL_DIR="" SQLFLUFF_BIN="" DIALECT="postgres" JSON_OUTPUT="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{SQL_DIR}}" ]; then
+        sql_dir="{{SQL_DIR}}"
+    elif [ -n "${SQL_DIR:-}" ]; then
+        sql_dir="$SQL_DIR"
+    else
+        echo "Usage: just lt02-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "  or:  SQL_DIR=/path/to/sql-dir SQLFLUFF_BIN=/path/to/sqlfluff just lt02-corpus-parity"
+        exit 1
+    fi
+    if [ -n "{{SQLFLUFF_BIN}}" ]; then
+        sqlfluff_bin="{{SQLFLUFF_BIN}}"
+    elif [ -n "${SQLFLUFF_BIN:-}" ]; then
+        sqlfluff_bin="$SQLFLUFF_BIN"
+    elif [ -n "${SQLFLUFF_DIR:-}" ] && [ -x "${SQLFLUFF_DIR}/.venv/bin/sqlfluff" ]; then
+        sqlfluff_bin="${SQLFLUFF_DIR}/.venv/bin/sqlfluff"
+    else
+        echo "SQLFluff binary not found."
+        echo "Provide it explicitly:"
+        echo "  just lt02-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "or set SQLFLUFF_BIN=/path/to/sqlfluff"
+        echo "or set SQLFLUFF_DIR with a .venv/bin/sqlfluff binary."
+        exit 1
+    fi
+    if [ -n "{{JSON_OUTPUT}}" ]; then
+        json_output="{{JSON_OUTPUT}}"
+    elif [ -n "${JSON_OUTPUT:-}" ]; then
+        json_output="$JSON_OUTPUT"
+    else
+        json_output=""
+    fi
+    if [ -n "$json_output" ]; then
+        python3 scripts/lt02-indent-parity-workbench.py \
+            --sql-dir "$sql_dir" \
+            --sqlfluff-bin "$sqlfluff_bin" \
+            --dialect "{{DIALECT}}" \
+            --json-output "$json_output"
+    else
+        python3 scripts/lt02-indent-parity-workbench.py \
+            --sql-dir "$sql_dir" \
+            --sqlfluff-bin "$sqlfluff_bin" \
+            --dialect "{{DIALECT}}"
+    fi
+
 # Pre-release validation: all checks needed before tagging a release
 pre-release: check-generated check-all
     @echo "All pre-release checks passed!"

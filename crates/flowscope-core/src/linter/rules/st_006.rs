@@ -927,9 +927,7 @@ fn projection_reorder_candidate_by_band(
             return None;
         }
         let text = sql[core_span.start..core_span.end].trim();
-        let Some(normalized) = normalize_projection_item_text(text) else {
-            return None;
-        };
+        let normalized = normalize_projection_item_text(text)?;
 
         let leading = if item.leading_span.start < item.leading_span.end
             && item.leading_span.end <= sql.len()
@@ -1003,7 +1001,9 @@ fn trailing_span_has_inline_comment(
         return false;
     }
     tokens.iter().any(|token| {
-        if token.start < trailing_span.start || token.end > trailing_span.end || !is_comment(&token.token)
+        if token.start < trailing_span.start
+            || token.end > trailing_span.end
+            || !is_comment(&token.token)
         {
             return false;
         }

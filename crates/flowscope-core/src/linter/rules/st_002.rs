@@ -415,7 +415,10 @@ fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usiz
         return None;
     }
 
-    Some((start - ctx.statement_range.start, end - ctx.statement_range.start))
+    Some((
+        start - ctx.statement_range.start,
+        end - ctx.statement_range.start,
+    ))
 }
 
 fn expr_span_offsets(sql: &str, expr: &Expr) -> Option<(usize, usize)> {

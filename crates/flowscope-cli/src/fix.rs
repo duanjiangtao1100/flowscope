@@ -716,13 +716,7 @@ fn parse_errors_increased(
 }
 
 fn regression_guard_total(counts: &BTreeMap<String, usize>) -> usize {
-    counts
-        .iter()
-        // LT02 parity is currently architectural/out-of-scope; don't let LT02
-        // increases mask deterministic improvements in other core autofixes.
-        .filter(|(code, _)| !code.eq_ignore_ascii_case(issue_codes::LINT_LT_002))
-        .map(|(_, count)| *count)
-        .sum()
+    counts.values().copied().sum()
 }
 
 fn try_core_only_fix_plan(

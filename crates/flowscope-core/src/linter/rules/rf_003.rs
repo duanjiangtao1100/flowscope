@@ -273,9 +273,8 @@ fn ancestor_source_names_for_select(
 
     let mut out = HashSet::new();
     for scope in scopes {
-        let strictly_contains = scope.start <= start
-            && scope.end >= end
-            && (scope.start != start || scope.end != end);
+        let strictly_contains =
+            scope.start <= start && scope.end >= end && (scope.start != start || scope.end != end);
         if strictly_contains {
             out.extend(scope.sources.iter().cloned());
         }

@@ -583,17 +583,14 @@ fn find_last_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usiz
     let haystack_bytes = haystack.as_bytes();
     let needle_bytes = needle.as_bytes();
 
-    for start in (0..=haystack_bytes.len() - needle_bytes.len()).rev() {
-        if haystack_bytes[start..start + needle_bytes.len()]
-            .iter()
-            .zip(needle_bytes.iter())
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        {
-            return Some(start);
-        }
-    }
-
-    None
+    (0..=haystack_bytes.len() - needle_bytes.len())
+        .rev()
+        .find(|&start| {
+            haystack_bytes[start..start + needle_bytes.len()]
+                .iter()
+                .zip(needle_bytes.iter())
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
 }
 
 fn rewrite_over_clause_with_tail_line(line: &str, max_line_length: usize) -> Option<String> {

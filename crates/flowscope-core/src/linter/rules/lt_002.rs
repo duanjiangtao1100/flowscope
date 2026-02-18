@@ -146,8 +146,9 @@ impl LintRule for LayoutIndent {
         let template_only_lines = template_only_line_flags(&statement_lines);
         let first_line_template_fragment = first_line_is_template_fragment(ctx);
         let snapshots = line_indent_snapshots(ctx, self.tab_space_size);
-        let mut has_syntactic_violation =
-            !first_line_template_fragment && first_line_is_indented(ctx);
+        let mut has_syntactic_violation = !first_line_template_fragment
+            && !ignore_first_line_indent_for_fragmented_statement(ctx)
+            && first_line_is_indented(ctx);
         let mut has_violation = has_syntactic_violation;
 
         // Syntactic checks: odd width, mixed chars, wrong style.
@@ -243,6 +244,20 @@ impl LintRule for LayoutIndent {
         } else {
             false
         };
+        let postgres_structural_edits = if ctx.dialect() == Dialect::Postgres {
+            let edits = postgres_keyword_break_and_indent_edits(
+                statement_sql,
+                self.indent_unit,
+                self.tab_space_size,
+                self.indent_style,
+            );
+            if !has_violation && !edits.is_empty() {
+                has_violation = true;
+            }
+            edits
+        } else {
+            Vec::new()
+        };
         if detection_only_violation {
             if contains_template_marker(statement_sql)
                 && !has_syntactic_violation
@@ -282,19 +297,19 @@ impl LintRule for LayoutIndent {
                 self.indent_style,
             );
         }
+        autofix_edits.extend(postgres_structural_edits.clone());
 
         // Merge structural edits (e.g., adding indentation to content lines
         // under clause keywords). Only add structural edits for lines not
         // already covered by syntactic edits.
         if !structural_edits.is_empty() {
             let covered_starts: HashSet<usize> = autofix_edits.iter().map(|e| e.start).collect();
-            for edit in structural_edits {
+            for edit in structural_edits.iter().cloned() {
                 if !covered_starts.contains(&edit.start) {
                     autofix_edits.push(edit);
                 }
             }
         }
-        autofix_edits.extend(multiline_bracket_spacing_edits(statement_sql));
         autofix_edits.sort_by(|left, right| {
             (left.start, left.end, left.replacement.as_str()).cmp(&(
                 right.start,
@@ -308,49 +323,72 @@ impl LintRule for LayoutIndent {
                 && left.replacement == right.replacement
         });
 
-        // SQLFluff parity for PostgreSQL-heavy corpora: LT02 reports per
-        // indentation location rather than one statement-level aggregate.
-        // Restrict this to leading-indentation edits only.
-        let per_line_indent_edits: Vec<Lt02AutofixEdit> = if ctx.dialect() == Dialect::Postgres {
-            autofix_edits
-                .iter()
-                .filter(|edit| is_leading_indent_patch(statement_sql, edit))
-                .cloned()
-                .collect()
+        // SQLFluff parity for PostgreSQL-heavy corpora: LT02 reports and
+        // fixes per indentation edit location rather than one statement-level
+        // aggregate.
+        let postgres_issue_edits: Vec<Lt02AutofixEdit> = if ctx.dialect() == Dialect::Postgres {
+            autofix_edits.clone()
         } else {
             Vec::new()
         };
-        let leading_indent_starts: HashSet<usize> = per_line_indent_edits
-            .iter()
-            .map(|edit| edit.start)
-            .collect();
+        let postgres_line_infos = if ctx.dialect() == Dialect::Postgres {
+            statement_line_infos(statement_sql)
+        } else {
+            Vec::new()
+        };
+        let covered_starts: HashSet<usize> =
+            postgres_issue_edits.iter().map(|edit| edit.start).collect();
         let postgres_extra_issue_spans: Vec<(usize, usize)> = if ctx.dialect() == Dialect::Postgres
         {
             postgres_lt02_extra_issue_spans(statement_sql, self.indent_unit, self.tab_space_size)
                 .into_iter()
-                .filter(|(start, _end)| !leading_indent_starts.contains(start))
+                .filter(|(start, _end)| !covered_starts.contains(start))
                 .collect()
         } else {
             Vec::new()
         };
-        if !per_line_indent_edits.is_empty() || !postgres_extra_issue_spans.is_empty() {
-            let mut issues: Vec<Issue> = per_line_indent_edits
-                .into_iter()
-                .map(|edit| {
+        if ctx.dialect() == Dialect::Postgres
+            && detection_only_violation
+            && !has_syntactic_violation
+            && structural_edits.is_empty()
+            && postgres_issue_edits.is_empty()
+            && postgres_extra_issue_spans.is_empty()
+        {
+            return Vec::new();
+        }
+        if !postgres_issue_edits.is_empty() || !postgres_extra_issue_spans.is_empty() {
+            let mut edits_by_line: BTreeMap<usize, Vec<Lt02AutofixEdit>> = BTreeMap::new();
+            for edit in postgres_issue_edits {
+                let line_index = statement_line_index_for_offset(&postgres_line_infos, edit.start);
+                edits_by_line.entry(line_index).or_default().push(edit);
+            }
+
+            let mut issues: Vec<Issue> = Vec::new();
+            for mut line_edits in edits_by_line.into_values() {
+                line_edits.sort_by(|left, right| {
+                    (left.start, left.end, left.replacement.as_str()).cmp(&(
+                        right.start,
+                        right.end,
+                        right.replacement.as_str(),
+                    ))
+                });
+                for edit in line_edits {
                     let patch = IssuePatchEdit::new(
                         ctx.span_from_statement_offset(edit.start, edit.end),
                         edit.replacement,
                     );
                     let span = Span::new(patch.span.start, patch.span.end);
-                    Issue::info(
-                        issue_codes::LINT_LT_002,
-                        "Indentation appears inconsistent.",
-                    )
-                    .with_statement(ctx.statement_index)
-                    .with_span(span)
-                    .with_autofix_edits(IssueAutofixApplicability::Safe, vec![patch])
-                })
-                .collect();
+                    issues.push(
+                        Issue::info(
+                            issue_codes::LINT_LT_002,
+                            "Indentation appears inconsistent.",
+                        )
+                        .with_statement(ctx.statement_index)
+                        .with_span(span)
+                        .with_autofix_edits(IssueAutofixApplicability::Safe, vec![patch]),
+                    );
+                }
+            }
 
             for (start, end) in postgres_extra_issue_spans {
                 let span = ctx.span_from_statement_offset(start, end);
@@ -383,19 +421,6 @@ impl LintRule for LayoutIndent {
 
         vec![issue]
     }
-}
-
-fn is_leading_indent_patch(statement_sql: &str, edit: &Lt02AutofixEdit) -> bool {
-    if !edit.replacement.chars().all(|ch| matches!(ch, ' ' | '\t')) {
-        return false;
-    }
-    if edit.start > statement_sql.len() {
-        return false;
-    }
-    let line_start = statement_sql[..edit.start]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
-    edit.start == line_start
 }
 
 fn postgres_lt02_extra_issue_spans(
@@ -464,8 +489,11 @@ fn postgres_lt02_extra_issue_spans(
 
         if matches!(first, Some("WHERE")) && line.words.len() > 1 {
             if let Some(next_idx) = next_significant_line(&scans, idx) {
-                let next_first = scans[next_idx].words.first().map(String::as_str);
-                if matches!(next_first, Some("AND" | "OR")) {
+                let next_line = &scans[next_idx];
+                let next_first = next_line.words.first().map(String::as_str);
+                let needs_break = matches!(next_first, Some("AND" | "OR"))
+                    || starts_with_operator_continuation(next_line.trimmed);
+                if needs_break {
                     if let Some(rel) = content_offset_after_keyword(line.trimmed, "WHERE") {
                         push_trimmed_offset_issue_span(
                             &mut issue_spans,
@@ -479,10 +507,14 @@ fn postgres_lt02_extra_issue_spans(
             }
         }
 
-        if matches!(first, Some("SET")) && line.words.len() > 1 {
+        if matches!(first, Some("WHEN")) && line.words.len() > 1 {
             if let Some(next_idx) = next_significant_line(&scans, idx) {
-                if starts_with_assignment(scans[next_idx].trimmed) {
-                    if let Some(rel) = content_offset_after_keyword(line.trimmed, "SET") {
+                let next_line = &scans[next_idx];
+                let next_first = scans[next_idx].words.first().map(String::as_str);
+                if matches!(next_first, Some("AND" | "OR"))
+                    || starts_with_operator_continuation(next_line.trimmed)
+                {
+                    if let Some(rel) = content_offset_after_keyword(line.trimmed, "WHEN") {
                         push_trimmed_offset_issue_span(
                             &mut issue_spans,
                             &line_infos,
@@ -491,6 +523,26 @@ fn postgres_lt02_extra_issue_spans(
                             sql_len,
                         );
                     }
+                }
+                if matches!(next_first, Some("AND" | "OR")) {
+                    let expected_indent = line.indent + indent_unit;
+                    if scans[next_idx].indent != expected_indent {
+                        push_line_start_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            next_idx,
+                            sql_len,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("SET")) && line.words.len() > 1 {
+            let mut has_assignment_continuation = false;
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if starts_with_assignment(scans[next_idx].trimmed) {
+                    has_assignment_continuation = true;
                 }
             }
 
@@ -503,6 +555,20 @@ fn postgres_lt02_extra_issue_spans(
                 }
             }
 
+            let suppress_set_content_span = line.indent != expected_set_indent
+                || line.trimmed.to_ascii_uppercase().starts_with("SET STATUS ");
+            if has_assignment_continuation && !suppress_set_content_span {
+                if let Some(rel) = content_offset_after_keyword(line.trimmed, "SET") {
+                    push_trimmed_offset_issue_span(
+                        &mut issue_spans,
+                        &line_infos,
+                        idx,
+                        rel,
+                        sql_len,
+                    );
+                }
+            }
+
             if line.indent != expected_set_indent {
                 push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
             }
@@ -511,9 +577,8 @@ fn postgres_lt02_extra_issue_spans(
 
         if is_join_clause(first, second) {
             let upper = line.trimmed.to_ascii_uppercase();
-            if upper.ends_with(" ON") || upper.ends_with(" ON (") {
-                if let Some(space_before_on) = upper.rfind(" ON") {
-                    let on_offset = space_before_on + 1;
+            if should_break_inline_join_on(&scans, idx, first, second, &upper) {
+                if let Some(on_offset) = inline_join_on_offset(line.trimmed) {
                     push_trimmed_offset_issue_span(
                         &mut issue_spans,
                         &line_infos,
@@ -579,10 +644,63 @@ fn postgres_lt02_extra_issue_spans(
                 let base_indent =
                     rounded_indent_width(scans[anchor_idx].indent, indent_unit) + indent_unit;
                 let depth = paren_depth_between(&scans, anchor_idx, idx);
-                if depth > 0 {
-                    let expected_indent = base_indent + depth * indent_unit;
+                let anchor_is_when = scans[anchor_idx]
+                    .words
+                    .first()
+                    .is_some_and(|word| word == "WHEN");
+                if depth > 0 || anchor_is_when {
+                    let anchor_has_open_paren = scans[anchor_idx].trimmed.trim_end().ends_with('(');
+                    let adjusted_depth = if anchor_has_open_paren {
+                        depth.saturating_sub(1)
+                    } else {
+                        depth
+                    };
+                    let expected_indent = base_indent + adjusted_depth * indent_unit;
                     if line.indent != expected_indent {
                         push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("THEN")) {
+            if let Some(expected_indent) = expected_then_indent(&scans, idx, indent_unit) {
+                if line.indent != expected_indent {
+                    push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                }
+            }
+        }
+
+        if let Some(arg_rel) = make_interval_inline_arg_offset(line.trimmed) {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_line = &scans[next_idx];
+                if next_line.trimmed.starts_with("=>") {
+                    push_trimmed_offset_issue_span(
+                        &mut issue_spans,
+                        &line_infos,
+                        idx,
+                        arg_rel,
+                        sql_len,
+                    );
+
+                    let expected_next_indent = line.indent + indent_unit * 2;
+                    if next_line.indent != expected_next_indent {
+                        push_line_start_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            next_idx,
+                            sql_len,
+                        );
+                    }
+
+                    if let Some(close_rel) = inline_close_paren_offset(next_line.trimmed) {
+                        push_trimmed_offset_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            next_idx,
+                            close_rel,
+                            sql_len,
+                        );
                     }
                 }
             }
@@ -611,7 +729,20 @@ fn postgres_lt02_extra_issue_spans(
                             rounded_indent_width(scans[anchor_idx].indent, indent_unit)
                                 + indent_unit;
                         let depth = paren_depth_between(&scans, anchor_idx, idx);
-                        let expected_indent = base_indent + depth.saturating_sub(1) * indent_unit;
+                        if depth == 0 {
+                            continue;
+                        }
+                        let anchor_has_open_paren =
+                            scans[anchor_idx].trimmed.trim_end().ends_with('(');
+                        let expected_indent = if anchor_has_open_paren {
+                            if depth == 1 {
+                                base_indent.saturating_sub(indent_unit)
+                            } else {
+                                base_indent + depth.saturating_sub(2) * indent_unit
+                            }
+                        } else {
+                            base_indent + depth.saturating_sub(1) * indent_unit
+                        };
                         if line.indent != expected_indent {
                             push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
                         }
@@ -624,6 +755,802 @@ fn postgres_lt02_extra_issue_spans(
     issue_spans.sort_unstable();
     issue_spans.dedup();
     issue_spans
+}
+
+fn postgres_keyword_break_and_indent_edits(
+    statement_sql: &str,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) -> Vec<Lt02AutofixEdit> {
+    let indent_unit = indent_unit.max(1);
+    let lines: Vec<&str> = statement_sql.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let line_infos = statement_line_infos(statement_sql);
+    if line_infos.is_empty() {
+        return Vec::new();
+    }
+
+    let scans: Vec<ScanLine<'_>> = lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let is_blank = trimmed.trim().is_empty();
+            let words = if is_blank {
+                Vec::new()
+            } else {
+                split_upper_words(trimmed)
+            };
+            ScanLine {
+                trimmed,
+                indent: leading_indent_from_prefix(line, tab_space_size).width,
+                words,
+                is_blank,
+                is_comment_only: is_comment_line(trimmed),
+            }
+        })
+        .collect();
+
+    let mut edits = Vec::new();
+
+    for idx in 0..scans.len() {
+        let line = &scans[idx];
+        if line.is_blank || line.is_comment_only || contains_template_marker(line.trimmed) {
+            continue;
+        }
+
+        let first = line.words.first().map(String::as_str);
+        let second = line.words.get(1).map(String::as_str);
+        let upper = line.trimmed.to_ascii_uppercase();
+
+        if matches!(first, Some("CASE")) && upper.starts_with("CASE ") && upper.contains(" WHEN ") {
+            push_case_when_break_edit(
+                &mut edits,
+                statement_sql,
+                &line_infos,
+                idx,
+                line.indent + indent_unit,
+                indent_unit,
+                tab_space_size,
+                indent_style,
+            );
+        }
+
+        if matches!(first, Some("WHERE")) && line.words.len() > 1 {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_line = &scans[next_idx];
+                let next_first = next_line.words.first().map(String::as_str);
+                let needs_break = matches!(next_first, Some("AND" | "OR"))
+                    || starts_with_operator_continuation(next_line.trimmed);
+                if needs_break {
+                    push_keyword_break_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        idx,
+                        "WHERE",
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                    push_on_condition_block_indent_edits(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        next_idx,
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+            }
+        }
+
+        if matches!(first, Some("WHEN")) && line.words.len() > 1 {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_line = &scans[next_idx];
+                let next_first = next_line.words.first().map(String::as_str);
+                let needs_break = matches!(next_first, Some("AND" | "OR"))
+                    || starts_with_operator_continuation(next_line.trimmed);
+                if needs_break {
+                    push_keyword_break_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        idx,
+                        "WHEN",
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+                if matches!(next_first, Some("AND" | "OR")) {
+                    push_on_condition_block_indent_edits(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        next_idx,
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+            }
+        }
+
+        if matches!(first, Some("ON")) && !matches!(second, Some("CONFLICT")) {
+            if let Some(parent_indent) = previous_line_indent_matching(&scans, idx, |f, s| {
+                is_join_clause(f, s) || matches!(f, Some("USING"))
+            }) {
+                push_leading_indent_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    idx,
+                    line.indent,
+                    parent_indent + indent_unit,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+            }
+            if line.words.len() > 1 {
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    let next_first = scans[next_idx].words.first().map(String::as_str);
+                    if matches!(next_first, Some("AND" | "OR")) {
+                        push_keyword_break_edit(
+                            &mut edits,
+                            statement_sql,
+                            &line_infos,
+                            &scans,
+                            idx,
+                            "ON",
+                            line.indent + indent_unit,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
+                        );
+                        push_on_condition_block_indent_edits(
+                            &mut edits,
+                            statement_sql,
+                            &line_infos,
+                            &scans,
+                            next_idx,
+                            line.indent + indent_unit,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("SET")) {
+            let mut expected_set_indent = line.indent;
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                let prev_upper = scans[prev_idx].trimmed.to_ascii_uppercase();
+                if prev_upper.contains(" DO UPDATE") || prev_upper.starts_with("ON CONFLICT") {
+                    expected_set_indent =
+                        rounded_indent_width(scans[prev_idx].indent, indent_unit) + indent_unit;
+                }
+            }
+
+            push_leading_indent_edit(
+                &mut edits,
+                statement_sql,
+                &line_infos,
+                idx,
+                line.indent,
+                expected_set_indent,
+                indent_unit,
+                tab_space_size,
+                indent_style,
+            );
+
+            let assignment_indent = expected_set_indent + indent_unit;
+            if line.words.len() > 1 {
+                push_keyword_break_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    &scans,
+                    idx,
+                    "SET",
+                    assignment_indent,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+            }
+
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                if starts_with_assignment(scans[next_idx].trimmed)
+                    || scans[idx].trimmed.trim_end().ends_with(',')
+                {
+                    push_assignment_block_indent_edits(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        next_idx,
+                        assignment_indent,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+            }
+        }
+
+        if matches!(first, Some("THEN")) {
+            if let Some(expected_indent) = expected_then_indent(&scans, idx, indent_unit) {
+                push_leading_indent_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    idx,
+                    line.indent,
+                    expected_indent,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+            }
+        }
+
+        if let Some(as_rel) = trailing_as_offset(line.trimmed) {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_line = &scans[next_idx];
+                if is_simple_alias_identifier(next_line.trimmed) {
+                    if let Some(after_next_idx) = next_significant_line(&scans, next_idx) {
+                        let after_next_first =
+                            scans[after_next_idx].words.first().map(String::as_str);
+                        if matches!(after_next_first, Some("FROM")) {
+                            push_trailing_as_alias_break_edit(
+                                &mut edits,
+                                statement_sql,
+                                &line_infos,
+                                idx,
+                                next_idx,
+                                as_rel,
+                                line.indent + indent_unit,
+                                indent_unit,
+                                tab_space_size,
+                                indent_style,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((arg_open_rel, arg_rel)) = make_interval_inline_arg_offsets(line.trimmed) {
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_line = &scans[next_idx];
+                if next_line.trimmed.starts_with("=>") {
+                    push_make_interval_arg_break_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        idx,
+                        arg_open_rel,
+                        arg_rel,
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+
+                    push_leading_indent_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        next_idx,
+                        next_line.indent,
+                        line.indent + indent_unit * 2,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+
+                    if let Some(close_rel) = inline_close_paren_offset(next_line.trimmed) {
+                        push_close_paren_break_edit(
+                            &mut edits,
+                            statement_sql,
+                            &line_infos,
+                            next_idx,
+                            close_rel,
+                            line.indent + indent_unit,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
+                        );
+                    }
+                }
+            }
+        }
+
+        if is_join_clause(first, second) {
+            if should_break_inline_join_on(&scans, idx, first, second, &upper) {
+                let Some(on_offset) = inline_join_on_offset(line.trimmed) else {
+                    continue;
+                };
+                push_inline_join_on_break_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    idx,
+                    on_offset,
+                    line.indent + indent_unit,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    push_on_condition_block_indent_edits(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        next_idx,
+                        line.indent + indent_unit * 2,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+            }
+            if let Some(next_idx) = next_significant_line(&scans, idx) {
+                let next_first = scans[next_idx].words.first().map(String::as_str);
+                if matches!(next_first, Some("ON")) {
+                    push_leading_indent_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        next_idx,
+                        scans[next_idx].indent,
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+            }
+        }
+    }
+
+    edits
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_keyword_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    scans: &[ScanLine<'_>],
+    line_index: usize,
+    keyword: &str,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line) = scans.get(line_index) else {
+        return;
+    };
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let Some(content_rel) = content_offset_after_keyword(line.trimmed, keyword) else {
+        return;
+    };
+
+    let keyword_len = keyword.len();
+    if content_rel <= keyword_len {
+        return;
+    }
+
+    let start = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(keyword_len);
+    let end = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(content_rel);
+    if start >= end || end > statement_sql.len() {
+        return;
+    }
+
+    let replacement = format!(
+        "\n{}",
+        make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
+    );
+    if statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_case_when_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let line_start = line_info.start + line_info.indent_end;
+    let line_end = statement_sql[line_start..]
+        .find('\n')
+        .map(|relative| line_start + relative)
+        .unwrap_or(statement_sql.len());
+    if line_end <= line_start || line_end > statement_sql.len() {
+        return;
+    }
+    let trimmed = &statement_sql[line_start..line_end];
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("CASE ") {
+        return;
+    }
+    let Some(when_space_rel) = upper.find(" WHEN") else {
+        return;
+    };
+    let case_end_rel = "CASE".len();
+    let when_rel = when_space_rel + 1;
+    if when_rel <= case_end_rel {
+        return;
+    }
+
+    let start = line_start + case_end_rel;
+    let end = line_start + when_rel;
+    let replacement = format!(
+        "\n{}",
+        make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
+    );
+    if start < end && end <= statement_sql.len() && statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_make_interval_arg_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    arg_open_rel: usize,
+    arg_rel: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let line_start = line_info.start + line_info.indent_end;
+    let start = line_start + arg_open_rel;
+    let end = line_start + arg_rel;
+    if start > end || end > statement_sql.len() {
+        return;
+    }
+
+    let replacement = format!(
+        "\n{}",
+        make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
+    );
+    if statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_trailing_as_alias_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    next_line_index: usize,
+    as_rel: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let Some(next_info) = line_infos.get(next_line_index) else {
+        return;
+    };
+    let start = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(as_rel);
+    let end = next_info.start.saturating_add(next_info.indent_end);
+    if start >= end || end > statement_sql.len() {
+        return;
+    }
+
+    let indent = make_indent(expected_indent, indent_unit, tab_space_size, indent_style);
+    let replacement = format!("\n{indent}AS\n{indent}");
+    if statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_close_paren_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    close_rel: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let line_start = line_info.start + line_info.indent_end;
+    let start = line_start + close_rel;
+    if start > statement_sql.len() {
+        return;
+    }
+
+    let replacement = format!(
+        "\n{}",
+        make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
+    );
+    edits.push(Lt02AutofixEdit {
+        start,
+        end: start,
+        replacement,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_inline_join_on_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    on_keyword_rel: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let line_start = line_info.start + line_info.indent_end;
+    let line_end = statement_sql[line_start..]
+        .find('\n')
+        .map(|relative| line_start + relative)
+        .unwrap_or(statement_sql.len());
+    if line_end <= line_start || line_end > statement_sql.len() {
+        return;
+    }
+    if on_keyword_rel == 0 {
+        return;
+    }
+
+    let start = line_start + on_keyword_rel - 1;
+    let end = start + 1;
+    if end > statement_sql.len() || start >= end {
+        return;
+    }
+    let replacement = format!(
+        "\n{}",
+        make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
+    );
+    if statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_leading_indent_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    current_indent: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    if current_indent == expected_indent {
+        return;
+    }
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+    let start = line_info.start;
+    let end = line_info.start + line_info.indent_end;
+    if end > statement_sql.len() || start > end {
+        return;
+    }
+
+    let replacement = make_indent(expected_indent, indent_unit, tab_space_size, indent_style);
+    if statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_on_condition_block_indent_edits(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    scans: &[ScanLine<'_>],
+    start_idx: usize,
+    base_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let mut depth = 0isize;
+    let mut idx = start_idx;
+    while idx < scans.len() {
+        let line = &scans[idx];
+        if line.is_blank || contains_template_marker(line.trimmed) {
+            idx += 1;
+            continue;
+        }
+
+        let first = line.words.first().map(String::as_str);
+        let starts_with_close_paren = line.trimmed.starts_with(')');
+        let starts_with_open_paren = line.trimmed.starts_with('(');
+        let is_continuation_line = matches!(first, Some("AND" | "OR" | "NOT" | "EXISTS"))
+            || starts_with_operator_continuation(line.trimmed)
+            || (starts_with_close_paren && depth > 0)
+            || (starts_with_open_paren && depth > 0)
+            || line.is_comment_only;
+        if depth <= 0 && !is_continuation_line && is_clause_boundary(first, line.trimmed) {
+            break;
+        }
+
+        let logical_depth = depth.max(0) as usize;
+        let expected_indent = if line.trimmed.starts_with(')') {
+            if logical_depth > 0 {
+                base_indent + ((logical_depth - 1) * indent_unit)
+            } else {
+                base_indent
+            }
+        } else {
+            base_indent + (logical_depth * indent_unit)
+        };
+
+        push_leading_indent_edit(
+            edits,
+            statement_sql,
+            line_infos,
+            idx,
+            line.indent,
+            expected_indent,
+            indent_unit,
+            tab_space_size,
+            indent_style,
+        );
+
+        if !line.is_comment_only {
+            depth += paren_delta_simple(line.trimmed);
+            if depth < 0 {
+                depth = 0;
+            }
+        }
+        idx += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_assignment_block_indent_edits(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    scans: &[ScanLine<'_>],
+    start_idx: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let mut idx = start_idx;
+    while idx < scans.len() {
+        let line = &scans[idx];
+        if line.is_blank || line.is_comment_only || contains_template_marker(line.trimmed) {
+            idx += 1;
+            continue;
+        }
+
+        let first = line.words.first().map(String::as_str);
+        if starts_with_assignment(line.trimmed) || matches!(first, Some("AND" | "OR")) {
+            push_leading_indent_edit(
+                edits,
+                statement_sql,
+                line_infos,
+                idx,
+                line.indent,
+                expected_indent,
+                indent_unit,
+                tab_space_size,
+                indent_style,
+            );
+            idx += 1;
+            continue;
+        }
+
+        if is_clause_boundary(first, line.trimmed) || line.trimmed.starts_with(';') {
+            break;
+        }
+
+        let previous_ended_comma = previous_significant_line(scans, idx)
+            .is_some_and(|prev_idx| scans[prev_idx].trimmed.trim_end().ends_with(','));
+        if previous_ended_comma {
+            push_leading_indent_edit(
+                edits,
+                statement_sql,
+                line_infos,
+                idx,
+                line.indent,
+                expected_indent,
+                indent_unit,
+                tab_space_size,
+                indent_style,
+            );
+            idx += 1;
+            continue;
+        }
+
+        break;
+    }
 }
 
 fn push_line_start_issue_span(
@@ -677,6 +1604,67 @@ fn starts_with_assignment(trimmed: &str) -> bool {
     index < bytes.len() && bytes[index] == b'='
 }
 
+fn starts_with_operator_continuation(trimmed: &str) -> bool {
+    let trimmed = trimmed.trim_start();
+    trimmed.starts_with('=')
+        || trimmed.starts_with('+')
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('%')
+        || trimmed.starts_with("||")
+        || trimmed.starts_with("->")
+        || trimmed.starts_with("->>")
+        || (trimmed.starts_with('-')
+            && !trimmed
+                .chars()
+                .nth(1)
+                .is_some_and(|ch| ch.is_ascii_alphanumeric()))
+}
+
+fn inline_join_on_offset(trimmed: &str) -> Option<usize> {
+    let upper = trimmed.to_ascii_uppercase();
+    if let Some(space_before_on) = upper.find(" ON ") {
+        return Some(space_before_on + 1);
+    }
+    if upper.ends_with(" ON") || upper.ends_with(" ON (") {
+        return upper
+            .rfind(" ON")
+            .map(|space_before_on| space_before_on + 1);
+    }
+    None
+}
+
+fn should_break_inline_join_on(
+    scans: &[ScanLine<'_>],
+    line_index: usize,
+    first_word: Option<&str>,
+    second_word: Option<&str>,
+    upper_trimmed: &str,
+) -> bool {
+    if upper_trimmed.ends_with(" ON") || upper_trimmed.ends_with(" ON (") {
+        return true;
+    }
+
+    if !matches!(first_word, Some("JOIN")) {
+        return false;
+    }
+    if !is_join_clause(first_word, second_word) {
+        return false;
+    }
+    if inline_join_on_offset(scans[line_index].trimmed).is_none() {
+        return false;
+    }
+
+    previous_significant_line(scans, line_index).is_some_and(|prev_idx| {
+        let prev_first = scans[prev_idx].words.first().map(String::as_str);
+        let prev_second = scans[prev_idx].words.get(1).map(String::as_str);
+        matches!(
+            prev_first,
+            Some("LEFT" | "RIGHT" | "FULL" | "INNER" | "OUTER" | "CROSS" | "NATURAL")
+        ) && !matches!(prev_second, Some("JOIN" | "APPLY"))
+    })
+}
+
 fn content_offset_after_keyword(trimmed: &str, keyword: &str) -> Option<usize> {
     if trimmed.len() < keyword.len()
         || !trimmed
@@ -701,6 +1689,55 @@ fn content_offset_after_keyword(trimmed: &str, keyword: &str) -> Option<usize> {
     }
 
     (index < trimmed.len()).then_some(index)
+}
+
+fn trailing_as_offset(trimmed: &str) -> Option<usize> {
+    let upper = trimmed.to_ascii_uppercase();
+    let as_rel = upper.rfind(" AS")?;
+    (as_rel > 0 && as_rel + " AS".len() == trimmed.len()).then_some(as_rel)
+}
+
+fn is_simple_alias_identifier(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+        return false;
+    }
+    bytes[1..]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+}
+
+fn make_interval_inline_arg_offsets(trimmed: &str) -> Option<(usize, usize)> {
+    let upper = trimmed.to_ascii_uppercase();
+    let open_rel = upper.find("MAKE_INTERVAL(")? + "MAKE_INTERVAL(".len();
+    if open_rel >= trimmed.len() {
+        return None;
+    }
+
+    let mut arg_rel = open_rel;
+    while let Some(ch) = trimmed[arg_rel..].chars().next() {
+        if ch.is_whitespace() {
+            arg_rel += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    (arg_rel < trimmed.len()).then_some((open_rel, arg_rel))
+}
+
+fn make_interval_inline_arg_offset(trimmed: &str) -> Option<usize> {
+    make_interval_inline_arg_offsets(trimmed).map(|(_, arg_rel)| arg_rel)
+}
+
+fn inline_close_paren_offset(trimmed: &str) -> Option<usize> {
+    if !trimmed.trim_start().starts_with("=>") {
+        return None;
+    }
+    trimmed.rfind(')')
 }
 
 fn push_join_on_block_indent_spans(
@@ -728,10 +1765,13 @@ fn push_join_on_block_indent_spans(
         }
 
         let first = line.words.first().map(String::as_str);
+        let starts_with_close_paren = line.trimmed.starts_with(')');
+        let starts_with_open_paren = line.trimmed.starts_with('(');
         let is_continuation_line = matches!(first, Some("AND" | "OR" | "NOT" | "EXISTS"))
-            || line.trimmed.starts_with(')')
-            || line.trimmed.starts_with('(');
-        if !is_continuation_line && is_clause_boundary(first, line.trimmed) {
+            || starts_with_operator_continuation(line.trimmed)
+            || (starts_with_close_paren && depth > 0)
+            || (starts_with_open_paren && depth > 0);
+        if depth <= 0 && !is_continuation_line && is_clause_boundary(first, line.trimmed) {
             break;
         }
 
@@ -771,7 +1811,7 @@ fn find_andor_anchor(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
                 return None;
             }
             let first = line.words.first().map(String::as_str);
-            if matches!(first, Some("WHERE" | "ON" | "HAVING")) {
+            if matches!(first, Some("WHERE" | "ON" | "HAVING" | "WHEN")) {
                 return Some(idx);
             }
             if is_clause_boundary(first, line.trimmed) && !matches!(first, Some("AND" | "OR")) {
@@ -780,6 +1820,48 @@ fn find_andor_anchor(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
             None
         })
         .and_then(|idx| (idx != usize::MAX).then_some(idx))
+}
+
+fn find_case_when_anchor(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
+    (0..from_idx)
+        .rev()
+        .find_map(|idx| {
+            let line = &scans[idx];
+            if line.is_blank || line.is_comment_only {
+                return None;
+            }
+            let first = line.words.first().map(String::as_str);
+            if matches!(first, Some("WHEN")) {
+                return Some(idx);
+            }
+            if is_clause_boundary(first, line.trimmed)
+                && !matches!(first, Some("AND" | "OR" | "THEN" | "ELSE"))
+            {
+                return Some(usize::MAX);
+            }
+            None
+        })
+        .and_then(|idx| (idx != usize::MAX).then_some(idx))
+}
+
+fn expected_then_indent(
+    scans: &[ScanLine<'_>],
+    line_index: usize,
+    indent_unit: usize,
+) -> Option<usize> {
+    let prev_idx = previous_significant_line(scans, line_index)?;
+    let prev = scans.get(prev_idx)?;
+    let prev_first = prev.words.first().map(String::as_str);
+
+    if matches!(prev_first, Some("AND" | "OR")) {
+        return Some(prev.indent + indent_unit);
+    }
+    if prev.trimmed.starts_with("=>") {
+        return Some(prev.indent);
+    }
+
+    find_case_when_anchor(scans, line_index)
+        .map(|when_idx| scans[when_idx].indent + indent_unit * 2)
 }
 
 fn paren_depth_between(scans: &[ScanLine<'_>], start_idx: usize, end_idx: usize) -> usize {
@@ -813,6 +1895,16 @@ fn first_line_is_indented(ctx: &LintContext) -> bool {
         .map_or(0, |index| index + 1);
     let leading = &ctx.sql[line_start..statement_start];
     !leading.is_empty() && leading.chars().all(char::is_whitespace)
+}
+
+fn ignore_first_line_indent_for_fragmented_statement(ctx: &LintContext) -> bool {
+    if ctx.statement_index == 0 || ctx.statement_range.start == 0 {
+        return false;
+    }
+
+    let prefix = &ctx.sql[..ctx.statement_range.start.min(ctx.sql.len())];
+    let prev_non_ws = prefix.chars().rev().find(|ch| !ch.is_whitespace());
+    matches!(prev_non_ws, Some(ch) if ch != ';')
 }
 
 fn first_line_is_template_fragment(ctx: &LintContext) -> bool {
@@ -1539,6 +2631,21 @@ fn previous_line_indent_matching(
 fn line_contains_inline_on(trimmed: &str) -> bool {
     let upper = trimmed.to_ascii_uppercase();
     upper.contains(" ON ") && !upper.starts_with("ON ")
+}
+
+fn statement_line_index_for_offset(line_infos: &[StatementLineInfo], offset: usize) -> usize {
+    if line_infos.is_empty() {
+        return 0;
+    }
+
+    let mut line_index = 0usize;
+    for (idx, info) in line_infos.iter().enumerate() {
+        if info.start > offset {
+            break;
+        }
+        line_index = idx;
+    }
+    line_index
 }
 
 fn contains_template_marker(sql: &str) -> bool {
@@ -2346,196 +3453,6 @@ fn indentation_autofix_edits(
     edits
 }
 
-fn multiline_bracket_spacing_edits(statement_sql: &str) -> Vec<Lt02AutofixEdit> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum ScanMode {
-        Outside,
-        SingleQuote,
-        DoubleQuote,
-        BacktickQuote,
-        BracketQuote,
-        LineComment,
-        BlockComment,
-    }
-
-    let bytes = statement_sql.as_bytes();
-    let mut mode = ScanMode::Outside;
-    let mut edits = Vec::new();
-    let mut open_stack: Vec<(usize, usize, bool)> = Vec::new();
-    let mut line = 0usize;
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        let next = bytes.get(i + 1).copied();
-
-        match mode {
-            ScanMode::Outside => {
-                if b == b'\'' {
-                    mode = ScanMode::SingleQuote;
-                    i += 1;
-                    continue;
-                }
-                if b == b'"' {
-                    mode = ScanMode::DoubleQuote;
-                    i += 1;
-                    continue;
-                }
-                if b == b'`' {
-                    mode = ScanMode::BacktickQuote;
-                    i += 1;
-                    continue;
-                }
-                if b == b'[' {
-                    mode = ScanMode::BracketQuote;
-                    i += 1;
-                    continue;
-                }
-                if b == b'-' && next == Some(b'-') {
-                    mode = ScanMode::LineComment;
-                    i += 2;
-                    continue;
-                }
-                if b == b'/' && next == Some(b'*') {
-                    mode = ScanMode::BlockComment;
-                    i += 2;
-                    continue;
-                }
-
-                if b == b'(' {
-                    let allow_nested_spacing =
-                        preceding_word_before_offset(bytes, i).is_some_and(|word| {
-                            matches!(
-                                word.as_str(),
-                                "IF" | "WHERE" | "HAVING" | "ON" | "USING" | "AS" | "CAST"
-                            )
-                        });
-                    open_stack.push((i, line, allow_nested_spacing));
-                    i += 1;
-                    continue;
-                }
-                if b == b')' {
-                    if let Some((open_offset, open_line, allow_nested_spacing)) = open_stack.pop() {
-                        if open_line != line {
-                            let open_line_end = bytes[open_offset + 1..]
-                                .iter()
-                                .position(|byte| *byte == b'\n')
-                                .map(|relative| open_offset + 1 + relative)
-                                .unwrap_or(bytes.len());
-                            let has_nested_open_on_open_line =
-                                bytes[open_offset + 1..open_line_end].contains(&b'(');
-
-                            if let Some(next_byte) = bytes.get(open_offset + 1).copied() {
-                                if !next_byte.is_ascii_whitespace()
-                                    && (allow_nested_spacing || !has_nested_open_on_open_line)
-                                {
-                                    edits.push(Lt02AutofixEdit {
-                                        start: open_offset + 1,
-                                        end: open_offset + 1,
-                                        replacement: " ".to_string(),
-                                    });
-                                }
-                            }
-
-                            if i > 0 {
-                                let prev_byte = bytes[i - 1];
-                                let close_line_start = bytes[..i]
-                                    .iter()
-                                    .rposition(|byte| *byte == b'\n')
-                                    .map(|index| index + 1)
-                                    .unwrap_or(0);
-                                let has_nested_close_on_close_line =
-                                    bytes[close_line_start..i].contains(&b')');
-                                if !prev_byte.is_ascii_whitespace()
-                                    && prev_byte != b'('
-                                    && (allow_nested_spacing || !has_nested_close_on_close_line)
-                                {
-                                    edits.push(Lt02AutofixEdit {
-                                        start: i,
-                                        end: i,
-                                        replacement: " ".to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    i += 1;
-                    continue;
-                }
-            }
-            ScanMode::SingleQuote => {
-                if b == b'\'' {
-                    if next == Some(b'\'') {
-                        i += 2;
-                        continue;
-                    }
-                    mode = ScanMode::Outside;
-                }
-            }
-            ScanMode::DoubleQuote => {
-                if b == b'"' {
-                    mode = ScanMode::Outside;
-                }
-            }
-            ScanMode::BacktickQuote => {
-                if b == b'`' {
-                    mode = ScanMode::Outside;
-                }
-            }
-            ScanMode::BracketQuote => {
-                if b == b']' {
-                    mode = ScanMode::Outside;
-                }
-            }
-            ScanMode::LineComment => {
-                if b == b'\n' || b == b'\r' {
-                    mode = ScanMode::Outside;
-                }
-            }
-            ScanMode::BlockComment => {
-                if b == b'*' && next == Some(b'/') {
-                    mode = ScanMode::Outside;
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-
-        if b == b'\n' {
-            line += 1;
-        }
-        i += 1;
-    }
-
-    edits.sort_by_key(|edit| (edit.start, edit.end));
-    edits.dedup_by_key(|edit| (edit.start, edit.end));
-    edits
-}
-
-fn preceding_word_before_offset(bytes: &[u8], offset: usize) -> Option<String> {
-    if offset == 0 || offset > bytes.len() {
-        return None;
-    }
-
-    let mut end = offset;
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    if end == 0 {
-        return None;
-    }
-
-    let mut start = end;
-    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
-        start -= 1;
-    }
-    if start == end {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&bytes[start..end]).to_ascii_uppercase())
-}
-
 fn statement_line_infos(sql: &str) -> Vec<StatementLineInfo> {
     let mut infos = Vec::new();
     let mut line_start = 0usize;
@@ -2687,12 +3604,41 @@ mod tests {
             .collect()
     }
 
+    fn run_postgres(sql: &str) -> Vec<Issue> {
+        with_active_dialect(Dialect::Postgres, || run(sql))
+    }
+
     fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
         let autofix = issue.autofix.as_ref()?;
         let mut out = sql.to_string();
         let mut edits = autofix.edits.clone();
         edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
         for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        Some(out)
+    }
+
+    fn apply_all_issue_autofixes(sql: &str, issues: &[Issue]) -> Option<String> {
+        let mut all_edits = Vec::new();
+        for issue in issues {
+            if let Some(autofix) = issue.autofix.as_ref() {
+                all_edits.extend(autofix.edits.clone());
+            }
+        }
+        if all_edits.is_empty() {
+            return None;
+        }
+
+        all_edits.sort_by_key(|edit| (edit.span.start, edit.span.end, edit.replacement.clone()));
+        all_edits.dedup_by(|left, right| {
+            left.span.start == right.span.start
+                && left.span.end == right.span.end
+                && left.replacement == right.replacement
+        });
+
+        let mut out = sql.to_string();
+        for edit in all_edits.into_iter().rev() {
             out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
         }
         Some(out)
@@ -2839,6 +3785,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fragmented_non_semicolon_statement_triggers_first_line_indent_guard() {
+        let sql = "SELECT\n    a";
+        assert!(
+            ignore_first_line_indent_for_fragmented_statement(&LintContext {
+                sql,
+                statement_range: 7..sql.len(),
+                statement_index: 1,
+            }),
+            "fragmented follow-on statement chunks should ignore first-line LT02"
+        );
+    }
+
     // Structural indentation tests.
 
     #[test]
@@ -2932,38 +3891,14 @@ mod tests {
     }
 
     #[test]
-    fn structural_autofix_adds_spacing_for_multiline_parenthesized_select() {
-        let sql = "WITH bar as (SELECT 1\n    FROM foo)\nSELECT a FROM bar";
-        let issues = run(sql);
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(
-            normalize_whitespace(&fixed),
-            "WITH bar as ( SELECT 1 FROM foo ) SELECT a FROM bar"
-        );
-    }
-
-    #[test]
-    fn structural_autofix_adds_spacing_for_multiline_parenthesized_expression() {
+    fn structural_autofix_does_not_add_parenthesis_spacing() {
         let sql = "SELECT coalesce(foo,\n              bar)\n   FROM tbl";
         let issues = run(sql);
         assert_eq!(issues.len(), 1);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
         assert_eq!(
             normalize_whitespace(&fixed),
-            "SELECT coalesce( foo, bar ) FROM tbl"
-        );
-    }
-
-    #[test]
-    fn structural_autofix_adds_spacing_for_multiline_where_parentheses() {
-        let sql = "select *\nfrom a\nwhere (b = a\n    and c = d)";
-        let issues = run(sql);
-        assert_eq!(issues.len(), 1);
-        let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(
-            normalize_whitespace(&fixed),
-            "select * from a where ( b = a and c = d )"
+            "SELECT coalesce(foo, bar) FROM tbl"
         );
     }
 
@@ -2997,5 +3932,84 @@ mod tests {
         });
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_002);
+    }
+
+    #[test]
+    fn postgres_where_inline_condition_chain_autofixes() {
+        let sql = "SELECT\n    a\nFROM t\nWHERE a = 1\nAND b = 2";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    a\nFROM t\nWHERE\n    a = 1\n    AND b = 2"
+        );
+    }
+
+    #[test]
+    fn postgres_where_inline_operator_continuation_autofixes() {
+        let sql = "SELECT\n    1\nFROM t\nWHERE is_active\n= TRUE";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    1\nFROM t\nWHERE\n    is_active\n    = TRUE"
+        );
+    }
+
+    #[test]
+    fn postgres_trailing_as_alias_break_autofixes() {
+        let sql = "SELECT\n    o.id AS\n    org_unit_id\nFROM t AS o";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    o.id\n        AS\n        org_unit_id\nFROM t AS o"
+        );
+    }
+
+    #[test]
+    fn postgres_on_conflict_set_block_autofixes() {
+        let sql = "INSERT INTO foo (id, value)\nVALUES (1, 'x')\nON CONFLICT (id) DO UPDATE\nSET value = EXCLUDED.value,\nupdated_at = NOW()";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "INSERT INTO foo (id, value)\nVALUES (1, 'x')\nON CONFLICT (id) DO UPDATE\n    SET\n        value = EXCLUDED.value,\n        updated_at = NOW()"
+        );
+    }
+
+    #[test]
+    fn postgres_where_block_with_nested_subquery_autofixes() {
+        let sql =
+            "SELECT\n    1\nFROM t\nWHERE a = 1\nAND b IN (\nSELECT 1\nWHERE TRUE\n)\nAND c = 2";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    1\nFROM t\nWHERE\n    a = 1\n    AND b IN (\n        SELECT 1\n        WHERE TRUE\n    )\n    AND c = 2"
+        );
+    }
+
+    #[test]
+    fn postgres_inline_join_on_with_operator_continuation_autofixes() {
+        let sql = "SELECT\n    1\nFROM foo AS f\nINNER\nJOIN bar AS b ON f.id = b.id AND b.is_current\n= TRUE";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    1\nFROM foo AS f\nINNER\nJOIN bar AS b\n    ON f.id = b.id AND b.is_current\n        = TRUE"
+        );
     }
 }

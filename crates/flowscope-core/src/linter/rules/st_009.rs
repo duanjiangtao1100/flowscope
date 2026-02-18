@@ -228,7 +228,8 @@ fn collect_following_join_autofixes(
 
     for join in joins {
         let join_name = table_factor_reference_name(&join.relation);
-        if let (Some(current), Some(on_expr)) = (join_name.as_ref(), join_on_expr(&join.join_operator))
+        if let (Some(current), Some(on_expr)) =
+            (join_name.as_ref(), join_on_expr(&join.join_operator))
         {
             let matching_previous = seen
                 .iter()
@@ -687,7 +688,10 @@ fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usiz
     if start < ctx.statement_range.start || end > ctx.statement_range.end {
         return None;
     }
-    Some((start - ctx.statement_range.start, end - ctx.statement_range.start))
+    Some((
+        start - ctx.statement_range.start,
+        end - ctx.statement_range.start,
+    ))
 }
 
 fn expr_span_offsets(sql: &str, expr: &Expr) -> Option<(usize, usize)> {
@@ -1143,5 +1147,4 @@ mod tests {
             "expected ON CONFLICT clause preserved, got: {fixed}"
         );
     }
-
 }
