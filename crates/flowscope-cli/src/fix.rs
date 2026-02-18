@@ -1253,6 +1253,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_014)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_015)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_001)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_ST_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_009)
         || code.eq_ignore_ascii_case(issue_codes::LINT_ST_005)

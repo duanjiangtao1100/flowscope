@@ -334,9 +334,12 @@ fn safe_operator_move_edits(
             {
                 return None;
             }
+            // Preserve existing indentation on the next line to avoid LT02
+            // regressions when moving the operator.
+            let delete_start = whitespace_before_on_same_line(sql, op_start, prev_end);
             return Some(vec![
-                (prev_end, op_end, "\n".to_string()),
-                (op_end, next_start, format!("{op_text} ")),
+                (delete_start, op_end, String::new()),
+                (next_start, next_start, format!("{op_text} ")),
             ]);
         } else {
             if !before_gap.chars().all(char::is_whitespace)
@@ -350,9 +353,11 @@ fn safe_operator_move_edits(
             {
                 return None;
             }
+            // Preserve existing indentation on the following line.
+            let delete_end = skip_inline_whitespace(sql, op_end);
             return Some(vec![
-                (prev_end, op_start, format!(" {op_text}")),
-                (op_start, next_start, "\n".to_string()),
+                (prev_end, prev_end, format!(" {op_text}")),
+                (op_start, delete_end, String::new()),
             ]);
         }
     }
@@ -480,11 +485,29 @@ fn is_layout_operator(token: &Token) -> bool {
             | Token::Minus
             | Token::Mul
             | Token::Div
+            | Token::Mod
+            | Token::StringConcat
+            | Token::Pipe
+            | Token::Caret
+            | Token::ShiftLeft
+            | Token::ShiftRight
             | Token::Eq
             | Token::Neq
             | Token::Lt
             | Token::Gt
-    ) || matches!(token, Token::Word(word) if matches!(word.keyword, Keyword::AND | Keyword::OR))
+            | Token::LtEq
+            | Token::GtEq
+            | Token::Spaceship
+            | Token::DoubleEq
+            | Token::Arrow
+            | Token::LongArrow
+            | Token::HashArrow
+            | Token::AtArrow
+            | Token::ArrowAt
+    ) || matches!(
+        token,
+        Token::Word(word) if matches!(word.keyword, Keyword::AND | Keyword::OR)
+    )
 }
 
 fn is_trivia_token(token: &Token) -> bool {
@@ -669,7 +692,7 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT a\n+ b FROM t");
+        assert_eq!(fixed, "SELECT a\n + b FROM t");
     }
 
     #[test]
@@ -699,7 +722,7 @@ mod tests {
         let autofix = issues[0].autofix.as_ref().expect("autofix metadata");
         assert_eq!(autofix.applicability, IssueAutofixApplicability::Safe);
         let fixed = apply_issue_autofix(sql, &issues[0]).expect("apply autofix");
-        assert_eq!(fixed, "SELECT a +\nb FROM t");
+        assert_eq!(fixed, "SELECT a +\n b FROM t");
     }
 
     #[test]
@@ -867,5 +890,21 @@ mod tests {
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
         assert_eq!(issues[1].code, issue_codes::LINT_LT_003);
+    }
+
+    #[test]
+    fn flags_trailing_comparison_operator() {
+        let sql = "SELECT * FROM t WHERE a >=\n b";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
+    }
+
+    #[test]
+    fn flags_trailing_json_operator() {
+        let sql = "SELECT usage_metadata ->>\n 'endpoint_id' FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, issue_codes::LINT_LT_003);
     }
 }

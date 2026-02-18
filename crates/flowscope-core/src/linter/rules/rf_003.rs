@@ -51,6 +51,13 @@ pub struct ReferencesConsistent {
     force_enable: bool,
 }
 
+#[derive(Clone)]
+struct Rf003SelectScope {
+    start: usize,
+    end: usize,
+    sources: HashSet<String>,
+}
+
 impl ReferencesConsistent {
     pub fn from_config(config: &LintConfig) -> Self {
         Self {
@@ -89,7 +96,17 @@ impl LintRule for ReferencesConsistent {
             return Vec::new();
         }
 
-        let all_statement_sources = collect_statement_source_names(statement);
+        let mut select_scopes = Vec::new();
+        visit_selects_in_statement(statement, &mut |select| {
+            if let Some((start, end)) = select_span_offsets(ctx.sql, select) {
+                select_scopes.push(Rf003SelectScope {
+                    start,
+                    end,
+                    sources: select_source_names(select),
+                });
+            }
+        });
+
         let mut mixed_count = 0usize;
         let mut consistency_transition_count = 0usize;
         let mut autofix_edits_raw: Vec<Rf003AutofixEdit> = Vec::new();
@@ -104,12 +121,13 @@ impl LintRule for ReferencesConsistent {
 
             let aliases = select_projection_alias_set(select);
             let source_names = select_source_names(select);
+            let ancestor_sources = ancestor_source_names_for_select(ctx, select, &select_scopes);
             let (mut qualified, mut unqualified, has_outer_references) =
                 count_reference_qualification_for_select(
                     select,
                     &aliases,
                     &source_names,
-                    &all_statement_sources,
+                    &ancestor_sources,
                     ctx.dialect(),
                 );
             let (projection_qualified, projection_unqualified) =
@@ -156,7 +174,7 @@ impl LintRule for ReferencesConsistent {
                         target_style,
                         &aliases,
                         &source_names,
-                        &all_statement_sources,
+                        &ancestor_sources,
                     ));
                 }
             }
@@ -242,6 +260,27 @@ impl LintRule for ReferencesConsistent {
             })
             .collect()
     }
+}
+
+fn ancestor_source_names_for_select(
+    ctx: &LintContext,
+    select: &Select,
+    scopes: &[Rf003SelectScope],
+) -> HashSet<String> {
+    let Some((start, end)) = select_span_offsets(ctx.sql, select) else {
+        return HashSet::new();
+    };
+
+    let mut out = HashSet::new();
+    for scope in scopes {
+        let strictly_contains = scope.start <= start
+            && scope.end >= end
+            && (scope.start != start || scope.end != end);
+        if strictly_contains {
+            out.extend(scope.sources.iter().cloned());
+        }
+    }
+    out
 }
 
 struct Rf003AutofixEdit {
@@ -714,6 +753,20 @@ fn classify_rf003_reference(
 }
 
 fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usize)> {
+    // Statement ranges may intentionally trim leading comments/whitespace.
+    // SQLParser spans are often absolute to the full document, so prefer
+    // document-level conversion when the statement does not start at byte 0.
+    if ctx.statement_range.start > 0 {
+        if let Some((start, end)) = expr_span_offsets(ctx.sql, expr) {
+            if start >= ctx.statement_range.start && end <= ctx.statement_range.end {
+                return Some((
+                    start - ctx.statement_range.start,
+                    end - ctx.statement_range.start,
+                ));
+            }
+        }
+    }
+
     if let Some((start, end)) = expr_span_offsets(ctx.statement_sql(), expr) {
         return Some((start, end));
     }
@@ -730,6 +783,20 @@ fn expr_statement_offsets(ctx: &LintContext, expr: &Expr) -> Option<(usize, usiz
 }
 
 fn select_statement_offsets(ctx: &LintContext, select: &Select) -> Option<(usize, usize)> {
+    // Statement ranges may intentionally trim leading comments/whitespace.
+    // SQLParser spans are often absolute to the full document, so prefer
+    // document-level conversion when the statement does not start at byte 0.
+    if ctx.statement_range.start > 0 {
+        if let Some((start, end)) = select_span_offsets(ctx.sql, select) {
+            if start >= ctx.statement_range.start && end <= ctx.statement_range.end {
+                return Some((
+                    start - ctx.statement_range.start,
+                    end - ctx.statement_range.start,
+                ));
+            }
+        }
+    }
+
     if let Some((start, end)) = select_span_offsets(ctx.statement_sql(), select) {
         return Some((start, end));
     }
@@ -1177,14 +1244,6 @@ fn projection_wildcard_qualification_counts(select: &Select) -> (usize, usize) {
     }
 
     (qualified, 0)
-}
-
-fn collect_statement_source_names(statement: &Statement) -> HashSet<String> {
-    let mut names = HashSet::new();
-    visit_selects_in_statement(statement, &mut |select| {
-        names.extend(select_source_names(select));
-    });
-    names
 }
 
 fn select_source_names(select: &Select) -> HashSet<String> {
@@ -1730,6 +1789,26 @@ mod tests {
         Some(out)
     }
 
+    fn apply_all_autofixes(sql: &str, issues: &[Issue]) -> String {
+        let mut edits: Vec<_> = issues
+            .iter()
+            .filter_map(|issue| issue.autofix.as_ref())
+            .flat_map(|autofix| autofix.edits.clone())
+            .collect();
+        edits.sort_by_key(|edit| (edit.span.start, edit.span.end));
+        edits.dedup_by(|left, right| {
+            left.span.start == right.span.start
+                && left.span.end == right.span.end
+                && left.replacement == right.replacement
+        });
+
+        let mut out = sql.to_string();
+        for edit in edits.into_iter().rev() {
+            out.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+        }
+        out
+    }
+
     // --- Edge cases adopted from sqlfluff RF03 ---
 
     #[test]
@@ -1832,5 +1911,29 @@ mod tests {
             },
         );
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn autofix_uses_document_spans_for_trimmed_statement_ranges() {
+        let sql = "-- c1\n-- c2\n-- c3\n-- c4\n-- c5\n-- c6\n-- c7\n-- c8\n-- c9\n-- c10\n-- c11\n-- c12\nSELECT\n    t.a,\n    b,\n    c,\n    d,\n    e,\n    f,\n    g,\n    h,\n    i,\n    j,\n    k,\n    l,\n    m,\n    n\nFROM foo AS t";
+        let statements = parse_sql(sql).expect("parse");
+        let statement_start = sql.find("SELECT").expect("statement start");
+        let statement_end = sql.len();
+        let rule = ReferencesConsistent::default();
+
+        let issues = rule.check(
+            &statements[0],
+            &LintContext {
+                sql,
+                statement_range: statement_start..statement_end,
+                statement_index: 0,
+            },
+        );
+
+        let fixed = apply_all_autofixes(sql, &issues);
+        assert!(fixed.contains("    t.b,"));
+        assert!(fixed.contains("    t.n"));
+        assert!(fixed.contains("FROM foo AS t"));
+        assert!(!fixed.contains("\n    b,"));
     }
 }

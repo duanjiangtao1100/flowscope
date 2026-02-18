@@ -479,8 +479,6 @@ fn is_non_function_sql_keyword(value: &str) -> bool {
             | "AND" | "OR" | "IS"
             // Clause keywords that precede parenthesized content
             | "AS" | "ON" | "USING" | "OVER" | "FILTER" | "WITHIN"
-            // Quantified comparison operators
-            | "ANY" | "ALL" | "SOME"
             // DML/DDL clause heads
             | "VALUES" | "SET" | "INTO" | "FROM" | "WHERE" | "HAVING"
             | "SELECT" | "TABLE" | "JOIN"
@@ -785,6 +783,15 @@ mod tests {
         let issues = run("SELECT CURRENT_TIMESTAMP, current_timestamp FROM t");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].code, issue_codes::LINT_CP_003);
+    }
+
+    #[test]
+    fn quantified_any_keyword_tracks_capitalisation_for_parity() {
+        let sql = "SELECT count(*), col = ANY(arr) FROM t";
+        let issues = run(sql);
+        assert_eq!(issues.len(), 1);
+        let fixed = apply_all_autofixes(sql, &issues);
+        assert_eq!(fixed, "SELECT count(*), col = any(arr) FROM t");
     }
 
     #[test]
