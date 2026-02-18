@@ -385,6 +385,10 @@ fn long_line_autofix_edits(
 
     for (line_start, line_end) in line_ranges(sql) {
         let line = &sql[line_start..line_end];
+        if is_comment_only_line(line) {
+            continue;
+        }
+
         let replacement = if line.len() > LEGACY_MAX_LINE_LENGTH {
             legacy_split_long_line(line)
         } else if line.chars().count() > max_line_length {
@@ -409,6 +413,15 @@ fn long_line_autofix_edits(
     edits
 }
 
+fn is_comment_only_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("--")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("*/")
+        || trimmed.starts_with("{#")
+}
+
 fn rewrite_lt05_long_line(
     line: &str,
     max_line_length: usize,
@@ -423,8 +436,33 @@ fn rewrite_lt05_code_line(line: &str, max_line_length: usize) -> Option<String> 
         .or_else(|| rewrite_over_clause_with_tail_line(line, max_line_length))
         .or_else(|| rewrite_function_alias_line(line, max_line_length))
         .or_else(|| rewrite_function_equals_line(line, max_line_length))
+        .or_else(|| rewrite_expression_alias_line(line, max_line_length))
         .or_else(|| rewrite_clause_break_line(line, max_line_length))
         .or_else(|| rewrite_whitespace_wrap_line(line, max_line_length))
+}
+
+fn rewrite_expression_alias_line(line: &str, max_line_length: usize) -> Option<String> {
+    if line.chars().count() <= max_line_length {
+        return None;
+    }
+
+    // Handle long expression aliases such as:
+    //   percentile_cont(...)::int AS p95
+    //   CASE ... END AS status
+    //   SUM(...) AS total
+    let marker = find_last_ascii_case_insensitive(line, " as ")?;
+    if marker == 0 {
+        return None;
+    }
+
+    let left = line[..marker].trim_end();
+    let right = line[marker + 1..].trim_start();
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+
+    let continuation = format!("{}    ", leading_whitespace_prefix(line));
+    Some(format!("{left}\n{continuation}{right}"))
 }
 
 fn rewrite_inline_comment_line(
@@ -535,6 +573,27 @@ fn rewrite_function_equals_line(line: &str, max_line_length: usize) -> Option<St
 
     let indent = leading_whitespace_prefix(line);
     Some(format!("{left}\n{indent}{right}"))
+}
+
+fn find_last_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+
+    for start in (0..=haystack_bytes.len() - needle_bytes.len()).rev() {
+        if haystack_bytes[start..start + needle_bytes.len()]
+            .iter()
+            .zip(needle_bytes.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        {
+            return Some(start);
+        }
+    }
+
+    None
 }
 
 fn rewrite_over_clause_with_tail_line(line: &str, max_line_length: usize) -> Option<String> {
@@ -1473,6 +1532,15 @@ mod tests {
     }
 
     #[test]
+    fn autofix_does_not_split_comment_only_long_line() {
+        let sql =
+            "-- Aggregate page performance events from the last 24 hours into hourly summaries.\n";
+        let mut edits = long_line_autofix_edits(sql, 80, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(fixed, sql);
+    }
+
+    #[test]
     fn autofix_moves_mid_query_inline_comment() {
         let sql = "select\n    my_long_long_line as foo -- with some comment\nfrom foo\n";
         let mut edits = long_line_autofix_edits(sql, 40, false);
@@ -1502,6 +1570,18 @@ mod tests {
         assert_eq!(
             fixed,
             "SELECT\n    my_function(col1 + col2, arg2, arg3)\n        over (\n            partition by col3, col4\n            order by col5 rows between unbounded preceding and current row\n        )\n        as my_relatively_long_alias,\n    my_other_function(col6, col7 + col8, arg4)\n        as my_other_relatively_long_alias,\n    my_expression_function(col6, col7 + col8, arg4)\n    = col9 + col10 as another_relatively_long_alias\nFROM my_table\n"
+        );
+    }
+
+    #[test]
+    fn autofix_splits_long_expression_alias_line() {
+        let sql =
+            "        percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms)::int AS p50_ms,\n";
+        let mut edits = long_line_autofix_edits(sql, 80, false);
+        let fixed = apply_patch_edits(sql, &mut edits);
+        assert_eq!(
+            fixed,
+            "        percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms)::int\n            AS p50_ms,\n"
         );
     }
 

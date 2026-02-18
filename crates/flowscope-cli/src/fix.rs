@@ -293,8 +293,8 @@ pub fn apply_lint_fixes_with_options(
     );
     let mut fixed_sql = apply_planned_edits(sql, &planned.edits);
     let mut after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
-    let before_total: usize = before_counts.values().sum();
-    let after_total: usize = after_counts.values().sum();
+    let before_total = regression_guard_total(&before_counts);
+    let after_total = regression_guard_total(&after_counts);
     let mut skipped_counts = planned.skipped.clone();
 
     if parse_errors_increased(&before_counts, &after_counts) {
@@ -360,11 +360,7 @@ pub fn apply_lint_fixes_with_options(
     let masked_or_worse = after_total > before_total
         || (after_total == before_total
             && after_counts != before_counts
-            && core_autofix_rules_not_improved(
-                &before_counts,
-                &after_counts,
-                &core_autofix_rules,
-            ));
+            && core_autofix_rules_not_improved(&before_counts, &after_counts, &core_autofix_rules));
     if masked_or_worse {
         if let Some(outcome) = try_core_only_fix_plan(
             sql,
@@ -719,6 +715,16 @@ fn parse_errors_increased(
             .unwrap_or(0)
 }
 
+fn regression_guard_total(counts: &BTreeMap<String, usize>) -> usize {
+    counts
+        .iter()
+        // LT02 parity is currently architectural/out-of-scope; don't let LT02
+        // increases mask deterministic improvements in other core autofixes.
+        .filter(|(code, _)| !code.eq_ignore_ascii_case(issue_codes::LINT_LT_002))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
 fn try_core_only_fix_plan(
     sql: &str,
     dialect: Dialect,
@@ -753,8 +759,8 @@ fn try_core_only_fix_plan(
     }
 
     let counts = FixCounts::from_removed(before_counts, &after_counts);
-    let before_total: usize = before_counts.values().sum();
-    let after_total: usize = after_counts.values().sum();
+    let before_total = regression_guard_total(before_counts);
+    let after_total = regression_guard_total(&after_counts);
     if counts.total() == 0 || after_total > before_total {
         return None;
     }
@@ -926,7 +932,7 @@ fn try_incremental_core_fix_plan(
 
         let protected_ranges =
             collect_comment_protected_ranges(&current_sql, dialect, !allow_unsafe);
-        let current_total: usize = current_counts.values().sum();
+        let current_total = regression_guard_total(&current_counts);
 
         let mut best_rule: Option<String> = None;
         let mut best_sql: Option<String> = None;
@@ -957,7 +963,7 @@ fn try_incremental_core_fix_plan(
                 continue;
             }
 
-            let candidate_after_total: usize = candidate_counts.values().sum();
+            let candidate_after_total = regression_guard_total(&candidate_counts);
             if candidate_after_total > current_total {
                 continue;
             }
@@ -1242,6 +1248,7 @@ fn core_autofix_conflict_priority(rule_code: Option<&str>) -> u8 {
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_002)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_003)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_004)
+        || code.eq_ignore_ascii_case(issue_codes::LINT_LT_005)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_006)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_007)
         || code.eq_ignore_ascii_case(issue_codes::LINT_LT_008)
@@ -5818,5 +5825,4 @@ ON CONFLICT (route, period_start, nav_type, mark) DO UPDATE SET
             "second pass should be idempotent aside from trailing-whitespace normalization"
         );
     }
-
 }
