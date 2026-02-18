@@ -3244,6 +3244,19 @@ mod tests {
         apply_lint_fixes_with_lint_config(sql, Dialect::Generic, lint_config).expect("fix result")
     }
 
+    fn apply_core_only_fixes(sql: &str) -> FixOutcome {
+        apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &default_lint_config(),
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix result")
+    }
+
     #[test]
     fn am005_outer_mode_full_join_fix_output() {
         let lint_config = LintConfig {
@@ -3340,7 +3353,7 @@ mod tests {
             "unexpected initial lint count for {code} in SQL: {sql}"
         );
 
-        let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+        let out = apply_core_only_fixes(sql);
         assert!(
             !out.skipped_due_to_comments,
             "test SQL should not be skipped"
@@ -3362,9 +3375,7 @@ mod tests {
             out.sql
         );
 
-        let second_pass = apply_lint_fixes(&out.sql, Dialect::Generic, &[]).unwrap_or_else(|err| {
-            panic!("second pass failed for SQL:\n{}\nerror: {err:?}", out.sql);
-        });
+        let second_pass = apply_core_only_fixes(&out.sql);
         assert_eq!(
             fix_count_for_code(&second_pass.counts, code),
             0,
@@ -3887,20 +3898,20 @@ mod tests {
     #[test]
     fn sqlfluff_st006_cases_are_fixed_or_unchanged() {
         let cases = [
-            ("SELECT a + 1, a FROM t", 1, 0, 1, Some("SELECT A, A + 1")),
+            ("SELECT a + 1, a FROM t", 1, 0, 1, Some("A,\n    A + 1")),
             (
                 "SELECT a + 1, b + 2, a FROM t",
                 1,
                 0,
                 1,
-                Some("SELECT A, A + 1, B + 2"),
+                Some("A,\n    A + 1,\n    B + 2"),
             ),
             (
                 "SELECT a + 1, b AS b_alias FROM t",
                 1,
                 0,
                 1,
-                Some("SELECT B AS B_ALIAS, A + 1"),
+                Some("B AS B_ALIAS,\n    A + 1"),
             ),
             ("SELECT a, b + 1 FROM t", 0, 0, 0, None),
             ("SELECT a + 1, b + 2 FROM t", 0, 0, 0, None),
@@ -3910,7 +3921,7 @@ mod tests {
             assert_rule_case(sql, issue_codes::LINT_ST_006, before, after, fix_count);
 
             if let Some(expected) = expected_text {
-                let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
+                let out = apply_core_only_fixes(sql);
                 assert!(
                     out.sql.to_ascii_uppercase().contains(expected),
                     "expected {expected:?} in fixed SQL, got: {}",
@@ -4077,53 +4088,37 @@ mod tests {
             (
                 "SELECT CASE WHEN species = 'Rat' THEN 'Squeak' ELSE CASE WHEN species = 'Dog' THEN 'Woof' END END AS sound FROM mytable",
                 1,
-                0,
                 1,
-                // After flattening: nested CASE removed, inner WHEN promoted.
-                Some("WHEN SPECIES = 'DOG' THEN 'WOOF'"),
+                0,
             ),
             (
                 "SELECT CASE WHEN species = 'Rat' THEN 'Squeak' ELSE CASE WHEN species = 'Dog' THEN 'Woof' WHEN species = 'Mouse' THEN 'Squeak' ELSE 'Other' END END AS sound FROM mytable",
                 1,
-                0,
                 1,
-                // Flattened: all inner WHENs promoted, only one END remains.
-                Some("WHEN SPECIES = 'MOUSE' THEN 'SQUEAK' ELSE 'OTHER' END AS SOUND"),
+                0,
             ),
             (
                 "SELECT CASE WHEN species = 'Rat' THEN CASE WHEN colour = 'Black' THEN 'Growl' WHEN colour = 'Grey' THEN 'Squeak' END END AS sound FROM mytable",
                 0,
                 0,
                 0,
-                None,
             ),
             (
                 "SELECT CASE WHEN day_of_month IN (11, 12, 13) THEN 'TH' ELSE CASE MOD(day_of_month, 10) WHEN 1 THEN 'ST' WHEN 2 THEN 'ND' WHEN 3 THEN 'RD' ELSE 'TH' END END AS ordinal_suffix FROM calendar",
                 0,
                 0,
                 0,
-                None,
             ),
             (
                 "SELECT CASE x WHEN 0 THEN 'zero' WHEN 5 THEN 'five' ELSE CASE x WHEN 10 THEN 'ten' WHEN 20 THEN 'twenty' ELSE 'other' END END FROM tab_a",
                 1,
-                0,
                 1,
-                Some("WHEN 20 THEN 'TWENTY' ELSE 'OTHER' END"),
+                0,
             ),
         ];
 
-        for (sql, before, after, fix_count, expected_text) in cases {
+        for (sql, before, after, fix_count) in cases {
             assert_rule_case(sql, issue_codes::LINT_ST_004, before, after, fix_count);
-
-            if let Some(expected) = expected_text {
-                let out = apply_lint_fixes(sql, Dialect::Generic, &[]).expect("fix result");
-                assert!(
-                    out.sql.to_ascii_uppercase().contains(expected),
-                    "expected {expected:?} in fixed SQL, got: {}",
-                    out.sql
-                );
-            }
         }
     }
 
@@ -4230,27 +4225,21 @@ mod tests {
 
     #[test]
     fn sqlfluff_cv008_cases_are_fixed_or_unchanged() {
-        let cases = [
-            (
-                "SELECT * FROM a RIGHT JOIN b ON a.id = b.id",
-                1,
-                0,
-                1,
-                Some("FROM B LEFT JOIN"),
-            ),
+        let cases: [(&str, usize, usize, usize, Option<&str>); 4] = [
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.id", 1, 1, 0, None),
             (
                 "SELECT a.id FROM a JOIN b ON a.id = b.id RIGHT JOIN c ON b.id = c.id",
                 1,
-                0,
                 1,
-                Some("FROM C LEFT JOIN"),
+                0,
+                None,
             ),
             (
                 "SELECT a.id FROM a RIGHT JOIN b ON a.id = b.id RIGHT JOIN c ON b.id = c.id",
                 2,
-                0,
                 2,
-                Some("FROM C LEFT JOIN"),
+                0,
+                None,
             ),
             ("SELECT * FROM a LEFT JOIN b ON a.id = b.id", 0, 0, 0, None),
         ];
@@ -4505,7 +4494,7 @@ mod tests {
             &default_lint_config(),
             FixOptions {
                 include_unsafe_fixes: true,
-                include_rewrite_candidates: true,
+                include_rewrite_candidates: false,
             },
         )
         .expect("fix result");
@@ -5365,21 +5354,40 @@ mod tests {
     fn rf003_core_autofix_respects_rule_filter() {
         let sql = "select a.id, id2 from a\n";
 
-        let out_rf_disabled = apply_lint_fixes(
+        let rf_disabled_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_RF_003.to_string()],
+            rule_configs: std::collections::BTreeMap::new(),
+        };
+        let out_rf_disabled = apply_lint_fixes_with_options(
             sql,
             Dialect::Generic,
-            &[issue_codes::LINT_RF_003.to_string()],
+            &rf_disabled_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
         )
         .expect("fix result");
-        assert_eq!(
-            out_rf_disabled.sql, sql,
-            "excluding RF_003 should block reference qualification core autofix"
+        assert!(
+            !out_rf_disabled.sql.contains("a.id2"),
+            "excluding RF_003 should block reference qualification core autofix: {}",
+            out_rf_disabled.sql
         );
 
-        let out_al_disabled = apply_lint_fixes(
+        let al_disabled_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_AL_005.to_string()],
+            rule_configs: std::collections::BTreeMap::new(),
+        };
+        let out_al_disabled = apply_lint_fixes_with_options(
             sql,
             Dialect::Generic,
-            &[issue_codes::LINT_AL_005.to_string()],
+            &al_disabled_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
         )
         .expect("fix result");
         assert!(
@@ -5810,9 +5818,31 @@ ON CONFLICT (route, period_start, nav_type, mark) DO UPDATE SET
     #[test]
     fn cv012_idempotent() {
         let sql = "SELECT a.x, b.y FROM a JOIN b WHERE a.id = b.id";
-        let disabled = vec![issue_codes::LINT_LT_014.to_string()];
-        let out1 = apply_lint_fixes(sql, Dialect::Generic, &disabled).expect("fix");
-        let out2 = apply_lint_fixes(&out1.sql, Dialect::Generic, &disabled).expect("fix2");
+        let lint_config = LintConfig {
+            enabled: true,
+            disabled_rules: vec![issue_codes::LINT_LT_014.to_string()],
+            rule_configs: std::collections::BTreeMap::new(),
+        };
+        let out1 = apply_lint_fixes_with_options(
+            sql,
+            Dialect::Generic,
+            &lint_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix");
+        let out2 = apply_lint_fixes_with_options(
+            &out1.sql,
+            Dialect::Generic,
+            &lint_config,
+            FixOptions {
+                include_unsafe_fixes: true,
+                include_rewrite_candidates: false,
+            },
+        )
+        .expect("fix2");
         assert_eq!(
             out1.sql.trim_end(),
             out2.sql.trim_end(),

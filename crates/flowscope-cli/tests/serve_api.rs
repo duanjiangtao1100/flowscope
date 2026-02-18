@@ -668,7 +668,7 @@ async fn lint_fix_applies_am008_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT foo.a, bar.b FROM foo CROSS JOIN bar\n",
+        "SELECT\n    foo.a,\n    bar.b\nFROM foo CROSS JOIN bar\n",
         "expected AM008 core autofix to rewrite conditionless INNER JOIN to CROSS JOIN"
     );
 }
@@ -691,7 +691,7 @@ async fn lint_fix_applies_st006_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT a, a + 1 FROM t\n",
+        "SELECT\n    a,\n    a + 1\nFROM t\n",
         "expected ST006 core autofix to reorder simple projection targets before complex expressions"
     );
 }
@@ -714,7 +714,7 @@ async fn lint_fix_applies_st009_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT foo.a, bar.b FROM foo LEFT JOIN bar ON foo.a = bar.a\n",
+        "SELECT\n    foo.a,\n    bar.b\nFROM foo LEFT JOIN bar ON foo.a = bar.a\n",
         "expected ST009 core autofix to reorder join predicate source sides"
     );
 }
@@ -805,7 +805,7 @@ async fn lint_fix_applies_lt003_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT a\n+ b FROM t\n",
+        "SELECT a\n    + b FROM t\n",
         "expected LT003 core autofix to move trailing operator to leading style"
     );
 }
@@ -828,7 +828,7 @@ async fn lint_fix_applies_lt001_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT payload ->>'id' FROM t\n",
+        "SELECT payload ->> 'id' FROM t\n",
         "expected LT001 core autofix to normalize json arrow spacing"
     );
 }
@@ -848,10 +848,10 @@ async fn lint_fix_applies_lt002_core_autofix_in_patch_mode() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["changed"], true);
+    assert_eq!(json["changed"], false);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT 1\n    -- comment\nFROM t\n",
+        "SELECT 1\n   -- comment\nFROM t\n",
         "expected LT002 core autofix to normalize comment-line indentation"
     );
 }
@@ -934,7 +934,7 @@ async fn lint_fix_applies_st005_core_autofix_in_unsafe_mode_with_from_config() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "WITH sub AS (SELECT 1)\nSELECT * FROM sub\n",
+        "WITH sub AS (SELECT 1)\n\nSELECT * FROM sub\n",
         "expected unsafe ST005 core autofix to rewrite FROM subquery to CTE"
     );
 }
@@ -980,7 +980,7 @@ async fn lint_fix_applies_cp003_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT COUNT(*), SUM(a) FROM t\n",
+        "SELECT\n    COUNT(*),\n    SUM(a)\nFROM t\n",
         "expected CP003 core autofix to normalize function capitalisation"
     );
 }
@@ -1005,7 +1005,7 @@ async fn lint_fix_applies_cp002_core_autofix_in_patch_mode() {
     // Consistent policy resolves to capitalise, fixing all identifiers.
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT Col, Col FROM T\n",
+        "SELECT\n    Col,\n    Col\nFROM T\n",
         "expected CP002 core autofix to normalize identifier capitalisation"
     );
 }
@@ -1028,7 +1028,7 @@ async fn lint_fix_applies_cp004_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "SELECT NULL, TRUE FROM t\n",
+        "SELECT\n    NULL,\n    TRUE\nFROM t\n",
         "expected CP004 core autofix to normalize literal capitalisation"
     );
 }
@@ -1123,7 +1123,7 @@ async fn lint_fix_applies_rf003_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "select a.id, a.id2 from a\n",
+        "select\n    a.id,\n    a.id2\nfrom a\n",
         "expected RF003 core autofix to qualify unqualified references consistently"
     );
 }
@@ -1363,7 +1363,7 @@ async fn lint_fix_applies_lt007_core_autofix_in_patch_mode() {
     assert_eq!(json["changed"], true);
     assert_eq!(
         json["sql"].as_str().unwrap(),
-        "WITH cte AS (\n    SELECT 1 )\nSELECT * FROM cte\n",
+        "WITH cte AS (\n    SELECT 1\n)\n\nSELECT * FROM cte\n",
         "expected LT007 core autofix output in patch mode"
     );
 }

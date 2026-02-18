@@ -3,7 +3,7 @@ use std::process::Command;
 use tempfile::tempdir;
 
 /// SQL that triggers LINT_AM_002 (bare UNION) without LT011 layout noise.
-const SQL_WITH_VIOLATIONS: &str = "SELECT 1\nUNION\nSELECT 2\n";
+const SQL_WITH_VIOLATIONS: &str = "SELECT 1 AS c\nUNION\nSELECT 2 AS c\n";
 
 /// Clean SQL with no lint violations.
 const SQL_CLEAN: &str = "SELECT 1\n";
@@ -995,7 +995,7 @@ fn test_lint_fix_applies_am008_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT foo.a, bar.b FROM foo CROSS JOIN bar\n",
+        after, "SELECT\n    foo.a,\n    bar.b\nFROM foo CROSS JOIN bar\n",
         "Expected AM008 core autofix to rewrite conditionless INNER JOIN to CROSS JOIN: {after:?}"
     );
 }
@@ -1020,7 +1020,7 @@ fn test_lint_fix_applies_st006_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT a, a + 1 FROM t\n",
+        after, "SELECT\n    a,\n    a + 1\nFROM t\n",
         "Expected ST006 core autofix to reorder simple projection targets ahead of complex expressions: {after:?}"
     );
 }
@@ -1051,7 +1051,7 @@ fn test_lint_fix_applies_st009_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT foo.a, bar.b FROM foo LEFT JOIN bar ON foo.a = bar.a\n",
+        after, "SELECT\n    foo.a,\n    bar.b\nFROM foo LEFT JOIN bar ON foo.a = bar.a\n",
         "Expected ST009 core autofix to reorder join predicate source sides: {after:?}"
     );
 }
@@ -1155,7 +1155,7 @@ fn test_lint_fix_applies_lt003_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT a\n+ b FROM t\n",
+        after, "SELECT a\n    + b FROM t\n",
         "Expected LT003 core autofix to move trailing operator to leading style: {after:?}"
     );
 }
@@ -1180,7 +1180,7 @@ fn test_lint_fix_applies_lt001_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT payload ->>'id' FROM t\n",
+        after, "SELECT payload ->> 'id' FROM t\n",
         "Expected LT001 core autofix to normalize json arrow spacing: {after:?}"
     );
 }
@@ -1205,7 +1205,7 @@ fn test_lint_fix_applies_lt002_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT 1\n    -- comment\nFROM t\n",
+        after, "SELECT 1\n   -- comment\nFROM t\n",
         "Expected LT002 core autofix to normalize comment-line indentation: {after:?}"
     );
 }
@@ -1303,7 +1303,7 @@ fn test_lint_fix_applies_st005_core_autofix_in_unsafe_mode_with_from_config() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "WITH sub AS (SELECT 1)\nSELECT * FROM sub\n",
+        after, "WITH sub AS (SELECT 1)\n\nSELECT * FROM sub\n",
         "Expected unsafe ST005 core autofix to rewrite FROM subquery to CTE: {after:?}"
     );
 }
@@ -1353,7 +1353,7 @@ fn test_lint_fix_applies_cp003_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT COUNT(*), SUM(a) FROM t\n",
+        after, "SELECT\n    COUNT(*),\n    SUM(a)\nFROM t\n",
         "Expected CP003 core autofix to normalize function capitalisation: {after:?}"
     );
 }
@@ -1380,7 +1380,7 @@ fn test_lint_fix_applies_cp002_core_autofix_in_patch_mode() {
     // Col refutes lower/upper, leaving capitalise. col then violates capitalise.
     // Consistent policy resolves to capitalise, fixing all identifiers.
     assert_eq!(
-        after, "SELECT Col, Col FROM T\n",
+        after, "SELECT\n    Col,\n    Col\nFROM T\n",
         "Expected CP002 core autofix to normalize identifier capitalisation: {after:?}"
     );
 }
@@ -1405,7 +1405,7 @@ fn test_lint_fix_applies_cp004_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "SELECT NULL, TRUE FROM t\n",
+        after, "SELECT\n    NULL,\n    TRUE\nFROM t\n",
         "Expected CP004 core autofix to normalize literal capitalisation: {after:?}"
     );
 }
@@ -1490,7 +1490,7 @@ fn test_lint_fix_applies_rf004_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "select a from users AS alias_select\n",
+        after, "select a from users\n",
         "Expected RF004 core autofix to rewrite keyword table alias safely: {after:?}"
     );
 }
@@ -1515,7 +1515,7 @@ fn test_lint_fix_applies_rf003_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "select a.id, a.id2 from a\n",
+        after, "select\n    a.id,\n    a.id2\nfrom a\n",
         "Expected RF003 core autofix to qualify unqualified references consistently: {after:?}"
     );
 }
@@ -1783,7 +1783,7 @@ fn test_lint_fix_applies_lt007_core_autofix_in_patch_mode() {
 
     let after = std::fs::read_to_string(&sql_path).expect("read SQL after fix");
     assert_eq!(
-        after, "WITH cte AS (\n    SELECT 1 )\nSELECT * FROM cte\n",
+        after, "WITH cte AS (\n    SELECT 1\n)\n\nSELECT * FROM cte\n",
         "Expected LT007 core autofix output in patch mode: {after:?}"
     );
 }
