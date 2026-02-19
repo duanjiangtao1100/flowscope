@@ -21,6 +21,7 @@ use flowscope_export::{
 };
 use is_terminal::IsTerminal;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -36,6 +37,9 @@ const EXIT_FAILURE: u8 = 1;
 /// Configuration error (e.g. unsupported format for the given mode).
 const EXIT_CONFIG_ERROR: u8 = 66;
 /// Max bounded fix passes per file during `--lint --fix`.
+///
+/// Three passes capture the vast majority of cascading fixes while avoiding
+/// disproportionate long-tail runtime on large statements.
 const MAX_LINT_FIX_PASSES: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -107,10 +111,17 @@ fn apply_lint_fixes_with_runtime_options(
     let mut merged_candidate_stats = FixCandidateStats::default();
     let mut any_changed = false;
     let mut last_outcome = None;
+    let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
 
     for _pass in 0..MAX_LINT_FIX_PASSES {
         let outcome =
             apply_lint_fixes_with_options(&current_sql, dialect, lint_config, fix_options)?;
+
+        // Avoid oscillating between previously seen SQL states across passes.
+        if outcome.changed && !seen_sql.insert(outcome.sql.clone()) {
+            break;
+        }
+
         merged_counts.merge(&outcome.counts);
         merged_candidate_stats.merge(collect_fix_candidate_stats(&outcome, runtime_options));
 

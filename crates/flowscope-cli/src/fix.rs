@@ -20,9 +20,8 @@ use flowscope_core::{TemplateConfig, TemplateMode};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-#[cfg(feature = "templating")]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[must_use]
@@ -171,6 +170,58 @@ impl RuleFilter {
     }
 }
 
+struct FixProfileGuard {
+    enabled: bool,
+    started_at: Instant,
+    sql_len: usize,
+    include_rewrite_candidates: bool,
+    include_unsafe_fixes: bool,
+    marks: Vec<(&'static str, Duration)>,
+}
+
+impl FixProfileGuard {
+    fn new(sql_len: usize, fix_options: FixOptions) -> Self {
+        Self {
+            enabled: std::env::var_os("FLOWSCOPE_FIX_PROFILE").is_some(),
+            started_at: Instant::now(),
+            sql_len,
+            include_rewrite_candidates: fix_options.include_rewrite_candidates,
+            include_unsafe_fixes: fix_options.include_unsafe_fixes,
+            marks: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, label: &'static str, started: Instant) {
+        if self.enabled {
+            self.marks.push((label, started.elapsed()));
+        }
+    }
+}
+
+impl Drop for FixProfileGuard {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+
+        let total = self.started_at.elapsed();
+        let mut summary = format!(
+            "flowscope: fix-profile sql_len={} rewrite={} unsafe={} total={:.2}ms",
+            self.sql_len,
+            self.include_rewrite_candidates,
+            self.include_unsafe_fixes,
+            total.as_secs_f64() * 1000.0
+        );
+        for (label, duration) in &self.marks {
+            summary.push_str(&format!(
+                " | {label}={:.2}ms",
+                duration.as_secs_f64() * 1000.0
+            ));
+        }
+        eprintln!("{summary}");
+    }
+}
+
 /// Apply deterministic lint fixes to a SQL document.
 ///
 /// Notes:
@@ -215,10 +266,21 @@ pub fn apply_lint_fixes_with_options(
     lint_config: &LintConfig,
     fix_options: FixOptions,
 ) -> Result<FixOutcome, ParseError> {
+    let mut profile = FixProfileGuard::new(sql.len(), fix_options);
+    const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR: usize = 4;
+    const INCREMENTAL_MAX_ITERATIONS_DEFAULT: usize = 24;
+    const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
     let rule_filter = RuleFilter::from_lint_config(lint_config);
 
+    let stage_started = Instant::now();
     let before_issues = lint_issues(sql, dialect, lint_config);
+    profile.record("lint_issues_before", stage_started);
+
+    let stage_started = Instant::now();
     let before_counts = lint_rule_counts_from_issues(&before_issues);
+    profile.record("before_counts", stage_started);
+
+    let stage_started = Instant::now();
     let mut core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
     core_candidates.extend(build_al001_fallback_candidates(
         sql,
@@ -226,11 +288,16 @@ pub fn apply_lint_fixes_with_options(
         &before_issues,
         lint_config,
     ));
+    profile.record("core_candidates", stage_started);
+
+    let stage_started = Instant::now();
     let core_autofix_rules =
         collect_core_autofix_rules(&before_issues, fix_options.include_unsafe_fixes);
+    profile.record("core_autofix_rules", stage_started);
     let mut candidates = Vec::new();
 
     if fix_options.include_rewrite_candidates {
+        let rewrite_stage_started = Instant::now();
         let safe_rule_filter = if fix_options.include_unsafe_fixes {
             rule_filter.clone()
         } else {
@@ -279,25 +346,39 @@ pub fn apply_lint_fixes_with_options(
         }
 
         candidates.extend(rewrite_candidates);
+        profile.record("rewrite_candidates", rewrite_stage_started);
     }
 
     candidates.extend(core_candidates.iter().cloned());
 
+    let stage_started = Instant::now();
     let protected_ranges =
         collect_comment_protected_ranges(sql, dialect, !fix_options.include_unsafe_fixes);
+    profile.record("protected_ranges", stage_started);
+
+    let stage_started = Instant::now();
     let planned = plan_fix_candidates(
         sql,
         candidates,
         &protected_ranges,
         fix_options.include_unsafe_fixes,
     );
+    profile.record("plan_fix_candidates", stage_started);
+
+    let stage_started = Instant::now();
     let mut fixed_sql = apply_planned_edits(sql, &planned.edits);
+    profile.record("apply_planned_edits", stage_started);
+
+    let stage_started = Instant::now();
     let mut after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
+    profile.record("after_counts", stage_started);
+
     let before_total = regression_guard_total(&before_counts);
     let after_total = regression_guard_total(&after_counts);
     let mut skipped_counts = planned.skipped.clone();
 
     if parse_errors_increased(&before_counts, &after_counts) {
+        let stage_started = Instant::now();
         if let Some(outcome) = try_core_only_fix_plan(
             sql,
             dialect,
@@ -307,17 +388,24 @@ pub fn apply_lint_fixes_with_options(
             &protected_ranges,
             fix_options.include_unsafe_fixes,
         ) {
+            profile.record("fallback_core_only_parse_errors", stage_started);
             return Ok(outcome);
         }
+        profile.record("fallback_core_only_parse_errors", stage_started);
+
+        let stage_started = Instant::now();
         if let Some(outcome) = try_incremental_core_fix_plan(
             sql,
             dialect,
             lint_config,
             &before_counts,
             fix_options.include_unsafe_fixes,
+            INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR,
         ) {
+            profile.record("fallback_incremental_parse_errors", stage_started);
             return Ok(outcome);
         }
+        profile.record("fallback_incremental_parse_errors", stage_started);
 
         return Ok(FixOutcome {
             sql: sql.to_string(),
@@ -332,6 +420,7 @@ pub fn apply_lint_fixes_with_options(
     if fix_options.include_rewrite_candidates
         && core_autofix_rules_not_improved(&before_counts, &after_counts, &core_autofix_rules)
     {
+        let stage_started = Instant::now();
         if let Some(outcome) = try_core_only_fix_plan(
             sql,
             dialect,
@@ -341,17 +430,24 @@ pub fn apply_lint_fixes_with_options(
             &protected_ranges,
             fix_options.include_unsafe_fixes,
         ) {
+            profile.record("fallback_core_only_rewrite_guard", stage_started);
             return Ok(outcome);
         }
+        profile.record("fallback_core_only_rewrite_guard", stage_started);
+
+        let stage_started = Instant::now();
         if let Some(outcome) = try_incremental_core_fix_plan(
             sql,
             dialect,
             lint_config,
             &before_counts,
             fix_options.include_unsafe_fixes,
+            INCREMENTAL_MAX_ITERATIONS_DEFAULT,
         ) {
+            profile.record("fallback_incremental_rewrite_guard", stage_started);
             return Ok(outcome);
         }
+        profile.record("fallback_incremental_rewrite_guard", stage_started);
     }
 
     // Strict regression guard: never apply a fix set that increases total
@@ -362,6 +458,7 @@ pub fn apply_lint_fixes_with_options(
             && after_counts != before_counts
             && core_autofix_rules_not_improved(&before_counts, &after_counts, &core_autofix_rules));
     if masked_or_worse {
+        let stage_started = Instant::now();
         if let Some(outcome) = try_core_only_fix_plan(
             sql,
             dialect,
@@ -371,17 +468,24 @@ pub fn apply_lint_fixes_with_options(
             &protected_ranges,
             fix_options.include_unsafe_fixes,
         ) {
+            profile.record("fallback_core_only_masked_or_worse", stage_started);
             return Ok(outcome);
         }
+        profile.record("fallback_core_only_masked_or_worse", stage_started);
+
+        let stage_started = Instant::now();
         if let Some(outcome) = try_incremental_core_fix_plan(
             sql,
             dialect,
             lint_config,
             &before_counts,
             fix_options.include_unsafe_fixes,
+            INCREMENTAL_MAX_ITERATIONS_DEFAULT,
         ) {
+            profile.record("fallback_incremental_masked_or_worse", stage_started);
             return Ok(outcome);
         }
+        profile.record("fallback_incremental_masked_or_worse", stage_started);
 
         return Ok(FixOutcome {
             sql: sql.to_string(),
@@ -393,21 +497,37 @@ pub fn apply_lint_fixes_with_options(
         });
     }
 
-    if !fix_options.include_rewrite_candidates && skipped_counts.overlap_conflict_blocked > 0 {
+    // Incremental overlap recovery can be very expensive on large/highly
+    // conflicted statements. Cap this path to low-conflict cases where the
+    // extra per-rule search is most likely to pay off.
+    const MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY: usize = 8;
+    if !fix_options.include_rewrite_candidates
+        && skipped_counts.overlap_conflict_blocked > 0
+        && skipped_counts.overlap_conflict_blocked <= MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY
+    {
+        let stage_started = Instant::now();
         if let Some(incremental) = try_incremental_core_fix_plan(
             &fixed_sql,
             dialect,
             lint_config,
             &after_counts,
             fix_options.include_unsafe_fixes,
+            INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY,
         ) {
+            profile.record("incremental_overlap_recovery", stage_started);
             merge_skipped_counts(&mut skipped_counts, &incremental.skipped_counts);
             fixed_sql = incremental.sql;
+            let recount_started = Instant::now();
             after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
+            profile.record("after_counts_overlap_recovery", recount_started);
+        } else {
+            profile.record("incremental_overlap_recovery", stage_started);
         }
     }
 
+    let stage_started = Instant::now();
     let counts = FixCounts::from_removed(&before_counts, &after_counts);
+    profile.record("final_removed_counts", stage_started);
 
     if counts.total() == 0 {
         return Ok(FixOutcome {
@@ -695,7 +815,21 @@ fn core_autofix_rules_not_improved(
     after_counts: &BTreeMap<String, usize>,
     core_autofix_rules: &HashSet<String>,
 ) -> bool {
+    let lt03_improved = after_counts
+        .get(issue_codes::LINT_LT_003)
+        .copied()
+        .unwrap_or(0)
+        < before_counts
+            .get(issue_codes::LINT_LT_003)
+            .copied()
+            .unwrap_or(0);
+
     core_autofix_rules.iter().any(|code| {
+        if lt03_improved && code == issue_codes::LINT_LT_005 {
+            // Allow LT03 fixes that trade one LT05 long-line violation for one
+            // LT03 operator-layout violation at equal total counts.
+            return false;
+        }
         let before_count = before_counts.get(code).copied().unwrap_or(0);
         before_count > 0 && after_counts.get(code).copied().unwrap_or(0) >= before_count
     })
@@ -886,16 +1020,18 @@ fn try_incremental_core_fix_plan(
     lint_config: &LintConfig,
     before_counts: &BTreeMap<String, usize>,
     allow_unsafe: bool,
+    max_iterations: usize,
 ) -> Option<FixOutcome> {
     let mut current_sql = sql.to_string();
     let mut current_counts = before_counts.clone();
     let mut changed = false;
     let mut skipped_counts = FixSkippedCounts::default();
+    let mut counts_cache: HashMap<String, BTreeMap<String, usize>> = HashMap::new();
     let mut seen_sql = HashSet::new();
     seen_sql.insert(current_sql.clone());
 
-    const MAX_ITERATIONS: usize = 24;
-    for _ in 0..MAX_ITERATIONS {
+    let max_iterations = max_iterations.max(1);
+    for _ in 0..max_iterations {
         let issues = lint_issues(&current_sql, dialect, lint_config);
         let mut all_candidates = build_fix_candidates_from_issue_autofixes(&current_sql, &issues);
         all_candidates.extend(build_al001_fallback_candidates(
@@ -933,6 +1069,7 @@ fn try_incremental_core_fix_plan(
         let mut best_counts: Option<BTreeMap<String, usize>> = None;
         let mut best_removed = 0usize;
         let mut best_after_total = usize::MAX;
+        let mut evaluated_candidate_sql = HashSet::new();
 
         for (rule_code, rule_candidates) in by_rule {
             let planned = plan_fix_candidates(
@@ -951,8 +1088,17 @@ fn try_incremental_core_fix_plan(
             if candidate_sql == current_sql {
                 continue;
             }
+            if !evaluated_candidate_sql.insert(candidate_sql.clone()) {
+                continue;
+            }
 
-            let candidate_counts = lint_rule_counts(&candidate_sql, dialect, lint_config);
+            let candidate_counts = if let Some(cached) = counts_cache.get(&candidate_sql) {
+                cached.clone()
+            } else {
+                let counts = lint_rule_counts(&candidate_sql, dialect, lint_config);
+                counts_cache.insert(candidate_sql.clone(), counts.clone());
+                counts
+            };
             if parse_errors_increased(&current_counts, &candidate_counts) {
                 continue;
             }
@@ -3340,6 +3486,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lt03_improvement_allows_lt05_tradeoff_at_equal_totals() {
+        let before = std::collections::BTreeMap::from([
+            (issue_codes::LINT_LT_003.to_string(), 1usize),
+            (issue_codes::LINT_LT_005.to_string(), 5usize),
+        ]);
+        let after = std::collections::BTreeMap::from([
+            (issue_codes::LINT_LT_003.to_string(), 0usize),
+            (issue_codes::LINT_LT_005.to_string(), 6usize),
+        ]);
+        let core_rules = std::collections::HashSet::from([
+            issue_codes::LINT_LT_003.to_string(),
+            issue_codes::LINT_LT_005.to_string(),
+        ]);
+
+        assert!(
+            !core_autofix_rules_not_improved(&before, &after, &core_rules),
+            "LT03 improvements should be allowed to trade against LT05 at equal totals"
+        );
+    }
+
+    #[test]
+    fn lt05_tradeoff_is_not_allowed_without_lt03_improvement() {
+        let before = std::collections::BTreeMap::from([
+            (issue_codes::LINT_LT_003.to_string(), 1usize),
+            (issue_codes::LINT_LT_005.to_string(), 5usize),
+        ]);
+        let after = std::collections::BTreeMap::from([
+            (issue_codes::LINT_LT_003.to_string(), 1usize),
+            (issue_codes::LINT_LT_005.to_string(), 6usize),
+        ]);
+        let core_rules = std::collections::HashSet::from([
+            issue_codes::LINT_LT_003.to_string(),
+            issue_codes::LINT_LT_005.to_string(),
+        ]);
+
+        assert!(
+            core_autofix_rules_not_improved(&before, &after, &core_rules),
+            "without LT03 improvement, LT05 worsening remains blocked"
+        );
+    }
+
     fn assert_rule_case(
         sql: &str,
         code: &str,
@@ -4765,6 +4953,7 @@ mod tests {
             &lint_config,
             &before_counts,
             false,
+            24,
         )
         .expect("expected incremental ST009 fix");
         assert!(

@@ -10,7 +10,7 @@ use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, Issue
 use sqlparser::ast::Statement;
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub struct LayoutIndent {
     indent_unit: usize,
@@ -297,6 +297,16 @@ impl LintRule for LayoutIndent {
                 self.indent_style,
             );
         }
+        if ctx.dialect() == Dialect::Postgres && !postgres_structural_edits.is_empty() {
+            // PostgreSQL structural passes (WHERE/WHEN/JOIN/SET shaping) are
+            // parity-critical and should win when they target the same line
+            // start as generic indentation normalization.
+            let postgres_starts: HashSet<usize> = postgres_structural_edits
+                .iter()
+                .map(|edit| edit.start)
+                .collect();
+            autofix_edits.retain(|edit| !postgres_starts.contains(&edit.start));
+        }
         autofix_edits.extend(postgres_structural_edits.clone());
 
         // Merge structural edits (e.g., adding indentation to content lines
@@ -322,6 +332,11 @@ impl LintRule for LayoutIndent {
                 && left.end == right.end
                 && left.replacement == right.replacement
         });
+        // Multiple LT02 strategies can emit competing edits at the same byte
+        // start. Collapse these upfront so we do not over-report duplicate
+        // locations and do not feed conflicting same-location candidates into
+        // the fix planner.
+        autofix_edits = collapse_lt02_autofix_edits_by_start(autofix_edits);
 
         // SQLFluff parity for PostgreSQL-heavy corpora: LT02 reports and
         // fixes per indentation edit location rather than one statement-level
@@ -338,11 +353,37 @@ impl LintRule for LayoutIndent {
         };
         let covered_starts: HashSet<usize> =
             postgres_issue_edits.iter().map(|edit| edit.start).collect();
+        let covered_starts_by_line: HashMap<usize, Vec<usize>> =
+            if ctx.dialect() == Dialect::Postgres {
+                postgres_issue_edits
+                    .iter()
+                    .filter_map(|edit| {
+                        statement_line_index_for_offset(&postgres_line_infos, edit.start)
+                            .map(|line_idx| (line_idx, edit.start))
+                    })
+                    .fold(HashMap::new(), |mut acc, (line_idx, start)| {
+                        acc.entry(line_idx).or_default().push(start);
+                        acc
+                    })
+            } else {
+                HashMap::new()
+            };
         let postgres_extra_issue_spans: Vec<(usize, usize)> = if ctx.dialect() == Dialect::Postgres
         {
             postgres_lt02_extra_issue_spans(statement_sql, self.indent_unit, self.tab_space_size)
                 .into_iter()
-                .filter(|(start, _end)| !covered_starts.contains(start))
+                .filter(|(start, _end)| {
+                    if covered_starts.contains(start) {
+                        return false;
+                    }
+                    statement_line_index_for_offset(&postgres_line_infos, *start)
+                        .and_then(|line_idx| covered_starts_by_line.get(&line_idx))
+                        .is_none_or(|line_starts| {
+                            !line_starts
+                                .iter()
+                                .any(|line_start| line_start.abs_diff(*start) <= 1)
+                        })
+                })
                 .collect()
         } else {
             Vec::new()
@@ -357,40 +398,44 @@ impl LintRule for LayoutIndent {
             return Vec::new();
         }
         if !postgres_issue_edits.is_empty() || !postgres_extra_issue_spans.is_empty() {
-            let mut edits_by_line: BTreeMap<usize, Vec<Lt02AutofixEdit>> = BTreeMap::new();
-            for edit in postgres_issue_edits {
-                let line_index = statement_line_index_for_offset(&postgres_line_infos, edit.start);
-                edits_by_line.entry(line_index).or_default().push(edit);
-            }
-
             let mut issues: Vec<Issue> = Vec::new();
-            for mut line_edits in edits_by_line.into_values() {
-                line_edits.sort_by(|left, right| {
-                    (left.start, left.end, left.replacement.as_str()).cmp(&(
-                        right.start,
-                        right.end,
-                        right.replacement.as_str(),
-                    ))
-                });
-                for edit in line_edits {
-                    let patch = IssuePatchEdit::new(
-                        ctx.span_from_statement_offset(edit.start, edit.end),
-                        edit.replacement,
-                    );
-                    let span = Span::new(patch.span.start, patch.span.end);
-                    issues.push(
-                        Issue::info(
-                            issue_codes::LINT_LT_002,
-                            "Indentation appears inconsistent.",
-                        )
-                        .with_statement(ctx.statement_index)
-                        .with_span(span)
-                        .with_autofix_edits(IssueAutofixApplicability::Safe, vec![patch]),
-                    );
+            let mut patches_by_start: BTreeMap<usize, IssuePatchEdit> = BTreeMap::new();
+            for edit in postgres_issue_edits {
+                let patch = IssuePatchEdit::new(
+                    ctx.span_from_statement_offset(edit.start, edit.end),
+                    edit.replacement,
+                );
+                match patches_by_start.entry(patch.span.start) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(patch);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if should_prefer_lt02_patch(&patch, entry.get()) {
+                            entry.insert(patch);
+                        }
+                    }
                 }
             }
 
+            let mut issue_starts = HashSet::new();
+            for patch in patches_by_start.into_values() {
+                let span = Span::new(patch.span.start, patch.span.end);
+                issue_starts.insert(span.start);
+                issues.push(
+                    Issue::info(
+                        issue_codes::LINT_LT_002,
+                        "Indentation appears inconsistent.",
+                    )
+                    .with_statement(ctx.statement_index)
+                    .with_span(span)
+                    .with_autofix_edits(IssueAutofixApplicability::Safe, vec![patch]),
+                );
+            }
+
             for (start, end) in postgres_extra_issue_spans {
+                if !issue_starts.insert(start) {
+                    continue;
+                }
                 let span = ctx.span_from_statement_offset(start, end);
                 issues.push(
                     Issue::info(
@@ -439,7 +484,7 @@ fn postgres_lt02_extra_issue_spans(
         return Vec::new();
     }
 
-    let scans: Vec<ScanLine<'_>> = lines
+    let mut scans: Vec<ScanLine<'_>> = lines
         .iter()
         .map(|line| {
             let trimmed = line.trim_start();
@@ -455,9 +500,14 @@ fn postgres_lt02_extra_issue_spans(
                 words,
                 is_blank,
                 is_comment_only: is_comment_line(trimmed),
+                inline_case_offset: inline_case_keyword_offset(trimmed),
+                prev_significant: None,
+                next_significant: None,
             }
         })
         .collect();
+    link_significant_lines(&mut scans);
+    let case_anchor_cache = build_case_anchor_cache(&scans);
 
     let mut issue_spans: Vec<(usize, usize)> = Vec::new();
     let mut set_block_expected_indent: Option<usize> = None;
@@ -600,8 +650,8 @@ fn postgres_lt02_extra_issue_spans(
 
         if matches!(first, Some("SELECT")) && line.words.len() > 1 && line.trimmed.contains(',') {
             if let Some(prev_idx) = previous_significant_line(&scans, idx) {
-                let prev_upper = scans[prev_idx].trimmed.to_ascii_uppercase();
-                if prev_upper.contains("UNION") {
+                let prev_first = scans[prev_idx].words.first().map(String::as_str);
+                if matches!(prev_first, Some("UNION" | "INTERSECT" | "EXCEPT")) {
                     if let Some(rel) = content_offset_after_keyword(line.trimmed, "SELECT") {
                         push_trimmed_offset_issue_span(
                             &mut issue_spans,
@@ -619,6 +669,23 @@ fn postgres_lt02_extra_issue_spans(
             let upper = line.trimmed.to_ascii_uppercase();
             if let Some(rel) = upper.find(" WHEN ").map(|offset| offset + 1) {
                 push_trimmed_offset_issue_span(&mut issue_spans, &line_infos, idx, rel, sql_len);
+            }
+        }
+
+        if !matches!(first, Some("CASE")) {
+            if let Some(case_rel) = line.inline_case_offset {
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    let next_first = scans[next_idx].words.first().map(String::as_str);
+                    if matches!(next_first, Some("WHEN" | "THEN" | "ELSE" | "END")) {
+                        push_trimmed_offset_issue_span(
+                            &mut issue_spans,
+                            &line_infos,
+                            idx,
+                            case_rel,
+                            sql_len,
+                        );
+                    }
+                }
             }
         }
 
@@ -663,8 +730,40 @@ fn postgres_lt02_extra_issue_spans(
             }
         }
 
+        if matches!(first, Some("WHEN")) {
+            if let Some(expected_indent) =
+                expected_case_when_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
+                if line.indent != expected_indent {
+                    push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                }
+            }
+        }
+
         if matches!(first, Some("THEN")) {
-            if let Some(expected_indent) = expected_then_indent(&scans, idx, indent_unit) {
+            if let Some(expected_indent) =
+                expected_then_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
+                if line.indent != expected_indent {
+                    push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                }
+            }
+        }
+
+        if matches!(first, Some("ELSE")) {
+            if let Some(expected_indent) =
+                expected_else_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
+                if line.indent != expected_indent {
+                    push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
+                }
+            }
+        }
+
+        if matches!(first, Some("END")) {
+            if let Some(expected_indent) =
+                expected_end_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
                 if line.indent != expected_indent {
                     push_line_start_issue_span(&mut issue_spans, &line_infos, idx, sql_len);
                 }
@@ -774,7 +873,7 @@ fn postgres_keyword_break_and_indent_edits(
         return Vec::new();
     }
 
-    let scans: Vec<ScanLine<'_>> = lines
+    let mut scans: Vec<ScanLine<'_>> = lines
         .iter()
         .map(|line| {
             let trimmed = line.trim_start();
@@ -790,9 +889,14 @@ fn postgres_keyword_break_and_indent_edits(
                 words,
                 is_blank,
                 is_comment_only: is_comment_line(trimmed),
+                inline_case_offset: inline_case_keyword_offset(trimmed),
+                prev_significant: None,
+                next_significant: None,
             }
         })
         .collect();
+    link_significant_lines(&mut scans);
+    let case_anchor_cache = build_case_anchor_cache(&scans);
 
     let mut edits = Vec::new();
 
@@ -819,13 +923,57 @@ fn postgres_keyword_break_and_indent_edits(
             );
         }
 
-        if matches!(first, Some("WHERE")) && line.words.len() > 1 {
+        if !matches!(first, Some("CASE")) {
+            if let Some(case_rel) = line.inline_case_offset {
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    let next_first = scans[next_idx].words.first().map(String::as_str);
+                    if matches!(next_first, Some("WHEN" | "THEN" | "ELSE" | "END")) {
+                        push_inline_case_break_edit(
+                            &mut edits,
+                            statement_sql,
+                            &line_infos,
+                            idx,
+                            case_rel,
+                            line.indent + indent_unit,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
+                        );
+                    }
+                }
+            }
+        }
+
+        if matches!(first, Some("WHERE")) {
             if let Some(next_idx) = next_significant_line(&scans, idx) {
                 let next_line = &scans[next_idx];
                 let next_first = next_line.words.first().map(String::as_str);
                 let needs_break = matches!(next_first, Some("AND" | "OR"))
                     || starts_with_operator_continuation(next_line.trimmed);
-                if needs_break {
+                let where_parent_indent = previous_significant_line(&scans, idx).and_then(|prev_idx| {
+                    let prev_first = scans[prev_idx].words.first().map(String::as_str);
+                    let prev_second = scans[prev_idx].words.get(1).map(String::as_str);
+                    (is_join_clause(prev_first, prev_second)
+                        || matches!(prev_first, Some("FROM" | "WHERE" | "HAVING" | "ON")))
+                    .then_some(scans[prev_idx].indent)
+                });
+                let where_clause_indent = where_parent_indent
+                    .unwrap_or_else(|| ceil_indent_width(line.indent, indent_unit));
+                if let Some(parent_indent) = where_parent_indent {
+                    push_leading_indent_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        idx,
+                        line.indent,
+                        parent_indent,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+                let where_content_indent = where_clause_indent + indent_unit;
+                if line.words.len() > 1 && needs_break {
                     push_keyword_break_edit(
                         &mut edits,
                         statement_sql,
@@ -833,7 +981,7 @@ fn postgres_keyword_break_and_indent_edits(
                         &scans,
                         idx,
                         "WHERE",
-                        line.indent + indent_unit,
+                        where_content_indent,
                         indent_unit,
                         tab_space_size,
                         indent_style,
@@ -844,11 +992,30 @@ fn postgres_keyword_break_and_indent_edits(
                         &line_infos,
                         &scans,
                         next_idx,
-                        line.indent + indent_unit,
+                        where_content_indent,
                         indent_unit,
                         tab_space_size,
                         indent_style,
                     );
+                }
+
+                if line.words.len() == 1 {
+                    let starts_condition_block = !is_clause_boundary(next_first, next_line.trimmed)
+                        || matches!(next_first, Some("AND" | "OR" | "NOT" | "EXISTS"))
+                        || starts_with_operator_continuation(next_line.trimmed);
+                    if starts_condition_block {
+                        push_on_condition_block_indent_edits(
+                            &mut edits,
+                            statement_sql,
+                            &line_infos,
+                            &scans,
+                            next_idx,
+                            where_content_indent,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
+                        );
+                    }
                 }
             }
         }
@@ -889,7 +1056,26 @@ fn postgres_keyword_break_and_indent_edits(
             }
         }
 
+        if matches!(first, Some("WHEN")) {
+            if let Some(expected_indent) =
+                expected_case_when_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
+                push_leading_indent_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    idx,
+                    line.indent,
+                    expected_indent,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+            }
+        }
+
         if matches!(first, Some("ON")) && !matches!(second, Some("CONFLICT")) {
+            let on_content_indent = rounded_indent_width(line.indent, indent_unit) + indent_unit;
             if let Some(parent_indent) = previous_line_indent_matching(&scans, idx, |f, s| {
                 is_join_clause(f, s) || matches!(f, Some("USING"))
             }) {
@@ -911,28 +1097,43 @@ fn postgres_keyword_break_and_indent_edits(
                     if matches!(next_first, Some("AND" | "OR")) {
                         push_keyword_break_edit(
                             &mut edits,
-                            statement_sql,
-                            &line_infos,
-                            &scans,
-                            idx,
-                            "ON",
-                            line.indent + indent_unit,
-                            indent_unit,
-                            tab_space_size,
-                            indent_style,
-                        );
-                        push_on_condition_block_indent_edits(
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        idx,
+                        "ON",
+                        on_content_indent,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                    push_on_condition_block_indent_edits(
                             &mut edits,
-                            statement_sql,
-                            &line_infos,
-                            &scans,
-                            next_idx,
-                            line.indent + indent_unit,
-                            indent_unit,
-                            tab_space_size,
-                            indent_style,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        next_idx,
+                        on_content_indent,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
                         );
                     }
+                }
+            }
+            if line.words.len() == 1 {
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    push_on_condition_block_indent_edits(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        next_idx,
+                        on_content_indent,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
                 }
             }
         }
@@ -994,8 +1195,66 @@ fn postgres_keyword_break_and_indent_edits(
             }
         }
 
+        if matches!(first, Some("SELECT")) && line.words.len() > 1 && line.trimmed.contains(',') {
+            if let Some(prev_idx) = previous_significant_line(&scans, idx) {
+                let prev_first = scans[prev_idx].words.first().map(String::as_str);
+                if matches!(prev_first, Some("UNION" | "INTERSECT" | "EXCEPT")) {
+                    push_keyword_break_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        &scans,
+                        idx,
+                        "SELECT",
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
+            }
+        }
+
         if matches!(first, Some("THEN")) {
-            if let Some(expected_indent) = expected_then_indent(&scans, idx, indent_unit) {
+            if let Some(expected_indent) =
+                expected_then_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
+                push_leading_indent_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    idx,
+                    line.indent,
+                    expected_indent,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+            }
+        }
+
+        if matches!(first, Some("ELSE")) {
+            if let Some(expected_indent) =
+                expected_else_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
+                push_leading_indent_edit(
+                    &mut edits,
+                    statement_sql,
+                    &line_infos,
+                    idx,
+                    line.indent,
+                    expected_indent,
+                    indent_unit,
+                    tab_space_size,
+                    indent_style,
+                );
+            }
+        }
+
+        if matches!(first, Some("END")) {
+            if let Some(expected_indent) =
+                expected_end_indent(&scans, &case_anchor_cache, idx, indent_unit)
+            {
                 push_leading_indent_edit(
                     &mut edits,
                     statement_sql,
@@ -1114,7 +1373,8 @@ fn postgres_keyword_break_and_indent_edits(
             }
             if let Some(next_idx) = next_significant_line(&scans, idx) {
                 let next_first = scans[next_idx].words.first().map(String::as_str);
-                if matches!(next_first, Some("ON")) {
+                let next_second = scans[next_idx].words.get(1).map(String::as_str);
+                if matches!(next_first, Some("ON")) && !matches!(next_second, Some("CONFLICT")) {
                     push_leading_indent_edit(
                         &mut edits,
                         statement_sql,
@@ -1230,6 +1490,44 @@ fn push_case_when_break_edit(
         make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
     );
     if start < end && end <= statement_sql.len() && statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_inline_case_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    case_rel: usize,
+    expected_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+
+    let start = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(case_rel.saturating_sub(1));
+    let end = start.saturating_add(1);
+    if start >= end || end > statement_sql.len() {
+        return;
+    }
+
+    let replacement = format!(
+        "\n{}",
+        make_indent(expected_indent, indent_unit, tab_space_size, indent_style)
+    );
+    if statement_sql[start..end] != replacement {
         edits.push(Lt02AutofixEdit {
             start,
             end,
@@ -1437,6 +1735,7 @@ fn push_on_condition_block_indent_edits(
     indent_style: IndentStyle,
 ) {
     let mut depth = 0isize;
+    let mut suspended_nested_clause_depth: Option<isize> = None;
     let mut idx = start_idx;
     while idx < scans.len() {
         let line = &scans[idx];
@@ -1446,6 +1745,35 @@ fn push_on_condition_block_indent_edits(
         }
 
         let first = line.words.first().map(String::as_str);
+
+        if let Some(suspended_depth) = suspended_nested_clause_depth {
+            let at_resume_boundary = depth == suspended_depth && is_clause_boundary(first, line.trimmed);
+            if !at_resume_boundary {
+                if !line.is_comment_only {
+                    depth += paren_delta_simple(line.trimmed);
+                    if depth < 0 {
+                        depth = 0;
+                    }
+                }
+                idx += 1;
+                continue;
+            }
+            suspended_nested_clause_depth = None;
+        }
+
+        if depth > 0 && matches!(first, Some("WHERE" | "HAVING")) && line.words.len() == 1 {
+            // Let nested WHERE/HAVING blocks compute their own child indentation.
+            suspended_nested_clause_depth = Some(depth);
+            if !line.is_comment_only {
+                depth += paren_delta_simple(line.trimmed);
+                if depth < 0 {
+                    depth = 0;
+                }
+            }
+            idx += 1;
+            continue;
+        }
+
         let starts_with_close_paren = line.trimmed.starts_with(')');
         let starts_with_open_paren = line.trimmed.starts_with('(');
         let is_continuation_line = matches!(first, Some("AND" | "OR" | "NOT" | "EXISTS"))
@@ -1632,6 +1960,17 @@ fn inline_join_on_offset(trimmed: &str) -> Option<usize> {
             .map(|space_before_on| space_before_on + 1);
     }
     None
+}
+
+fn inline_case_keyword_offset(trimmed: &str) -> Option<usize> {
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.contains("PARTITION BY CASE") {
+        return None;
+    }
+
+    upper
+        .find(" CASE")
+        .map(|space_before_case| space_before_case + 1)
 }
 
 fn should_break_inline_join_on(
@@ -1844,8 +2183,66 @@ fn find_case_when_anchor(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usiz
         .and_then(|idx| (idx != usize::MAX).then_some(idx))
 }
 
+fn build_case_anchor_cache(scans: &[ScanLine<'_>]) -> Vec<Option<usize>> {
+    let mut cache = vec![None; scans.len()];
+    let mut current_anchor: Option<usize> = None;
+
+    for (idx, line) in scans.iter().enumerate() {
+        cache[idx] = current_anchor;
+        if line.is_blank || line.is_comment_only {
+            continue;
+        }
+
+        let first = line.words.first().map(String::as_str);
+        if matches!(first, Some("CASE")) || line.inline_case_offset.is_some() {
+            current_anchor = Some(idx);
+            continue;
+        }
+
+        if is_clause_boundary(first, line.trimmed)
+            && !matches!(first, Some("WHEN" | "THEN" | "ELSE" | "END" | "AND" | "OR"))
+        {
+            current_anchor = None;
+        }
+    }
+
+    cache
+}
+
+fn find_case_anchor(case_anchor_cache: &[Option<usize>], from_idx: usize) -> Option<usize> {
+    case_anchor_cache.get(from_idx).copied().flatten()
+}
+
+fn case_line_indent_for_anchor(
+    scans: &[ScanLine<'_>],
+    anchor_idx: usize,
+    indent_unit: usize,
+) -> usize {
+    let anchor = &scans[anchor_idx];
+    let first = anchor.words.first().map(String::as_str);
+    if matches!(first, Some("CASE")) {
+        anchor.indent
+    } else if anchor.inline_case_offset.is_some() {
+        anchor.indent + indent_unit
+    } else {
+        anchor.indent
+    }
+}
+
+fn expected_case_when_indent(
+    scans: &[ScanLine<'_>],
+    case_anchor_cache: &[Option<usize>],
+    line_index: usize,
+    indent_unit: usize,
+) -> Option<usize> {
+    let case_anchor = find_case_anchor(case_anchor_cache, line_index)?;
+    let case_indent = case_line_indent_for_anchor(scans, case_anchor, indent_unit);
+    Some(case_indent + indent_unit)
+}
+
 fn expected_then_indent(
     scans: &[ScanLine<'_>],
+    case_anchor_cache: &[Option<usize>],
     line_index: usize,
     indent_unit: usize,
 ) -> Option<usize> {
@@ -1860,8 +2257,34 @@ fn expected_then_indent(
         return Some(prev.indent);
     }
 
+    if let Some(case_anchor) = find_case_anchor(case_anchor_cache, line_index) {
+        let case_indent = case_line_indent_for_anchor(scans, case_anchor, indent_unit);
+        return Some(case_indent + indent_unit * 2);
+    }
+
     find_case_when_anchor(scans, line_index)
         .map(|when_idx| scans[when_idx].indent + indent_unit * 2)
+}
+
+fn expected_else_indent(
+    scans: &[ScanLine<'_>],
+    case_anchor_cache: &[Option<usize>],
+    line_index: usize,
+    indent_unit: usize,
+) -> Option<usize> {
+    let case_anchor = find_case_anchor(case_anchor_cache, line_index)?;
+    let case_indent = case_line_indent_for_anchor(scans, case_anchor, indent_unit);
+    Some(case_indent + indent_unit)
+}
+
+fn expected_end_indent(
+    scans: &[ScanLine<'_>],
+    case_anchor_cache: &[Option<usize>],
+    line_index: usize,
+    indent_unit: usize,
+) -> Option<usize> {
+    let case_anchor = find_case_anchor(case_anchor_cache, line_index)?;
+    Some(case_line_indent_for_anchor(scans, case_anchor, indent_unit))
 }
 
 fn paren_depth_between(scans: &[ScanLine<'_>], start_idx: usize, end_idx: usize) -> usize {
@@ -2077,6 +2500,27 @@ struct ScanLine<'a> {
     words: Vec<String>,
     is_blank: bool,
     is_comment_only: bool,
+    inline_case_offset: Option<usize>,
+    prev_significant: Option<usize>,
+    next_significant: Option<usize>,
+}
+
+fn link_significant_lines(scans: &mut [ScanLine<'_>]) {
+    let mut prev_significant = None;
+    for (idx, scan) in scans.iter_mut().enumerate() {
+        scan.prev_significant = prev_significant;
+        if !scan.is_blank && !scan.is_comment_only {
+            prev_significant = Some(idx);
+        }
+    }
+
+    let mut next_significant = None;
+    for idx in (0..scans.len()).rev() {
+        scans[idx].next_significant = next_significant;
+        if !scans[idx].is_blank && !scans[idx].is_comment_only {
+            next_significant = Some(idx);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2112,7 +2556,7 @@ fn detect_additional_indentation_violation(
     }
 
     let indent_map = actual_indent_map(sql, tab_space_size);
-    let scans: Vec<_> = lines
+    let mut scans: Vec<_> = lines
         .iter()
         .enumerate()
         .map(|(line_idx, line)| {
@@ -2130,9 +2574,13 @@ fn detect_additional_indentation_violation(
                 words,
                 is_blank,
                 is_comment_only,
+                inline_case_offset: None,
+                prev_significant: None,
+                next_significant: None,
             }
         })
         .collect();
+    link_significant_lines(&mut scans);
 
     let template_only_lines = template_only_line_flags(&lines);
     let mut sql_template_block_indents: Vec<usize> = Vec::new();
@@ -2455,7 +2903,7 @@ fn detect_additional_indentation_violation(
 fn detect_tsql_else_if_successive_violation(sql: &str, tab_space_size: usize) -> bool {
     let lines: Vec<&str> = sql.lines().collect();
     let indent_map = actual_indent_map(sql, tab_space_size);
-    let scans: Vec<_> = lines
+    let mut scans: Vec<_> = lines
         .iter()
         .enumerate()
         .map(|(line_idx, line)| {
@@ -2472,9 +2920,13 @@ fn detect_tsql_else_if_successive_violation(sql: &str, tab_space_size: usize) ->
                 words,
                 is_blank,
                 is_comment_only: is_comment_line(trimmed),
+                inline_case_offset: None,
+                prev_significant: None,
+                next_significant: None,
             }
         })
         .collect();
+    link_significant_lines(&mut scans);
 
     for idx in 0..scans.len() {
         let line = &scans[idx];
@@ -2591,17 +3043,11 @@ fn is_clause_boundary(first_word: Option<&str>, trimmed: &str) -> bool {
 }
 
 fn next_significant_line(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
-    scans
-        .iter()
-        .enumerate()
-        .skip(from_idx + 1)
-        .find_map(|(idx, scan)| (!scan.is_blank && !scan.is_comment_only).then_some(idx))
+    scans.get(from_idx).and_then(|scan| scan.next_significant)
 }
 
 fn previous_significant_line(scans: &[ScanLine<'_>], from_idx: usize) -> Option<usize> {
-    (0..from_idx)
-        .rev()
-        .find(|idx| !scans[*idx].is_blank && !scans[*idx].is_comment_only)
+    scans.get(from_idx).and_then(|scan| scan.prev_significant)
 }
 
 fn previous_line_matching(
@@ -2631,21 +3077,6 @@ fn previous_line_indent_matching(
 fn line_contains_inline_on(trimmed: &str) -> bool {
     let upper = trimmed.to_ascii_uppercase();
     upper.contains(" ON ") && !upper.starts_with("ON ")
-}
-
-fn statement_line_index_for_offset(line_infos: &[StatementLineInfo], offset: usize) -> usize {
-    if line_infos.is_empty() {
-        return 0;
-    }
-
-    let mut line_index = 0usize;
-    for (idx, info) in line_infos.iter().enumerate() {
-        if info.start > offset {
-            break;
-        }
-        line_index = idx;
-    }
-    line_index
 }
 
 fn contains_template_marker(sql: &str) -> bool {
@@ -3264,6 +3695,42 @@ struct Lt02AutofixEdit {
     replacement: String,
 }
 
+fn should_prefer_lt02_edit(candidate: &Lt02AutofixEdit, current: &Lt02AutofixEdit) -> bool {
+    // Mirror planner ordering for same-start conflicts:
+    // lower `end` wins, then lexicographically lower replacement.
+    if candidate.end != current.end {
+        return candidate.end < current.end;
+    }
+
+    candidate.replacement < current.replacement
+}
+
+fn should_prefer_lt02_patch(candidate: &IssuePatchEdit, current: &IssuePatchEdit) -> bool {
+    // Mirror planner ordering for same-start conflicts.
+    if candidate.span.end != current.span.end {
+        return candidate.span.end < current.span.end;
+    }
+
+    candidate.replacement < current.replacement
+}
+
+fn collapse_lt02_autofix_edits_by_start(edits: Vec<Lt02AutofixEdit>) -> Vec<Lt02AutofixEdit> {
+    let mut by_start: BTreeMap<usize, Lt02AutofixEdit> = BTreeMap::new();
+    for edit in edits {
+        match by_start.entry(edit.start) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(edit);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if should_prefer_lt02_edit(&edit, entry.get()) {
+                    entry.insert(edit);
+                }
+            }
+        }
+    }
+    by_start.into_values().collect()
+}
+
 fn line_indent_snapshots(ctx: &LintContext, tab_space_size: usize) -> Vec<LineIndentSnapshot> {
     if let Some(tokens) = tokenize_with_offsets_for_context(ctx) {
         let statement_start_line = offset_to_line(ctx.sql, ctx.statement_range.start);
@@ -3479,6 +3946,21 @@ fn statement_line_infos(sql: &str) -> Vec<StatementLineInfo> {
     infos
 }
 
+fn statement_line_index_for_offset(
+    line_infos: &[StatementLineInfo],
+    offset: usize,
+) -> Option<usize> {
+    if line_infos.is_empty() {
+        return None;
+    }
+
+    let idx = line_infos.partition_point(|line| line.start <= offset);
+    let line_idx = idx
+        .saturating_sub(1)
+        .min(line_infos.len().saturating_sub(1));
+    Some(line_idx)
+}
+
 fn normalized_indent_replacement(
     width: usize,
     indent_unit: usize,
@@ -3522,6 +4004,13 @@ fn rounded_indent_width(width: usize, indent_unit: usize) -> usize {
     } else {
         up
     }
+}
+
+fn ceil_indent_width(width: usize, indent_unit: usize) -> usize {
+    if width == 0 || indent_unit == 0 {
+        return width;
+    }
+    width.div_ceil(indent_unit) * indent_unit
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
@@ -3961,6 +4450,66 @@ mod tests {
     }
 
     #[test]
+    fn postgres_standalone_where_block_autofixes_with_other_lt02_violation() {
+        let sql = "SELECT\n   1\nFROM t\nWHERE\na = 1\nAND b = 2";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    1\nFROM t\nWHERE\n    a = 1\n    AND b = 2"
+        );
+    }
+
+    #[test]
+    fn postgres_standalone_where_block_under_exists_autofixes() {
+        let sql = "SELECT\n    1\nFROM t\nWHERE\n    EXISTS (\n        SELECT 1 FROM ledger.cluster_live_status cls\n        JOIN ledger.cluster c ON c.cluster_id = cls.cluster_id\n        WHERE\n          c.id = i.subject_id::uuid\n          AND cls.state != 'RUNNING'\n    )";
+        let mut postgres_only = sql.to_string();
+        let mut postgres_only_edits = collapse_lt02_autofix_edits_by_start(
+            postgres_keyword_break_and_indent_edits(sql, 4, 4, IndentStyle::Spaces),
+        );
+        let line_infos = statement_line_infos(sql);
+        let debug_edits: Vec<String> = postgres_only_edits
+            .iter()
+            .map(|edit| {
+                let line = statement_line_index_for_offset(&line_infos, edit.start)
+                    .map(|line_idx| line_idx + 1)
+                    .unwrap_or(0);
+                format!(
+                    "line={line} start={} end={} replacement={:?}",
+                    edit.start,
+                    edit.end,
+                    edit.replacement.replace(' ', "·")
+                )
+            })
+            .collect();
+        postgres_only_edits.sort_by(|left, right| right.start.cmp(&left.start));
+        for edit in postgres_only_edits {
+            if edit.start <= edit.end && edit.end <= postgres_only.len() {
+                postgres_only.replace_range(edit.start..edit.end, &edit.replacement);
+            }
+        }
+        assert!(
+            postgres_only.contains(
+                "        WHERE\n            c.id = i.subject_id::uuid\n            AND cls.state != 'RUNNING'"
+            ),
+            "postgres structural edits should indent standalone WHERE block, got:\n{postgres_only}\nedits={debug_edits:#?}"
+        );
+
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert!(
+            fixed.contains(
+                "        WHERE\n            c.id = i.subject_id::uuid\n            AND cls.state != 'RUNNING'"
+            ),
+            "nested standalone WHERE block should indent condition lines under WHERE, got:\n{fixed}"
+        );
+    }
+
+    #[test]
     fn postgres_trailing_as_alias_break_autofixes() {
         let sql = "SELECT\n    o.id AS\n    org_unit_id\nFROM t AS o";
         let issues = run_postgres(sql);
@@ -3983,6 +4532,26 @@ mod tests {
         assert_eq!(
             fixed,
             "INSERT INTO foo (id, value)\nVALUES (1, 'x')\nON CONFLICT (id) DO UPDATE\n    SET\n        value = EXCLUDED.value,\n        updated_at = NOW()"
+        );
+    }
+
+    #[test]
+    fn postgres_select_after_union_operator_autofixes() {
+        let sql = "SELECT\n    1 AS a\nUNION ALL\nSELECT a, b";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(fixed, "SELECT\n    1 AS a\nUNION ALL\nSELECT\n    a, b");
+    }
+
+    #[test]
+    fn postgres_unioned_identifier_does_not_trigger_union_select_break() {
+        let sql = "WITH unioned AS (\n    SELECT a, b\n    FROM t\n)\nSELECT\n    a\nFROM unioned";
+        let issues = run_postgres(sql);
+        assert!(
+            issues.is_empty(),
+            "UNIONED identifier should not be treated like a UNION set operator"
         );
     }
 
@@ -4010,6 +4579,58 @@ mod tests {
         assert_eq!(
             fixed,
             "SELECT\n    1\nFROM foo AS f\nINNER\nJOIN bar AS b\n    ON f.id = b.id AND b.is_current\n        = TRUE"
+        );
+    }
+
+    #[test]
+    fn postgres_standalone_on_block_with_nested_parens_autofixes() {
+        let sql = "SELECT\n    1\nFROM foo AS c\nLEFT JOIN bar AS v\n    ON\n    -- Non-PIPELINE: exact version_key match\n        (c.cluster_source <> 'PIPELINE' AND c.dbr_version = v.version_key)\n    OR\n    -- PIPELINE: match on main_version + photon\n    (c.cluster_source = 'PIPELINE'\n    AND c.parsed_main_version = v.main_version\n    AND c.parsed_is_photon = v.is_photon\n    AND v.is_lts = TRUE)";
+        let mut fixed = sql.to_string();
+        let mut edits = collapse_lt02_autofix_edits_by_start(postgres_keyword_break_and_indent_edits(
+            sql,
+            4,
+            4,
+            IndentStyle::Spaces,
+        ));
+        edits.sort_by(|left, right| right.start.cmp(&left.start));
+        for edit in edits {
+            if edit.start <= edit.end && edit.end <= fixed.len() {
+                fixed.replace_range(edit.start..edit.end, &edit.replacement);
+            }
+        }
+
+        assert!(
+            fixed.contains(
+                "        OR\n        -- PIPELINE: match on main_version + photon\n        (c.cluster_source = 'PIPELINE'\n            AND c.parsed_main_version = v.main_version\n            AND c.parsed_is_photon = v.is_photon\n            AND v.is_lts = TRUE)"
+            ),
+            "standalone ON block should indent nested AND conditions, got:\n{fixed}"
+        );
+    }
+
+    #[test]
+    fn postgres_inline_case_when_block_autofixes() {
+        let sql =
+            "SELECT\n    CASE WHEN a > 0\n        THEN 1\n        ELSE 0\n    END AS x\nFROM t";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    CASE\n        WHEN a > 0\n            THEN 1\n        ELSE 0\n    END AS x\nFROM t"
+        );
+    }
+
+    #[test]
+    fn postgres_partition_by_inline_case_autofixes() {
+        let sql = "SELECT\n    ROW_NUMBER() OVER (\n        PARTITION BY CASE\n            WHEN a > 0\n            THEN 1\n            ELSE 0\n        END\n    ) AS rn\nFROM t";
+        let issues = run_postgres(sql);
+        assert!(!issues.is_empty());
+        assert!(issues.iter().any(|issue| issue.autofix.is_some()));
+        let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
+        assert_eq!(
+            fixed,
+            "SELECT\n    ROW_NUMBER() OVER (\n        PARTITION BY\n            CASE\n                WHEN a > 0\n                    THEN 1\n                ELSE 0\n            END\n    ) AS rn\nFROM t"
         );
     }
 }

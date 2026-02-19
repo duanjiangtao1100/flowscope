@@ -114,6 +114,11 @@ fn operator_layout_violations(
         return operator_layout_violations_template_fallback(ctx.statement_sql(), line_position);
     };
     let sql = ctx.statement_sql();
+    let token_offsets: Vec<Option<(usize, usize)>> = tokens
+        .iter()
+        .map(|token| token_with_span_offsets(sql, token))
+        .collect();
+    let non_trivia_neighbors = build_non_trivia_neighbors(&tokens);
     let mut violations = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
@@ -122,18 +127,14 @@ fn operator_layout_violations(
         }
 
         let current_line = token.span.start.line;
-        let prev_significant = tokens[..index]
-            .iter()
-            .rev()
-            .find(|prev| !is_trivia_token(&prev.token));
-        let next_significant = tokens
-            .iter()
-            .skip(index + 1)
-            .find(|next| !is_trivia_token(&next.token));
-
-        let (Some(prev_token), Some(next_token)) = (prev_significant, next_significant) else {
+        let Some(prev_idx) = non_trivia_neighbors.prev[index] else {
             continue;
         };
+        let Some(next_idx) = non_trivia_neighbors.next[index] else {
+            continue;
+        };
+        let prev_token = &tokens[prev_idx];
+        let next_token = &tokens[next_idx];
 
         let line_break_before = prev_token.span.end.line < current_line;
         let line_break_after = next_token.span.start.line > current_line;
@@ -143,16 +144,21 @@ fn operator_layout_violations(
             OperatorLinePosition::Trailing => line_break_before && !line_break_after,
         };
         if has_violation {
-            let Some((start, end)) = token_with_span_offsets(sql, token) else {
+            let Some((start, end)) = token_offsets[index] else {
                 continue;
             };
+            let prefer_inline_join =
+                matches!(token.token, Token::Mul) && is_interval_keyword_token(&next_token.token);
             let edits = safe_operator_autofix_edits(
                 sql,
-                &tokens,
                 index,
                 line_position,
                 line_break_before,
                 line_break_after,
+                prefer_inline_join,
+                &token_offsets,
+                prev_idx,
+                next_idx,
             )
             .unwrap_or_default();
             violations.push(((start, end), edits));
@@ -249,6 +255,14 @@ fn contains_template_marker(sql: &str) -> bool {
     sql.contains("{{") || sql.contains("{%") || sql.contains("{#")
 }
 
+fn is_interval_keyword_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Word(word)
+            if word.keyword == Keyword::INTERVAL || word.value.eq_ignore_ascii_case("INTERVAL")
+    )
+}
+
 fn line_ranges(sql: &str) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
@@ -272,20 +286,39 @@ fn line_ranges(sql: &str) -> Vec<(usize, usize)> {
 
 fn safe_operator_autofix_edits(
     sql: &str,
-    tokens: &[TokenWithSpan],
     operator_idx: usize,
     line_position: OperatorLinePosition,
     line_break_before: bool,
     line_break_after: bool,
+    prefer_inline_join: bool,
+    token_offsets: &[Option<(usize, usize)>],
+    prev_idx: usize,
+    next_idx: usize,
 ) -> Option<Vec<Lt03AutofixEdit>> {
     match line_position {
         OperatorLinePosition::Leading if !line_break_before && line_break_after => {
             // Trailing operator → move to leading: "a +\n  b" → "a\n+ b"
-            safe_operator_move_edits(sql, tokens, operator_idx, true)
+            safe_operator_move_edits(
+                sql,
+                operator_idx,
+                true,
+                prefer_inline_join,
+                token_offsets,
+                prev_idx,
+                next_idx,
+            )
         }
         OperatorLinePosition::Trailing if line_break_before && !line_break_after => {
             // Leading operator → move to trailing: "a\n+ b" → "a +\n  b"
-            safe_operator_move_edits(sql, tokens, operator_idx, false)
+            safe_operator_move_edits(
+                sql,
+                operator_idx,
+                false,
+                false,
+                token_offsets,
+                prev_idx,
+                next_idx,
+            )
         }
         _ => None,
     }
@@ -301,15 +334,16 @@ fn safe_operator_autofix_edits(
 /// Edits are split to avoid spanning comment protected ranges.
 fn safe_operator_move_edits(
     sql: &str,
-    tokens: &[TokenWithSpan],
     operator_idx: usize,
     to_leading: bool,
+    prefer_inline_join: bool,
+    token_offsets: &[Option<(usize, usize)>],
+    prev_idx: usize,
+    next_idx: usize,
 ) -> Option<Vec<Lt03AutofixEdit>> {
-    let prev_idx = prev_non_trivia_index(tokens, operator_idx)?;
-    let next_idx = next_non_trivia_index(tokens, operator_idx + 1)?;
-    let (_, prev_end) = token_with_span_offsets(sql, &tokens[prev_idx])?;
-    let (op_start, op_end) = token_with_span_offsets(sql, &tokens[operator_idx])?;
-    let (next_start, _) = token_with_span_offsets(sql, &tokens[next_idx])?;
+    let (_, prev_end) = token_offsets.get(prev_idx).copied().flatten()?;
+    let (op_start, op_end) = token_offsets.get(operator_idx).copied().flatten()?;
+    let (next_start, _) = token_offsets.get(next_idx).copied().flatten()?;
 
     if prev_end > op_start || op_end > next_start || next_start > sql.len() {
         return None;
@@ -333,6 +367,12 @@ fn safe_operator_move_edits(
                 || (!after_gap.contains('\n') && !after_gap.contains('\r'))
             {
                 return None;
+            }
+            if prefer_inline_join {
+                // PostgreSQL interval arithmetic often appears as:
+                // "... *\n    interval '1 day'". Moving `*` to leading style can
+                // trigger LT02 indentation cascades; join this break inline.
+                return Some(vec![(op_end, next_start, " ".to_string())]);
             }
             // Preserve existing indentation on the next line to avoid LT02
             // regressions when moving the operator.
@@ -519,24 +559,32 @@ fn is_trivia_token(token: &Token) -> bool {
     )
 }
 
-fn next_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
-    while index < tokens.len() {
-        if !is_trivia_token(&tokens[index].token) {
-            return Some(index);
-        }
-        index += 1;
-    }
-    None
+struct NonTriviaNeighbors {
+    prev: Vec<Option<usize>>,
+    next: Vec<Option<usize>>,
 }
 
-fn prev_non_trivia_index(tokens: &[TokenWithSpan], mut index: usize) -> Option<usize> {
-    while index > 0 {
-        index -= 1;
-        if !is_trivia_token(&tokens[index].token) {
-            return Some(index);
+fn build_non_trivia_neighbors(tokens: &[TokenWithSpan]) -> NonTriviaNeighbors {
+    let mut prev = vec![None; tokens.len()];
+    let mut next = vec![None; tokens.len()];
+
+    let mut prev_non_trivia = None;
+    for (idx, token) in tokens.iter().enumerate() {
+        prev[idx] = prev_non_trivia;
+        if !is_trivia_token(&token.token) {
+            prev_non_trivia = Some(idx);
         }
     }
-    None
+
+    let mut next_non_trivia = None;
+    for idx in (0..tokens.len()).rev() {
+        next[idx] = next_non_trivia;
+        if !is_trivia_token(&tokens[idx].token) {
+            next_non_trivia = Some(idx);
+        }
+    }
+
+    NonTriviaNeighbors { prev, next }
 }
 
 fn line_col_to_offset(sql: &str, line: usize, column: usize) -> Option<usize> {
