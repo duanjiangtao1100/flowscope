@@ -1315,7 +1315,7 @@ fn expected_spacing_before_lparen(
                 if exists_requires_space_before_lparen(tokens, left_idx) {
                     return ExpectedSpacing::Single;
                 }
-                return ExpectedSpacing::Skip;
+                return ExpectedSpacing::NoneInline;
             }
             // Keywords that should have a space before (
             if is_keyword_requiring_space_before_paren(w.keyword) {
@@ -2555,6 +2555,36 @@ mod tests {
     fn does_not_flag_exists_without_space_before_parenthesis() {
         let no_space = "SELECT\n    EXISTS(\n        SELECT 1\n    ) AS has_row\nFROM t";
         assert!(run(no_space).is_empty());
+    }
+
+    #[test]
+    fn flags_space_before_exists_parenthesis_in_select_list() {
+        let sql = "SELECT 1,\n    EXISTS (\n        SELECT 1\n    ) AS has_row\nFROM t";
+        let issues = run(sql);
+        assert!(
+            !issues.is_empty(),
+            "expected EXISTS-space violation in select list"
+        );
+        let fixed = apply_all_issue_autofixes(sql, &issues);
+        assert!(
+            fixed.contains("EXISTS(\n"),
+            "expected EXISTS( after fix, got: {fixed}"
+        );
+    }
+
+    #[test]
+    fn requires_space_before_exists_parenthesis_after_where() {
+        let sql = "SELECT 1\nWHERE EXISTS(\n    SELECT 1\n)";
+        let issues = run(sql);
+        assert!(
+            !issues.is_empty(),
+            "expected missing-space violation for WHERE EXISTS("
+        );
+        let fixed = apply_all_issue_autofixes(sql, &issues);
+        assert!(
+            fixed.contains("WHERE EXISTS (\n"),
+            "expected WHERE EXISTS ( after fix, got: {fixed}"
+        );
     }
 
     #[test]
