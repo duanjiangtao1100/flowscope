@@ -13,7 +13,8 @@ use flowscope_cli::server;
 use anyhow::{Context, Result};
 use clap::Parser;
 use flowscope_core::{
-    analyze, AnalysisOptions, AnalyzeRequest, FileSource, LintConfig, ParseError, Severity,
+    analyze, issue_codes, AnalysisOptions, AnalyzeRequest, FileSource, LintConfig, ParseError,
+    Severity,
 };
 use flowscope_export::{
     export_csv_bundle, export_duckdb, export_html, export_json, export_mermaid, export_sql,
@@ -41,6 +42,9 @@ const EXIT_CONFIG_ERROR: u8 = 66;
 /// Three passes capture the vast majority of cascading fixes while avoiding
 /// disproportionate long-tail runtime on large statements.
 const MAX_LINT_FIX_PASSES: usize = 3;
+/// Extra cleanup passes granted at the end of the normal loop budget when
+/// progress is still being made.
+const MAX_LINT_FIX_BONUS_PASSES: usize = 1;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LintFixRuntimeOptions {
@@ -110,10 +114,14 @@ fn apply_lint_fixes_with_runtime_options(
     let mut merged_counts = FixCounts::default();
     let mut merged_candidate_stats = FixCandidateStats::default();
     let mut any_changed = false;
+    let mut lt03_touched = false;
     let mut last_outcome = None;
     let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
+    let mut pass_limit = MAX_LINT_FIX_PASSES;
+    let mut bonus_passes_granted = 0usize;
+    let mut pass_index = 0usize;
 
-    for _pass in 0..MAX_LINT_FIX_PASSES {
+    while pass_index < pass_limit {
         let outcome =
             apply_lint_fixes_with_options(&current_sql, dialect, lint_config, fix_options)?;
 
@@ -124,6 +132,9 @@ fn apply_lint_fixes_with_runtime_options(
 
         merged_counts.merge(&outcome.counts);
         merged_candidate_stats.merge(collect_fix_candidate_stats(&outcome, runtime_options));
+        if outcome.counts.get(issue_codes::LINT_LT_003) > 0 {
+            lt03_touched = true;
+        }
 
         if outcome.changed {
             any_changed = true;
@@ -133,11 +144,29 @@ fn apply_lint_fixes_with_runtime_options(
         let continue_fixing = outcome.changed
             && !outcome.skipped_due_to_comments
             && !outcome.skipped_due_to_regression;
+        let overlap_retry = !outcome.changed
+            && !outcome.skipped_due_to_comments
+            && !outcome.skipped_due_to_regression
+            && outcome.skipped_counts.overlap_conflict_blocked > 0;
+
+        // Some files keep improving right at the bounded pass budget. Allow a
+        // small number of extra cleanup passes to avoid near-miss leftovers.
+        if (continue_fixing || overlap_retry)
+            && pass_index + 1 == pass_limit
+            && bonus_passes_granted < MAX_LINT_FIX_BONUS_PASSES
+            && (overlap_retry || lt03_touched)
+        {
+            pass_limit += 1;
+            bonus_passes_granted += 1;
+        }
+
         last_outcome = Some(outcome);
 
-        if !continue_fixing {
+        if !continue_fixing && !overlap_retry {
             break;
         }
+
+        pass_index += 1;
     }
 
     let mut outcome = last_outcome.expect("at least one fix pass should run");

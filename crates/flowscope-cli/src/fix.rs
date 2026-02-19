@@ -267,9 +267,29 @@ pub fn apply_lint_fixes_with_options(
     fix_options: FixOptions,
 ) -> Result<FixOutcome, ParseError> {
     let mut profile = FixProfileGuard::new(sql.len(), fix_options);
+    const INCREMENTAL_LARGE_SQL_THRESHOLD: usize = 4_000;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR: usize = 4;
+    const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL: usize = 2;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT: usize = 24;
+    const INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL: usize = 12;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
+    const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 4;
+    let is_large_sql = sql.len() >= INCREMENTAL_LARGE_SQL_THRESHOLD;
+    let incremental_parse_error_iterations = if is_large_sql {
+        INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL
+    } else {
+        INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR
+    };
+    let incremental_default_iterations = if is_large_sql {
+        INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL
+    } else {
+        INCREMENTAL_MAX_ITERATIONS_DEFAULT
+    };
+    let incremental_overlap_recovery_iterations = if is_large_sql {
+        INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL
+    } else {
+        INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY
+    };
     let rule_filter = RuleFilter::from_lint_config(lint_config);
 
     let stage_started = Instant::now();
@@ -400,7 +420,7 @@ pub fn apply_lint_fixes_with_options(
             lint_config,
             &before_counts,
             fix_options.include_unsafe_fixes,
-            INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR,
+            incremental_parse_error_iterations,
         ) {
             profile.record("fallback_incremental_parse_errors", stage_started);
             return Ok(outcome);
@@ -442,7 +462,7 @@ pub fn apply_lint_fixes_with_options(
             lint_config,
             &before_counts,
             fix_options.include_unsafe_fixes,
-            INCREMENTAL_MAX_ITERATIONS_DEFAULT,
+            incremental_default_iterations,
         ) {
             profile.record("fallback_incremental_rewrite_guard", stage_started);
             return Ok(outcome);
@@ -480,7 +500,7 @@ pub fn apply_lint_fixes_with_options(
             lint_config,
             &before_counts,
             fix_options.include_unsafe_fixes,
-            INCREMENTAL_MAX_ITERATIONS_DEFAULT,
+            incremental_default_iterations,
         ) {
             profile.record("fallback_incremental_masked_or_worse", stage_started);
             return Ok(outcome);
@@ -501,9 +521,15 @@ pub fn apply_lint_fixes_with_options(
     // conflicted statements. Cap this path to low-conflict cases where the
     // extra per-rule search is most likely to pay off.
     const MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY: usize = 8;
+    const MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY_LARGE_SQL: usize = 8;
+    let overlap_recovery_conflict_limit = if is_large_sql {
+        MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY_LARGE_SQL
+    } else {
+        MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY
+    };
     if !fix_options.include_rewrite_candidates
         && skipped_counts.overlap_conflict_blocked > 0
-        && skipped_counts.overlap_conflict_blocked <= MAX_OVERLAP_CONFLICTS_FOR_INCREMENTAL_RECOVERY
+        && skipped_counts.overlap_conflict_blocked <= overlap_recovery_conflict_limit
     {
         let stage_started = Instant::now();
         if let Some(incremental) = try_incremental_core_fix_plan(
@@ -512,7 +538,7 @@ pub fn apply_lint_fixes_with_options(
             lint_config,
             &after_counts,
             fix_options.include_unsafe_fixes,
-            INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY,
+            incremental_overlap_recovery_iterations,
         ) {
             profile.record("incremental_overlap_recovery", stage_started);
             merge_skipped_counts(&mut skipped_counts, &incremental.skipped_counts);
