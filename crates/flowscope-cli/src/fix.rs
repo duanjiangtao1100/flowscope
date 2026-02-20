@@ -87,6 +87,10 @@ impl FixLintState {
         let counts = lint_rule_counts_from_issues(&issues);
         Self { issues, counts }
     }
+
+    pub fn counts(&self) -> &BTreeMap<String, usize> {
+        &self.counts
+    }
 }
 
 #[derive(Debug, Clone)]

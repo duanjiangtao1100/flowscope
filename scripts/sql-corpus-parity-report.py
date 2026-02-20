@@ -140,6 +140,7 @@ def _run_flowscope_fix(
     sql_dir: Path,
     unsafe_fixes: bool,
     legacy_ast_fixes: bool,
+    fix_only: bool,
 ) -> tuple[FlowScopeFixTelemetry, str, str]:
     cmd = [
         str(flowscope_bin),
@@ -150,6 +151,8 @@ def _run_flowscope_fix(
         "--show-fixes",
         str(sql_dir),
     ]
+    if fix_only:
+        cmd.append("--fix-only")
     if unsafe_fixes:
         cmd.append("--unsafe-fixes")
     if legacy_ast_fixes:
@@ -302,6 +305,11 @@ def main() -> None:
         help="Pass --legacy-ast-fixes to FlowScope",
     )
     parser.add_argument(
+        "--no-fix-only",
+        action="store_true",
+        help="Do not pass --fix-only to FlowScope fix phase (compatibility fallback)",
+    )
+    parser.add_argument(
         "--work-dir",
         type=Path,
         default=None,
@@ -358,6 +366,7 @@ def main() -> None:
         fs_probe,
         args.unsafe_fixes,
         args.legacy_ast_fixes,
+        not args.no_fix_only,
     )
     fs_after = _run_flowscope_lint(flowscope_bin, args.dialect, fs_probe)
 
@@ -518,6 +527,7 @@ def main() -> None:
             "flowscope_flags": {
                 "unsafe_fixes": args.unsafe_fixes,
                 "legacy_ast_fixes": args.legacy_ast_fixes,
+                "fix_only": not args.no_fix_only,
             },
         },
         "totals": {

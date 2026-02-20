@@ -24,7 +24,7 @@ use flowscope_export::{
 };
 use is_terminal::IsTerminal;
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -53,6 +53,11 @@ const MAX_LINT_FIX_BONUS_PASSES: usize = 1;
 /// the broad long-tail cost of unrestricted bonus passes.
 const MAX_LINT_FIX_LARGE_SQL_LT02_EXTRA_PASSES: usize = 1;
 const LINT_FIX_LARGE_SQL_LT02_EXTRA_PASS_THRESHOLD: usize = 10_000;
+/// Stop extra cleanup passes on large SQL when LT02/LT03 are no longer moving
+/// and residual violations are overwhelmingly known mostly-unfixable classes.
+const LINT_FIX_MOSTLY_UNFIXABLE_STOP_THRESHOLD: usize = 4_000;
+const MAX_RESIDUAL_POTENTIALLY_FIXABLE_FOR_STOP: usize = 2;
+const MOSTLY_UNFIXABLE_RATIO_DENOMINATOR: usize = 5; // 20% potentially-fixable max.
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LintFixRuntimeOptions {
@@ -155,6 +160,9 @@ fn apply_lint_fixes_with_runtime_options(
         if outcome.counts.get(issue_codes::LINT_LT_002) > 0 {
             lt02_touched = true;
         }
+        let lt_cleanup_progress = outcome.counts.get(issue_codes::LINT_LT_003) > 0
+            || outcome.counts.get(issue_codes::LINT_LT_002) > 0;
+        let residual_is_mostly_unfixable = is_mostly_unfixable_residual(post_lint_state.counts());
 
         if outcome.changed {
             any_changed = true;
@@ -162,9 +170,19 @@ fn apply_lint_fixes_with_runtime_options(
         }
         cached_lint_state = Some(post_lint_state);
 
-        let continue_fixing = outcome.changed
+        let mut continue_fixing = outcome.changed
             && !outcome.skipped_due_to_comments
             && !outcome.skipped_due_to_regression;
+        if continue_fixing
+            && pass_index + 1 >= MAX_LINT_FIX_PASSES
+            && current_sql.len() >= LINT_FIX_MOSTLY_UNFIXABLE_STOP_THRESHOLD
+            && !lt02_touched
+            && !lt03_touched
+            && !lt_cleanup_progress
+            && residual_is_mostly_unfixable
+        {
+            continue_fixing = false;
+        }
         // Only retry overlap conflicts once per unique SQL state: re-running on
         // unchanged SQL would produce the same conflicts and waste the pass budget.
         let overlap_retry = !outcome.changed
@@ -243,6 +261,38 @@ fn collect_fix_candidate_stats(
         blocked_protected_range,
         blocked_overlap_conflict,
     }
+}
+
+fn is_mostly_unfixable_rule(code: &str) -> bool {
+    matches!(
+        code,
+        issue_codes::LINT_AL_003
+            | issue_codes::LINT_RF_002
+            | issue_codes::LINT_RF_004
+            | issue_codes::LINT_LT_005
+    )
+}
+
+fn is_mostly_unfixable_residual(after_counts: &BTreeMap<String, usize>) -> bool {
+    let mut total_remaining = 0usize;
+    let mut potentially_fixable_remaining = 0usize;
+
+    for (code, count) in after_counts {
+        if *count == 0 || code == issue_codes::PARSE_ERROR {
+            continue;
+        }
+        total_remaining += *count;
+        if !is_mostly_unfixable_rule(code) {
+            potentially_fixable_remaining += *count;
+        }
+    }
+
+    if total_remaining == 0 {
+        return false;
+    }
+
+    potentially_fixable_remaining <= MAX_RESIDUAL_POTENTIALLY_FIXABLE_FOR_STOP
+        && potentially_fixable_remaining * MOSTLY_UNFIXABLE_RATIO_DENOMINATOR <= total_remaining
 }
 
 fn main() -> ExitCode {
@@ -1219,8 +1269,13 @@ fn print_issues_to_stderr(result: &flowscope_core::AnalyzeResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_fix_candidate_stats, parse_rule_configs_json, LintFixRuntimeOptions};
+    use super::{
+        collect_fix_candidate_stats, is_mostly_unfixable_residual, parse_rule_configs_json,
+        LintFixRuntimeOptions,
+    };
     use flowscope_cli::fix::{FixCounts, FixOutcome, FixSkippedCounts};
+    use flowscope_core::issue_codes;
+    use std::collections::BTreeMap;
 
     fn sample_outcome(skipped_counts: FixSkippedCounts) -> FixOutcome {
         FixOutcome {
@@ -1333,5 +1388,28 @@ mod tests {
         assert_eq!(stats.blocked, 5);
         assert_eq!(stats.blocked_unsafe, 0);
         assert_eq!(stats.blocked_display_only, 3);
+    }
+
+    #[test]
+    fn mostly_unfixable_residual_detects_dominated_known_residuals() {
+        let counts = BTreeMap::from([
+            (issue_codes::LINT_LT_005.to_string(), 140usize),
+            (issue_codes::LINT_RF_002.to_string(), 116usize),
+            (issue_codes::LINT_AL_003.to_string(), 43usize),
+            (issue_codes::LINT_RF_004.to_string(), 2usize),
+            (issue_codes::LINT_ST_009.to_string(), 1usize),
+        ]);
+        assert!(is_mostly_unfixable_residual(&counts));
+    }
+
+    #[test]
+    fn mostly_unfixable_residual_rejects_when_fixable_tail_is_material() {
+        let counts = BTreeMap::from([
+            (issue_codes::LINT_LT_005.to_string(), 20usize),
+            (issue_codes::LINT_RF_002.to_string(), 10usize),
+            (issue_codes::LINT_ST_009.to_string(), 8usize),
+            (issue_codes::LINT_LT_003.to_string(), 3usize),
+        ]);
+        assert!(!is_mostly_unfixable_residual(&counts));
     }
 }
