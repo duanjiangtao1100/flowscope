@@ -61,6 +61,10 @@ pub struct Args {
     #[arg(long, requires = "lint")]
     pub fix: bool,
 
+    /// Apply fixes only and skip post-fix lint reporting (requires --lint and --fix)
+    #[arg(long, requires_all = ["lint", "fix"])]
+    pub fix_only: bool,
+
     /// Include unsafe lint auto-fixes (requires --lint and --fix)
     #[arg(long, requires_all = ["lint", "fix"])]
     pub unsafe_fixes: bool,
@@ -305,6 +309,7 @@ mod tests {
         let args = Args::parse_from(["flowscope", "--lint", "test.sql"]);
         assert!(args.lint);
         assert!(!args.fix);
+        assert!(!args.fix_only);
         assert!(!args.unsafe_fixes);
         assert!(!args.legacy_ast_fixes);
         assert!(!args.show_fixes);
@@ -319,9 +324,27 @@ mod tests {
         let args = Args::parse_from(["flowscope", "--lint", "--fix", "test.sql"]);
         assert!(args.lint);
         assert!(args.fix);
+        assert!(!args.fix_only);
         assert!(!args.unsafe_fixes);
         assert!(!args.legacy_ast_fixes);
         assert!(!args.show_fixes);
+    }
+
+    #[test]
+    fn test_fix_only_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--fix", "--fix-only", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(args.fix_only);
+    }
+
+    #[test]
+    fn test_fix_only_requires_lint_and_fix() {
+        let missing_both = Args::try_parse_from(["flowscope", "--fix-only", "test.sql"]);
+        assert!(missing_both.is_err());
+
+        let missing_fix = Args::try_parse_from(["flowscope", "--lint", "--fix-only", "test.sql"]);
+        assert!(missing_fix.is_err());
     }
 
     #[test]

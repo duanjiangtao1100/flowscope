@@ -410,6 +410,87 @@ fn test_lint_stdin() {
 }
 
 #[test]
+fn test_lint_fix_only_skips_post_fix_lint_for_file_inputs() {
+    let dir = tempdir().expect("temp dir");
+    let sql_path = dir.path().join("fix_only.sql");
+    std::fs::write(&sql_path, SQL_WITH_VIOLATIONS).expect("write sql");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args([
+            "--lint",
+            "--fix",
+            "--fix-only",
+            "--format",
+            "html",
+            sql_path.to_str().expect("sql path"),
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert!(
+        output.status.success(),
+        "Expected --fix-only to complete successfully"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("phase 2/2 linting post-fix inputs"),
+        "Expected --fix-only to skip post-fix lint phase: {stderr}"
+    );
+    assert!(
+        stderr.contains("phase timing: fix="),
+        "Expected --fix-only timing output to include fix phase: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).is_empty(),
+        "Expected no lint report output for file-based --fix-only run"
+    );
+
+    let fixed_sql = std::fs::read_to_string(&sql_path).expect("read fixed sql");
+    assert!(
+        fixed_sql.contains("DISTINCT"),
+        "Expected --fix-only to apply file fixes in place: {fixed_sql}"
+    );
+}
+
+#[test]
+fn test_lint_fix_only_emits_fixed_sql_for_stdin() {
+    let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
+        .args(["--lint", "--fix", "--fix-only"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(SQL_WITH_VIOLATIONS.as_bytes())
+                .unwrap();
+            child.wait_with_output()
+        })
+        .expect("run CLI");
+
+    assert!(
+        output.status.success(),
+        "Expected --fix-only stdin run to succeed"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("DISTINCT"),
+        "Expected --fix-only stdin output to contain fixed SQL: {stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("phase 2/2 linting post-fix inputs"),
+        "Expected --fix-only to skip post-fix lint phase: {stderr}"
+    );
+}
+
+#[test]
 fn test_lint_templated_sql_without_template_flag_uses_jinja_fallback() {
     let output = Command::new(env!("CARGO_BIN_EXE_flowscope"))
         .args(["--lint", "--format", "json"])

@@ -75,6 +75,27 @@ pub struct FixOutcome {
     pub skipped_counts: FixSkippedCounts,
 }
 
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct FixLintState {
+    issues: Vec<Issue>,
+    counts: BTreeMap<String, usize>,
+}
+
+impl FixLintState {
+    fn from_issues(issues: Vec<Issue>) -> Self {
+        let counts = lint_rule_counts_from_issues(&issues);
+        Self { issues, counts }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[must_use]
+pub struct FixPassResult {
+    pub outcome: FixOutcome,
+    pub post_lint_state: FixLintState,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[must_use]
 pub struct FixSkippedCounts {
@@ -260,12 +281,41 @@ pub fn apply_lint_fixes_with_lint_config(
     )
 }
 
+pub fn apply_lint_fixes_with_options_and_lint_state(
+    sql: &str,
+    dialect: Dialect,
+    lint_config: &LintConfig,
+    fix_options: FixOptions,
+    before_lint_state: Option<FixLintState>,
+) -> Result<FixPassResult, ParseError> {
+    apply_lint_fixes_with_options_internal(
+        sql,
+        dialect,
+        lint_config,
+        fix_options,
+        before_lint_state,
+    )
+}
+
 pub fn apply_lint_fixes_with_options(
     sql: &str,
     dialect: Dialect,
     lint_config: &LintConfig,
     fix_options: FixOptions,
 ) -> Result<FixOutcome, ParseError> {
+    Ok(
+        apply_lint_fixes_with_options_internal(sql, dialect, lint_config, fix_options, None)?
+            .outcome,
+    )
+}
+
+fn apply_lint_fixes_with_options_internal(
+    sql: &str,
+    dialect: Dialect,
+    lint_config: &LintConfig,
+    fix_options: FixOptions,
+    before_lint_state: Option<FixLintState>,
+) -> Result<FixPassResult, ParseError> {
     let mut profile = FixProfileGuard::new(sql.len(), fix_options);
     const INCREMENTAL_LARGE_SQL_THRESHOLD: usize = 4_000;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR: usize = 4;
@@ -298,13 +348,22 @@ pub fn apply_lint_fixes_with_options(
     };
     let rule_filter = RuleFilter::from_lint_config(lint_config);
 
-    let stage_started = Instant::now();
-    let before_issues = lint_issues(sql, dialect, lint_config);
-    profile.record("lint_issues_before", stage_started);
+    let (before_issues, before_counts) = if let Some(state) = before_lint_state {
+        let stage_started = Instant::now();
+        profile.record("lint_issues_before_cached", stage_started);
+        let stage_started = Instant::now();
+        profile.record("before_counts_cached", stage_started);
+        (state.issues, state.counts)
+    } else {
+        let stage_started = Instant::now();
+        let before_issues = lint_issues(sql, dialect, lint_config);
+        profile.record("lint_issues_before", stage_started);
 
-    let stage_started = Instant::now();
-    let before_counts = lint_rule_counts_from_issues(&before_issues);
-    profile.record("before_counts", stage_started);
+        let stage_started = Instant::now();
+        let before_counts = lint_rule_counts_from_issues(&before_issues);
+        profile.record("before_counts", stage_started);
+        (before_issues, before_counts)
+    };
 
     let stage_started = Instant::now();
     let mut core_candidates = build_fix_candidates_from_issue_autofixes(sql, &before_issues);
@@ -396,11 +455,15 @@ pub fn apply_lint_fixes_with_options(
     profile.record("apply_planned_edits", stage_started);
 
     let stage_started = Instant::now();
-    let mut after_counts = if fixed_sql == sql {
-        before_counts.clone()
+    let mut after_lint_state = if fixed_sql == sql {
+        FixLintState {
+            issues: before_issues.clone(),
+            counts: before_counts.clone(),
+        }
     } else {
-        lint_rule_counts(&fixed_sql, dialect, lint_config)
+        lint_state(&fixed_sql, dialect, lint_config)
     };
+    let mut after_counts = after_lint_state.counts.clone();
     profile.record("after_counts", stage_started);
 
     let before_total = regression_guard_total(&before_counts);
@@ -419,7 +482,10 @@ pub fn apply_lint_fixes_with_options(
             fix_options.include_unsafe_fixes,
         ) {
             profile.record("fallback_core_only_parse_errors", stage_started);
-            return Ok(outcome);
+            return Ok(FixPassResult {
+                post_lint_state: lint_state(&outcome.sql, dialect, lint_config),
+                outcome,
+            });
         }
         profile.record("fallback_core_only_parse_errors", stage_started);
 
@@ -434,17 +500,26 @@ pub fn apply_lint_fixes_with_options(
             incremental_parse_error_rule_evaluations,
         ) {
             profile.record("fallback_incremental_parse_errors", stage_started);
-            return Ok(outcome);
+            return Ok(FixPassResult {
+                post_lint_state: lint_state(&outcome.sql, dialect, lint_config),
+                outcome,
+            });
         }
         profile.record("fallback_incremental_parse_errors", stage_started);
 
-        return Ok(FixOutcome {
-            sql: sql.to_string(),
-            counts: FixCounts::default(),
-            changed: false,
-            skipped_due_to_comments: false,
-            skipped_due_to_regression: true,
-            skipped_counts,
+        return Ok(FixPassResult {
+            post_lint_state: FixLintState {
+                issues: before_issues.clone(),
+                counts: before_counts.clone(),
+            },
+            outcome: FixOutcome {
+                sql: sql.to_string(),
+                counts: FixCounts::default(),
+                changed: false,
+                skipped_due_to_comments: false,
+                skipped_due_to_regression: true,
+                skipped_counts,
+            },
         });
     }
 
@@ -462,7 +537,10 @@ pub fn apply_lint_fixes_with_options(
             fix_options.include_unsafe_fixes,
         ) {
             profile.record("fallback_core_only_rewrite_guard", stage_started);
-            return Ok(outcome);
+            return Ok(FixPassResult {
+                post_lint_state: lint_state(&outcome.sql, dialect, lint_config),
+                outcome,
+            });
         }
         profile.record("fallback_core_only_rewrite_guard", stage_started);
 
@@ -477,7 +555,10 @@ pub fn apply_lint_fixes_with_options(
             usize::MAX,
         ) {
             profile.record("fallback_incremental_rewrite_guard", stage_started);
-            return Ok(outcome);
+            return Ok(FixPassResult {
+                post_lint_state: lint_state(&outcome.sql, dialect, lint_config),
+                outcome,
+            });
         }
         profile.record("fallback_incremental_rewrite_guard", stage_started);
     }
@@ -501,7 +582,10 @@ pub fn apply_lint_fixes_with_options(
             fix_options.include_unsafe_fixes,
         ) {
             profile.record("fallback_core_only_masked_or_worse", stage_started);
-            return Ok(outcome);
+            return Ok(FixPassResult {
+                post_lint_state: lint_state(&outcome.sql, dialect, lint_config),
+                outcome,
+            });
         }
         profile.record("fallback_core_only_masked_or_worse", stage_started);
 
@@ -516,17 +600,26 @@ pub fn apply_lint_fixes_with_options(
             usize::MAX,
         ) {
             profile.record("fallback_incremental_masked_or_worse", stage_started);
-            return Ok(outcome);
+            return Ok(FixPassResult {
+                post_lint_state: lint_state(&outcome.sql, dialect, lint_config),
+                outcome,
+            });
         }
         profile.record("fallback_incremental_masked_or_worse", stage_started);
 
-        return Ok(FixOutcome {
-            sql: sql.to_string(),
-            counts: FixCounts::default(),
-            changed: false,
-            skipped_due_to_comments: false,
-            skipped_due_to_regression: true,
-            skipped_counts,
+        return Ok(FixPassResult {
+            post_lint_state: FixLintState {
+                issues: before_issues.clone(),
+                counts: before_counts.clone(),
+            },
+            outcome: FixOutcome {
+                sql: sql.to_string(),
+                counts: FixCounts::default(),
+                changed: false,
+                skipped_due_to_comments: false,
+                skipped_due_to_regression: true,
+                skipped_counts,
+            },
         });
     }
 
@@ -558,7 +651,8 @@ pub fn apply_lint_fixes_with_options(
             merge_skipped_counts(&mut skipped_counts, &incremental.skipped_counts);
             fixed_sql = incremental.sql;
             let recount_started = Instant::now();
-            after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
+            after_lint_state = lint_state(&fixed_sql, dialect, lint_config);
+            after_counts = after_lint_state.counts.clone();
             profile.record("after_counts_overlap_recovery", recount_started);
         } else {
             profile.record("incremental_overlap_recovery", stage_started);
@@ -570,24 +664,33 @@ pub fn apply_lint_fixes_with_options(
     profile.record("final_removed_counts", stage_started);
 
     if counts.total() == 0 {
-        return Ok(FixOutcome {
-            sql: sql.to_string(),
-            counts,
-            changed: false,
-            skipped_due_to_comments: false,
-            skipped_due_to_regression: false,
-            skipped_counts,
+        return Ok(FixPassResult {
+            post_lint_state: FixLintState {
+                issues: before_issues.clone(),
+                counts: before_counts.clone(),
+            },
+            outcome: FixOutcome {
+                sql: sql.to_string(),
+                counts,
+                changed: false,
+                skipped_due_to_comments: false,
+                skipped_due_to_regression: false,
+                skipped_counts,
+            },
         });
     }
     let changed = fixed_sql != sql;
 
-    Ok(FixOutcome {
-        sql: fixed_sql,
-        counts,
-        changed,
-        skipped_due_to_comments: false,
-        skipped_due_to_regression: false,
-        skipped_counts,
+    Ok(FixPassResult {
+        post_lint_state: after_lint_state,
+        outcome: FixOutcome {
+            sql: fixed_sql,
+            counts,
+            changed,
+            skipped_due_to_comments: false,
+            skipped_due_to_regression: false,
+            skipped_counts,
+        },
     })
 }
 
@@ -713,6 +816,11 @@ fn lint_rule_counts(
 ) -> BTreeMap<String, usize> {
     let issues = lint_issues(sql, dialect, lint_config);
     lint_rule_counts_from_issues(&issues)
+}
+
+fn lint_state(sql: &str, dialect: Dialect, lint_config: &LintConfig) -> FixLintState {
+    let issues = lint_issues(sql, dialect, lint_config);
+    FixLintState::from_issues(issues)
 }
 
 fn lint_issues(sql: &str, dialect: Dialect, lint_config: &LintConfig) -> Vec<Issue> {
@@ -1107,14 +1215,16 @@ fn try_incremental_core_fix_plan(
         let current_total = regression_guard_total(&current_counts);
         let mut ordered_rules = by_rule.into_iter().collect::<Vec<_>>();
         if max_rule_evaluations_per_iteration != usize::MAX {
-            ordered_rules.sort_by(|(left_rule, left_candidates), (right_rule, right_candidates)| {
-                let left_count = current_counts.get(left_rule).copied().unwrap_or(0);
-                let right_count = current_counts.get(right_rule).copied().unwrap_or(0);
-                right_count
-                    .cmp(&left_count)
-                    .then_with(|| right_candidates.len().cmp(&left_candidates.len()))
-                    .then_with(|| left_rule.cmp(right_rule))
-            });
+            ordered_rules.sort_by(
+                |(left_rule, left_candidates), (right_rule, right_candidates)| {
+                    let left_count = current_counts.get(left_rule).copied().unwrap_or(0);
+                    let right_count = current_counts.get(right_rule).copied().unwrap_or(0);
+                    right_count
+                        .cmp(&left_count)
+                        .then_with(|| right_candidates.len().cmp(&left_candidates.len()))
+                        .then_with(|| left_rule.cmp(right_rule))
+                },
+            );
         }
 
         let mut best_rule: Option<String> = None;
@@ -5028,6 +5138,53 @@ mod tests {
                 .copied()
                 .unwrap_or(0),
             0
+        );
+    }
+
+    #[test]
+    fn cached_pre_lint_state_matches_uncached_next_pass_behavior() {
+        let sql = "SELECT 1 UNION SELECT 2";
+        let lint_config = default_lint_config();
+        let fix_options = FixOptions {
+            include_unsafe_fixes: false,
+            include_rewrite_candidates: false,
+        };
+
+        let first_pass = apply_lint_fixes_with_options_and_lint_state(
+            sql,
+            Dialect::Generic,
+            &lint_config,
+            fix_options,
+            None,
+        )
+        .expect("first fix pass");
+
+        let second_cached = apply_lint_fixes_with_options_and_lint_state(
+            &first_pass.outcome.sql,
+            Dialect::Generic,
+            &lint_config,
+            fix_options,
+            Some(first_pass.post_lint_state.clone()),
+        )
+        .expect("second cached pass");
+        let second_uncached = apply_lint_fixes_with_options_and_lint_state(
+            &first_pass.outcome.sql,
+            Dialect::Generic,
+            &lint_config,
+            fix_options,
+            None,
+        )
+        .expect("second uncached pass");
+
+        assert_eq!(second_cached.outcome.sql, second_uncached.outcome.sql);
+        assert_eq!(second_cached.outcome.counts, second_uncached.outcome.counts);
+        assert_eq!(
+            second_cached.outcome.changed,
+            second_uncached.outcome.changed
+        );
+        assert_eq!(
+            second_cached.outcome.skipped_due_to_regression,
+            second_uncached.outcome.skipped_due_to_regression
         );
     }
 

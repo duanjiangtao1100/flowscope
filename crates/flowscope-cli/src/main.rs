@@ -1,7 +1,9 @@
 //! FlowScope CLI - SQL lineage analyzer
 
 use flowscope_cli::cli;
-use flowscope_cli::fix::{apply_lint_fixes_with_options, FixCounts, FixOptions, FixOutcome};
+use flowscope_cli::fix::{
+    apply_lint_fixes_with_options_and_lint_state, FixCounts, FixLintState, FixOptions, FixOutcome,
+};
 use flowscope_cli::input;
 #[cfg(feature = "metadata-provider")]
 use flowscope_cli::metadata;
@@ -121,6 +123,7 @@ fn apply_lint_fixes_with_runtime_options(
     let mut lt03_touched = false;
     let mut lt02_touched = false;
     let mut last_outcome = None;
+    let mut cached_lint_state: Option<FixLintState> = None;
     let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
     let mut overlap_retried_sql: HashSet<String> = HashSet::new();
     let mut pass_limit = MAX_LINT_FIX_PASSES;
@@ -129,8 +132,15 @@ fn apply_lint_fixes_with_runtime_options(
     let mut pass_index = 0usize;
 
     while pass_index < pass_limit {
-        let outcome =
-            apply_lint_fixes_with_options(&current_sql, dialect, lint_config, fix_options)?;
+        let pass_result = apply_lint_fixes_with_options_and_lint_state(
+            &current_sql,
+            dialect,
+            lint_config,
+            fix_options,
+            cached_lint_state.take(),
+        )?;
+        let outcome = pass_result.outcome;
+        let post_lint_state = pass_result.post_lint_state;
 
         // Avoid oscillating between previously seen SQL states across passes.
         if outcome.changed && !seen_sql.insert(outcome.sql.clone()) {
@@ -150,6 +160,7 @@ fn apply_lint_fixes_with_runtime_options(
             any_changed = true;
             current_sql = outcome.sql.clone();
         }
+        cached_lint_state = Some(post_lint_state);
 
         let continue_fixing = outcome.changed
             && !outcome.skipped_due_to_comments
@@ -348,7 +359,9 @@ fn run_lint(args: Args) -> Result<bool> {
     let started_at = Instant::now();
     let fix_runtime_options = LintFixRuntimeOptions::from_args(&args);
 
-    validate_lint_output_format(args.format)?;
+    if !args.fix_only {
+        validate_lint_output_format(args.format)?;
+    }
 
     let respect_gitignore = !args.no_respect_gitignore;
     let lint_jobs = resolve_lint_jobs(args.jobs);
@@ -478,9 +491,15 @@ fn run_lint(args: Args) -> Result<bool> {
                 );
             }
             if stdin_modified {
-                eprintln!(
-                    "flowscope: auto-fixes were applied to stdin input for linting output only (no file was written)"
-                );
+                if args.fix_only {
+                    eprintln!(
+                        "flowscope: auto-fixes were applied to stdin input (emitting fixed SQL output)"
+                    );
+                } else {
+                    eprintln!(
+                        "flowscope: auto-fixes were applied to stdin input for linting output only (no file was written)"
+                    );
+                }
             }
 
             let skipped_or_blocked_total = skipped_or_blocked_candidates.total_skipped_or_blocked();
@@ -509,6 +528,27 @@ fn run_lint(args: Args) -> Result<bool> {
         }
 
         fix_elapsed = Some(fix_started_at.elapsed());
+    }
+
+    if args.fix_only {
+        if !args.quiet {
+            if let Some(fix_elapsed) = fix_elapsed {
+                eprintln!(
+                    "flowscope: phase timing: fix={}",
+                    format_cli_elapsed(fix_elapsed)
+                );
+            }
+        }
+
+        let stdin_output = lint_inputs
+            .iter()
+            .find(|lint_input| lint_input.path.is_none())
+            .map(|lint_input| lint_input.source.content.as_str());
+        if let Some(sql) = stdin_output {
+            write_output(&args.output, sql)?;
+        }
+
+        return Ok(false);
     }
 
     if !args.quiet {
