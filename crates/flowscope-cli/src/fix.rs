@@ -269,11 +269,11 @@ pub fn apply_lint_fixes_with_options(
     let mut profile = FixProfileGuard::new(sql.len(), fix_options);
     const INCREMENTAL_LARGE_SQL_THRESHOLD: usize = 4_000;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR: usize = 4;
-    const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL: usize = 2;
+    const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL: usize = 1;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT: usize = 24;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL: usize = 12;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
-    const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 4;
+    const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 2;
     let is_large_sql = sql.len() >= INCREMENTAL_LARGE_SQL_THRESHOLD;
     let incremental_parse_error_iterations = if is_large_sql {
         INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL

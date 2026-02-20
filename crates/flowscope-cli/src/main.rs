@@ -44,7 +44,7 @@ const EXIT_CONFIG_ERROR: u8 = 66;
 const MAX_LINT_FIX_PASSES: usize = 3;
 /// Extra cleanup passes granted at the end of the normal loop budget when
 /// progress is still being made.
-const MAX_LINT_FIX_BONUS_PASSES: usize = 1;
+const MAX_LINT_FIX_BONUS_PASSES: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LintFixRuntimeOptions {
@@ -115,6 +115,7 @@ fn apply_lint_fixes_with_runtime_options(
     let mut merged_candidate_stats = FixCandidateStats::default();
     let mut any_changed = false;
     let mut lt03_touched = false;
+    let mut lt02_touched = false;
     let mut last_outcome = None;
     let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
     let mut pass_limit = MAX_LINT_FIX_PASSES;
@@ -135,6 +136,9 @@ fn apply_lint_fixes_with_runtime_options(
         if outcome.counts.get(issue_codes::LINT_LT_003) > 0 {
             lt03_touched = true;
         }
+        if outcome.counts.get(issue_codes::LINT_LT_002) > 0 {
+            lt02_touched = true;
+        }
 
         if outcome.changed {
             any_changed = true;
@@ -154,7 +158,7 @@ fn apply_lint_fixes_with_runtime_options(
         if (continue_fixing || overlap_retry)
             && pass_index + 1 == pass_limit
             && bonus_passes_granted < MAX_LINT_FIX_BONUS_PASSES
-            && (overlap_retry || lt03_touched)
+            && (overlap_retry || lt03_touched || lt02_touched)
         {
             pass_limit += 1;
             bonus_passes_granted += 1;

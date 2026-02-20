@@ -855,7 +855,8 @@ fn postgres_lt02_extra_issue_spans(
                 let next_first = scans[next_idx].words.first().map(String::as_str);
                 let has_trailing_continuation = line.trimmed.trim_end().ends_with('/')
                     || line.trimmed.trim_end().ends_with(',');
-                if has_trailing_continuation && !is_clause_boundary(next_first, scans[next_idx].trimmed)
+                if has_trailing_continuation
+                    && !is_clause_boundary(next_first, scans[next_idx].trimmed)
                 {
                     let keyword = first.unwrap_or_default();
                     if let Some(rel) = content_offset_after_keyword(line.trimmed, keyword) {
@@ -1033,18 +1034,49 @@ fn postgres_keyword_break_and_indent_edits(
 
         if matches!(first, Some("CASE")) {
             if let Some(when_rel) = upper.find(" WHEN ").map(|offset| offset + 1) {
-                push_trimmed_offset_break_edit(
-                    &mut edits,
-                    statement_sql,
-                    &line_infos,
-                    idx,
-                    "CASE".len(),
-                    when_rel,
-                    line.indent + indent_unit,
-                    indent_unit,
-                    tab_space_size,
-                    indent_style,
-                );
+                let mut emitted_multiline_case_when_edit = false;
+                if let Some(next_idx) = next_significant_line(&scans, idx) {
+                    let next_first = scans[next_idx].words.first().map(String::as_str);
+                    let continues_case_condition =
+                        !is_clause_boundary(next_first, scans[next_idx].trimmed)
+                            && !matches!(next_first, Some("WHEN" | "THEN" | "ELSE" | "END"));
+                    if continues_case_condition {
+                        let when_tail = &line.trimmed[when_rel..];
+                        if let Some(when_content_rel) =
+                            content_offset_after_keyword(when_tail, "WHEN")
+                        {
+                            let content_rel = when_rel + when_content_rel;
+                            push_case_when_multiline_break_edit(
+                                &mut edits,
+                                statement_sql,
+                                &line_infos,
+                                idx,
+                                "CASE".len(),
+                                content_rel,
+                                line.indent + indent_unit,
+                                line.indent + indent_unit * 2,
+                                indent_unit,
+                                tab_space_size,
+                                indent_style,
+                            );
+                            emitted_multiline_case_when_edit = true;
+                        }
+                    }
+                }
+                if !emitted_multiline_case_when_edit {
+                    push_trimmed_offset_break_edit(
+                        &mut edits,
+                        statement_sql,
+                        &line_infos,
+                        idx,
+                        "CASE".len(),
+                        when_rel,
+                        line.indent + indent_unit,
+                        indent_unit,
+                        tab_space_size,
+                        indent_style,
+                    );
+                }
             }
         }
 
@@ -1075,13 +1107,14 @@ fn postgres_keyword_break_and_indent_edits(
                 let next_first = next_line.words.first().map(String::as_str);
                 let needs_break = matches!(next_first, Some("AND" | "OR"))
                     || starts_with_operator_continuation(next_line.trimmed);
-                let where_parent_indent = previous_significant_line(&scans, idx).and_then(|prev_idx| {
-                    let prev_first = scans[prev_idx].words.first().map(String::as_str);
-                    let prev_second = scans[prev_idx].words.get(1).map(String::as_str);
-                    (is_join_clause(prev_first, prev_second)
-                        || matches!(prev_first, Some("FROM" | "WHERE" | "HAVING" | "ON")))
-                    .then_some(scans[prev_idx].indent)
-                });
+                let where_parent_indent =
+                    previous_significant_line(&scans, idx).and_then(|prev_idx| {
+                        let prev_first = scans[prev_idx].words.first().map(String::as_str);
+                        let prev_second = scans[prev_idx].words.get(1).map(String::as_str);
+                        (is_join_clause(prev_first, prev_second)
+                            || matches!(prev_first, Some("FROM" | "WHERE" | "HAVING" | "ON")))
+                        .then_some(scans[prev_idx].indent)
+                    });
                 let where_clause_indent = where_parent_indent
                     .unwrap_or_else(|| ceil_indent_width(line.indent, indent_unit));
                 if let Some(parent_indent) = where_parent_indent {
@@ -1239,7 +1272,8 @@ fn postgres_keyword_break_and_indent_edits(
                 let next_first = scans[next_idx].words.first().map(String::as_str);
                 let has_trailing_continuation = line.trimmed.trim_end().ends_with('/')
                     || line.trimmed.trim_end().ends_with(',');
-                if has_trailing_continuation && !is_clause_boundary(next_first, scans[next_idx].trimmed)
+                if has_trailing_continuation
+                    && !is_clause_boundary(next_first, scans[next_idx].trimmed)
                 {
                     let keyword = first.unwrap_or_default();
                     push_keyword_break_edit(
@@ -1299,26 +1333,26 @@ fn postgres_keyword_break_and_indent_edits(
                     if matches!(next_first, Some("AND" | "OR")) {
                         push_keyword_break_edit(
                             &mut edits,
-                        statement_sql,
-                        &line_infos,
-                        &scans,
-                        idx,
-                        "ON",
-                        on_content_indent,
-                        indent_unit,
-                        tab_space_size,
-                        indent_style,
-                    );
-                    push_on_condition_block_indent_edits(
+                            statement_sql,
+                            &line_infos,
+                            &scans,
+                            idx,
+                            "ON",
+                            on_content_indent,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
+                        );
+                        push_on_condition_block_indent_edits(
                             &mut edits,
-                        statement_sql,
-                        &line_infos,
-                        &scans,
-                        next_idx,
-                        on_content_indent,
-                        indent_unit,
-                        tab_space_size,
-                        indent_style,
+                            statement_sql,
+                            &line_infos,
+                            &scans,
+                            next_idx,
+                            on_content_indent,
+                            indent_unit,
+                            tab_space_size,
+                            indent_style,
                         );
                     }
                 }
@@ -1417,7 +1451,9 @@ fn postgres_keyword_break_and_indent_edits(
             }
         }
 
-        if matches!(first, Some("SELECT")) && upper.starts_with("SELECT *") && !upper.contains(" FROM ")
+        if matches!(first, Some("SELECT"))
+            && upper.starts_with("SELECT *")
+            && !upper.contains(" FROM ")
         {
             if let Some(next_idx) = next_significant_line(&scans, idx) {
                 let next_first = scans[next_idx].words.first().map(String::as_str);
@@ -1752,6 +1788,53 @@ fn push_trimmed_offset_break_edit(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn push_case_when_multiline_break_edit(
+    edits: &mut Vec<Lt02AutofixEdit>,
+    statement_sql: &str,
+    line_infos: &[StatementLineInfo],
+    line_index: usize,
+    case_break_rel: usize,
+    content_rel: usize,
+    when_indent: usize,
+    content_indent: usize,
+    indent_unit: usize,
+    tab_space_size: usize,
+    indent_style: IndentStyle,
+) {
+    if content_rel <= case_break_rel {
+        return;
+    }
+    let Some(line_info) = line_infos.get(line_index) else {
+        return;
+    };
+
+    let start = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(case_break_rel);
+    let end = line_info
+        .start
+        .saturating_add(line_info.indent_end)
+        .saturating_add(content_rel);
+    if start >= end || end > statement_sql.len() {
+        return;
+    }
+
+    let replacement = format!(
+        "\n{}WHEN\n{}",
+        make_indent(when_indent, indent_unit, tab_space_size, indent_style),
+        make_indent(content_indent, indent_unit, tab_space_size, indent_style)
+    );
+    if statement_sql[start..end] != replacement {
+        edits.push(Lt02AutofixEdit {
+            start,
+            end,
+            replacement,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_inline_case_break_edit(
     edits: &mut Vec<Lt02AutofixEdit>,
     statement_sql: &str,
@@ -2000,7 +2083,8 @@ fn push_on_condition_block_indent_edits(
         let first = line.words.first().map(String::as_str);
 
         if let Some(suspended_depth) = suspended_nested_clause_depth {
-            let at_resume_boundary = depth == suspended_depth && is_clause_boundary(first, line.trimmed);
+            let at_resume_boundary =
+                depth == suspended_depth && is_clause_boundary(first, line.trimmed);
             if !at_resume_boundary {
                 if !line.is_comment_only {
                     depth += paren_delta_simple(line.trimmed);
@@ -2217,7 +2301,9 @@ fn inline_join_on_offset(trimmed: &str) -> Option<usize> {
 
 fn inline_case_keyword_offset(trimmed: &str) -> Option<usize> {
     let upper = trimmed.to_ascii_uppercase();
-    upper.find(" CASE").map(|space_before_case| space_before_case + 1)
+    upper
+        .find(" CASE")
+        .map(|space_before_case| space_before_case + 1)
 }
 
 fn should_break_inline_join_on(
@@ -4846,12 +4932,9 @@ mod tests {
     fn postgres_standalone_on_block_with_nested_parens_autofixes() {
         let sql = "SELECT\n    1\nFROM foo AS c\nLEFT JOIN bar AS v\n    ON\n    -- Non-PIPELINE: exact version_key match\n        (c.cluster_source <> 'PIPELINE' AND c.dbr_version = v.version_key)\n    OR\n    -- PIPELINE: match on main_version + photon\n    (c.cluster_source = 'PIPELINE'\n    AND c.parsed_main_version = v.main_version\n    AND c.parsed_is_photon = v.is_photon\n    AND v.is_lts = TRUE)";
         let mut fixed = sql.to_string();
-        let mut edits = collapse_lt02_autofix_edits_by_start(postgres_keyword_break_and_indent_edits(
-            sql,
-            4,
-            4,
-            IndentStyle::Spaces,
-        ));
+        let mut edits = collapse_lt02_autofix_edits_by_start(
+            postgres_keyword_break_and_indent_edits(sql, 4, 4, IndentStyle::Spaces),
+        );
         edits.sort_by(|left, right| right.start.cmp(&left.start));
         for edit in edits {
             if edit.start <= edit.end && edit.end <= fixed.len() {
@@ -4944,7 +5027,7 @@ mod tests {
         let fixed = apply_all_issue_autofixes(sql, &issues).expect("apply all autofixes");
         assert_eq!(
             fixed,
-            "SELECT\n    workspace_id,\n    table_full_name,\n    usage_date,\n    COUNT(*) AS query_count,\n    SUM(COALESCE(pruned_files_count, 0)) AS total_pruned_files,\n    SUM(COALESCE(read_files_count, 0)) AS total_read_files,\n    CASE\n        WHEN SUM(COALESCE(pruned_files_count, 0) + COALESCE(read_files_count,\n        0)) > 0\n            THEN\n            SUM(COALESCE(pruned_files_count, 0))::numeric\n            / SUM(COALESCE(pruned_files_count, 0) + COALESCE(read_files_count,\n                0))\n    END AS pruning_ratio\nFROM query_files"
+            "SELECT\n    workspace_id,\n    table_full_name,\n    usage_date,\n    COUNT(*) AS query_count,\n    SUM(COALESCE(pruned_files_count, 0)) AS total_pruned_files,\n    SUM(COALESCE(read_files_count, 0)) AS total_read_files,\n    CASE\n        WHEN\n            SUM(COALESCE(pruned_files_count, 0) + COALESCE(read_files_count,\n        0)) > 0\n            THEN\n            SUM(COALESCE(pruned_files_count, 0))::numeric\n            / SUM(COALESCE(pruned_files_count, 0) + COALESCE(read_files_count,\n                0))\n    END AS pruning_ratio\nFROM query_files"
         );
     }
 
