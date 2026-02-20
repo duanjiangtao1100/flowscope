@@ -270,7 +270,7 @@ pub fn apply_lint_fixes_with_options(
     const INCREMENTAL_LARGE_SQL_THRESHOLD: usize = 4_000;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR: usize = 4;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL: usize = 1;
-    const INCREMENTAL_MAX_RULE_EVALUATIONS_PARSE_ERROR_LARGE_SQL: usize = 8;
+    const INCREMENTAL_MAX_RULE_EVALUATIONS_PARSE_ERROR_LARGE_SQL: usize = 1;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT: usize = 24;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL: usize = 12;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
@@ -1105,6 +1105,17 @@ fn try_incremental_core_fix_plan(
         let protected_ranges =
             collect_comment_protected_ranges(&current_sql, dialect, !allow_unsafe);
         let current_total = regression_guard_total(&current_counts);
+        let mut ordered_rules = by_rule.into_iter().collect::<Vec<_>>();
+        if max_rule_evaluations_per_iteration != usize::MAX {
+            ordered_rules.sort_by(|(left_rule, left_candidates), (right_rule, right_candidates)| {
+                let left_count = current_counts.get(left_rule).copied().unwrap_or(0);
+                let right_count = current_counts.get(right_rule).copied().unwrap_or(0);
+                right_count
+                    .cmp(&left_count)
+                    .then_with(|| right_candidates.len().cmp(&left_candidates.len()))
+                    .then_with(|| left_rule.cmp(right_rule))
+            });
+        }
 
         let mut best_rule: Option<String> = None;
         let mut best_sql: Option<String> = None;
@@ -1114,7 +1125,7 @@ fn try_incremental_core_fix_plan(
         let mut evaluated_candidate_sql = HashSet::new();
 
         let mut rule_evaluations = 0usize;
-        for (rule_code, rule_candidates) in by_rule {
+        for (rule_code, rule_candidates) in ordered_rules {
             if rule_evaluations >= max_rule_evaluations_per_iteration {
                 break;
             }
