@@ -270,6 +270,7 @@ pub fn apply_lint_fixes_with_options(
     const INCREMENTAL_LARGE_SQL_THRESHOLD: usize = 4_000;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR: usize = 4;
     const INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL: usize = 1;
+    const INCREMENTAL_MAX_RULE_EVALUATIONS_PARSE_ERROR_LARGE_SQL: usize = 8;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT: usize = 24;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL: usize = 12;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
@@ -284,6 +285,11 @@ pub fn apply_lint_fixes_with_options(
         INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL
     } else {
         INCREMENTAL_MAX_ITERATIONS_DEFAULT
+    };
+    let incremental_parse_error_rule_evaluations = if is_large_sql {
+        INCREMENTAL_MAX_RULE_EVALUATIONS_PARSE_ERROR_LARGE_SQL
+    } else {
+        usize::MAX
     };
     let incremental_overlap_recovery_iterations = if is_large_sql {
         INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL
@@ -425,6 +431,7 @@ pub fn apply_lint_fixes_with_options(
             &before_counts,
             fix_options.include_unsafe_fixes,
             incremental_parse_error_iterations,
+            incremental_parse_error_rule_evaluations,
         ) {
             profile.record("fallback_incremental_parse_errors", stage_started);
             return Ok(outcome);
@@ -467,6 +474,7 @@ pub fn apply_lint_fixes_with_options(
             &before_counts,
             fix_options.include_unsafe_fixes,
             incremental_default_iterations,
+            usize::MAX,
         ) {
             profile.record("fallback_incremental_rewrite_guard", stage_started);
             return Ok(outcome);
@@ -505,6 +513,7 @@ pub fn apply_lint_fixes_with_options(
             &before_counts,
             fix_options.include_unsafe_fixes,
             incremental_default_iterations,
+            usize::MAX,
         ) {
             profile.record("fallback_incremental_masked_or_worse", stage_started);
             return Ok(outcome);
@@ -543,6 +552,7 @@ pub fn apply_lint_fixes_with_options(
             &after_counts,
             fix_options.include_unsafe_fixes,
             incremental_overlap_recovery_iterations,
+            usize::MAX,
         ) {
             profile.record("incremental_overlap_recovery", stage_started);
             merge_skipped_counts(&mut skipped_counts, &incremental.skipped_counts);
@@ -1051,6 +1061,7 @@ fn try_incremental_core_fix_plan(
     before_counts: &BTreeMap<String, usize>,
     allow_unsafe: bool,
     max_iterations: usize,
+    max_rule_evaluations_per_iteration: usize,
 ) -> Option<FixOutcome> {
     let mut current_sql = sql.to_string();
     let mut current_counts = before_counts.clone();
@@ -1061,6 +1072,7 @@ fn try_incremental_core_fix_plan(
     seen_sql.insert(current_sql.clone());
 
     let max_iterations = max_iterations.max(1);
+    let max_rule_evaluations_per_iteration = max_rule_evaluations_per_iteration.max(1);
     for _ in 0..max_iterations {
         let issues = lint_issues(&current_sql, dialect, lint_config);
         let mut all_candidates = build_fix_candidates_from_issue_autofixes(&current_sql, &issues);
@@ -1101,7 +1113,11 @@ fn try_incremental_core_fix_plan(
         let mut best_after_total = usize::MAX;
         let mut evaluated_candidate_sql = HashSet::new();
 
+        let mut rule_evaluations = 0usize;
         for (rule_code, rule_candidates) in by_rule {
+            if rule_evaluations >= max_rule_evaluations_per_iteration {
+                break;
+            }
             let planned = plan_fix_candidates(
                 &current_sql,
                 rule_candidates,
@@ -1113,6 +1129,7 @@ fn try_incremental_core_fix_plan(
             if planned.edits.is_empty() {
                 continue;
             }
+            rule_evaluations += 1;
 
             let candidate_sql = apply_planned_edits(&current_sql, &planned.edits);
             if candidate_sql == current_sql {
@@ -4984,6 +5001,7 @@ mod tests {
             &before_counts,
             false,
             24,
+            usize::MAX,
         )
         .expect("expected incremental ST009 fix");
         assert!(

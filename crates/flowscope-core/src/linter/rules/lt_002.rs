@@ -2521,6 +2521,9 @@ fn build_case_anchor_cache(scans: &[ScanLine<'_>]) -> Vec<Option<usize>> {
     let mut current_anchor: Option<usize> = None;
 
     for (idx, line) in scans.iter().enumerate() {
+        // Record the anchor *before* inspecting the current line so that a
+        // CASE line references its enclosing anchor, while lines that follow
+        // (WHEN, THEN, ELSE, END) reference back to the CASE itself.
         cache[idx] = current_anchor;
         if line.is_blank || line.is_comment_only {
             continue;

@@ -25,6 +25,10 @@ impl LintRule for TsqlEmptyBatch {
     }
 
     fn check(&self, _statement: &Statement, ctx: &LintContext) -> Vec<Issue> {
+        if ctx.dialect() != Dialect::Mssql {
+            return Vec::new();
+        }
+
         // TQ003 is document-level: GO separators can sit outside statement
         // spans, so evaluate once against the full SQL document.
         if ctx.statement_index != 0 {
@@ -254,39 +258,44 @@ fn match_ascii_keyword_at(bytes: &[u8], start: usize, keyword_upper: &[u8]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linter::rule::with_active_dialect;
     use crate::parser::parse_sql;
     use crate::types::IssueAutofixApplicability;
 
     fn run(sql: &str) -> Vec<Issue> {
         let statements = parse_sql(sql).expect("parse");
         let rule = TsqlEmptyBatch;
-        statements
-            .iter()
-            .enumerate()
-            .flat_map(|(index, statement)| {
-                rule.check(
-                    statement,
-                    &LintContext {
-                        sql,
-                        statement_range: 0..sql.len(),
-                        statement_index: index,
-                    },
-                )
-            })
-            .collect()
+        with_active_dialect(Dialect::Mssql, || {
+            statements
+                .iter()
+                .enumerate()
+                .flat_map(|(index, statement)| {
+                    rule.check(
+                        statement,
+                        &LintContext {
+                            sql,
+                            statement_range: 0..sql.len(),
+                            statement_index: index,
+                        },
+                    )
+                })
+                .collect()
+        })
     }
 
     fn run_for_statement_sql(sql: &str) -> Vec<Issue> {
         let statements = parse_sql("SELECT 1").expect("parse placeholder statement");
         let rule = TsqlEmptyBatch;
-        rule.check(
-            &statements[0],
-            &LintContext {
-                sql,
-                statement_range: 0..sql.len(),
-                statement_index: 0,
-            },
-        )
+        with_active_dialect(Dialect::Mssql, || {
+            rule.check(
+                &statements[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        })
     }
 
     fn apply_issue_autofix(sql: &str, issue: &Issue) -> Option<String> {
@@ -364,6 +373,24 @@ mod tests {
     #[test]
     fn rule_does_not_flag_go_text_inside_string_literal() {
         let issues = run("SELECT '\nGO\nGO\n' AS sql_snippet");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn rule_does_not_run_for_non_mssql_dialect() {
+        let statements = parse_sql("SELECT 1").expect("parse placeholder statement");
+        let rule = TsqlEmptyBatch;
+        let sql = "SELECT 1\nGO\nGO\n";
+        let issues = with_active_dialect(Dialect::Postgres, || {
+            rule.check(
+                &statements[0],
+                &LintContext {
+                    sql,
+                    statement_range: 0..sql.len(),
+                    statement_index: 0,
+                },
+            )
+        });
         assert!(issues.is_empty());
     }
 }

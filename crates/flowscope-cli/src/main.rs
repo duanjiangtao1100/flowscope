@@ -49,7 +49,6 @@ const MAX_LINT_FIX_BONUS_PASSES: usize = 2;
 #[derive(Debug, Clone, Copy, Default)]
 struct LintFixRuntimeOptions {
     include_unsafe_fixes: bool,
-    show_fixes: bool,
     legacy_ast_fixes: bool,
 }
 
@@ -57,7 +56,6 @@ impl LintFixRuntimeOptions {
     fn from_args(args: &Args) -> Self {
         Self {
             include_unsafe_fixes: args.unsafe_fixes,
-            show_fixes: args.show_fixes,
             legacy_ast_fixes: args.legacy_ast_fixes,
         }
     }
@@ -118,6 +116,7 @@ fn apply_lint_fixes_with_runtime_options(
     let mut lt02_touched = false;
     let mut last_outcome = None;
     let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
+    let mut overlap_retried_sql: HashSet<String> = HashSet::new();
     let mut pass_limit = MAX_LINT_FIX_PASSES;
     let mut bonus_passes_granted = 0usize;
     let mut pass_index = 0usize;
@@ -148,10 +147,13 @@ fn apply_lint_fixes_with_runtime_options(
         let continue_fixing = outcome.changed
             && !outcome.skipped_due_to_comments
             && !outcome.skipped_due_to_regression;
+        // Only retry overlap conflicts once per unique SQL state: re-running on
+        // unchanged SQL would produce the same conflicts and waste the pass budget.
         let overlap_retry = !outcome.changed
             && !outcome.skipped_due_to_comments
             && !outcome.skipped_due_to_regression
-            && outcome.skipped_counts.overlap_conflict_blocked > 0;
+            && outcome.skipped_counts.overlap_conflict_blocked > 0
+            && overlap_retried_sql.insert(current_sql.clone());
 
         // Some files keep improving right at the bounded pass budget. Allow a
         // small number of extra cleanup passes to avoid near-miss leftovers.
@@ -198,11 +200,7 @@ fn collect_fix_candidate_stats(
     } else {
         outcome.skipped_counts.unsafe_skipped
     };
-    let blocked_display_only = if runtime_options.show_fixes {
-        outcome.skipped_counts.display_only
-    } else {
-        0
-    };
+    let blocked_display_only = outcome.skipped_counts.display_only;
 
     let blocked_protected_range = outcome.skipped_counts.protected_range_blocked;
     let blocked_overlap_conflict = outcome.skipped_counts.overlap_conflict_blocked;
@@ -1163,7 +1161,19 @@ fn print_issues_to_stderr(result: &flowscope_core::AnalyzeResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rule_configs_json;
+    use super::{collect_fix_candidate_stats, parse_rule_configs_json, LintFixRuntimeOptions};
+    use flowscope_cli::fix::{FixCounts, FixOutcome, FixSkippedCounts};
+
+    fn sample_outcome(skipped_counts: FixSkippedCounts) -> FixOutcome {
+        FixOutcome {
+            sql: String::new(),
+            counts: FixCounts::default(),
+            changed: false,
+            skipped_due_to_comments: false,
+            skipped_due_to_regression: false,
+            skipped_counts,
+        }
+    }
 
     #[test]
     fn parse_rule_configs_json_accepts_object_map() {
@@ -1218,5 +1228,52 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(2)
         );
+    }
+
+    #[test]
+    fn collect_fix_candidate_stats_always_counts_display_only_as_blocked() {
+        let outcome = sample_outcome(FixSkippedCounts {
+            unsafe_skipped: 1,
+            protected_range_blocked: 2,
+            overlap_conflict_blocked: 3,
+            display_only: 4,
+        });
+
+        let stats = collect_fix_candidate_stats(
+            &outcome,
+            LintFixRuntimeOptions {
+                include_unsafe_fixes: false,
+                legacy_ast_fixes: false,
+            },
+        );
+
+        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.blocked, 10);
+        assert_eq!(stats.blocked_unsafe, 1);
+        assert_eq!(stats.blocked_display_only, 4);
+        assert_eq!(stats.blocked_protected_range, 2);
+        assert_eq!(stats.blocked_overlap_conflict, 3);
+    }
+
+    #[test]
+    fn collect_fix_candidate_stats_excludes_unsafe_when_unsafe_fixes_enabled() {
+        let outcome = sample_outcome(FixSkippedCounts {
+            unsafe_skipped: 2,
+            protected_range_blocked: 1,
+            overlap_conflict_blocked: 1,
+            display_only: 3,
+        });
+
+        let stats = collect_fix_candidate_stats(
+            &outcome,
+            LintFixRuntimeOptions {
+                include_unsafe_fixes: true,
+                legacy_ast_fixes: false,
+            },
+        );
+
+        assert_eq!(stats.blocked, 5);
+        assert_eq!(stats.blocked_unsafe, 0);
+        assert_eq!(stats.blocked_display_only, 3);
     }
 }
