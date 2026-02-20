@@ -390,7 +390,11 @@ pub fn apply_lint_fixes_with_options(
     profile.record("apply_planned_edits", stage_started);
 
     let stage_started = Instant::now();
-    let mut after_counts = lint_rule_counts(&fixed_sql, dialect, lint_config);
+    let mut after_counts = if fixed_sql == sql {
+        before_counts.clone()
+    } else {
+        lint_rule_counts(&fixed_sql, dialect, lint_config)
+    };
     profile.record("after_counts", stage_started);
 
     let before_total = regression_guard_total(&before_counts);
