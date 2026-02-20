@@ -44,7 +44,13 @@ const EXIT_CONFIG_ERROR: u8 = 66;
 const MAX_LINT_FIX_PASSES: usize = 3;
 /// Extra cleanup passes granted at the end of the normal loop budget when
 /// progress is still being made.
-const MAX_LINT_FIX_BONUS_PASSES: usize = 2;
+const MAX_LINT_FIX_BONUS_PASSES: usize = 1;
+/// Allow one additional large-SQL cleanup pass when LT02 has been improving.
+///
+/// This narrowly recovers the last indentation edge cases without reopening
+/// the broad long-tail cost of unrestricted bonus passes.
+const MAX_LINT_FIX_LARGE_SQL_LT02_EXTRA_PASSES: usize = 1;
+const LINT_FIX_LARGE_SQL_LT02_EXTRA_PASS_THRESHOLD: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LintFixRuntimeOptions {
@@ -119,6 +125,7 @@ fn apply_lint_fixes_with_runtime_options(
     let mut overlap_retried_sql: HashSet<String> = HashSet::new();
     let mut pass_limit = MAX_LINT_FIX_PASSES;
     let mut bonus_passes_granted = 0usize;
+    let mut large_sql_lt02_extra_passes_granted = 0usize;
     let mut pass_index = 0usize;
 
     while pass_index < pass_limit {
@@ -164,6 +171,17 @@ fn apply_lint_fixes_with_runtime_options(
         {
             pass_limit += 1;
             bonus_passes_granted += 1;
+        }
+
+        if continue_fixing
+            && pass_index + 1 == pass_limit
+            && bonus_passes_granted >= MAX_LINT_FIX_BONUS_PASSES
+            && large_sql_lt02_extra_passes_granted < MAX_LINT_FIX_LARGE_SQL_LT02_EXTRA_PASSES
+            && current_sql.len() >= LINT_FIX_LARGE_SQL_LT02_EXTRA_PASS_THRESHOLD
+            && lt02_touched
+        {
+            pass_limit += 1;
+            large_sql_lt02_extra_passes_granted += 1;
         }
 
         last_outcome = Some(outcome);
