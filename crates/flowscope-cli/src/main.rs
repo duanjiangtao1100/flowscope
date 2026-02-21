@@ -2,7 +2,8 @@
 
 use flowscope_cli::cli;
 use flowscope_cli::fix::{
-    apply_lint_fixes_with_options_and_lint_state, FixCounts, FixLintState, FixOptions, FixOutcome,
+    apply_lint_fixes_with_runtime_options, FixCandidateStats, LintFixExecution,
+    LintFixRuntimeOptions,
 };
 use flowscope_cli::input;
 #[cfg(feature = "metadata-provider")]
@@ -14,17 +15,13 @@ use flowscope_cli::server;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use flowscope_core::{
-    analyze, issue_codes, AnalysisOptions, AnalyzeRequest, FileSource, LintConfig, ParseError,
-    Severity,
-};
+use flowscope_core::{analyze, AnalysisOptions, AnalyzeRequest, FileSource, LintConfig, Severity};
 use flowscope_export::{
     export_csv_bundle, export_duckdb, export_html, export_json, export_mermaid, export_sql,
     export_xlsx, ExportFormat, ExportNaming, MermaidView,
 };
 use is_terminal::IsTerminal;
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -39,266 +36,17 @@ use output::{format_lint_json, format_lint_results, format_table, FileLintResult
 const EXIT_FAILURE: u8 = 1;
 /// Configuration error (e.g. unsupported format for the given mode).
 const EXIT_CONFIG_ERROR: u8 = 66;
-/// Max bounded fix passes per file during `--lint --fix`.
-///
-/// Three passes capture the vast majority of cascading fixes while avoiding
-/// disproportionate long-tail runtime on large statements.
-const MAX_LINT_FIX_PASSES: usize = 3;
-/// Extra cleanup passes granted at the end of the normal loop budget when
-/// progress is still being made.
-const MAX_LINT_FIX_BONUS_PASSES: usize = 1;
-/// Allow one additional large-SQL cleanup pass when LT02 has been improving.
-///
-/// This narrowly recovers the last indentation edge cases without reopening
-/// the broad long-tail cost of unrestricted bonus passes.
-const MAX_LINT_FIX_LARGE_SQL_LT02_EXTRA_PASSES: usize = 1;
-const LINT_FIX_LARGE_SQL_LT02_EXTRA_PASS_THRESHOLD: usize = 10_000;
-/// Stop extra cleanup passes on large SQL when LT02/LT03 are no longer moving
-/// and residual violations are overwhelmingly known mostly-unfixable classes.
-const LINT_FIX_MOSTLY_UNFIXABLE_STOP_THRESHOLD: usize = 4_000;
-const MAX_RESIDUAL_POTENTIALLY_FIXABLE_FOR_STOP: usize = 2;
-const MOSTLY_UNFIXABLE_RATIO_DENOMINATOR: usize = 5; // 20% potentially-fixable max.
-
-#[derive(Debug, Clone, Copy, Default)]
-struct LintFixRuntimeOptions {
-    include_unsafe_fixes: bool,
-    legacy_ast_fixes: bool,
-}
-
-impl LintFixRuntimeOptions {
-    fn from_args(args: &Args) -> Self {
-        Self {
-            include_unsafe_fixes: args.unsafe_fixes,
-            legacy_ast_fixes: args.legacy_ast_fixes,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct FixCandidateStats {
-    skipped: usize,
-    blocked: usize,
-    blocked_unsafe: usize,
-    blocked_display_only: usize,
-    blocked_protected_range: usize,
-    blocked_overlap_conflict: usize,
-}
-
-impl FixCandidateStats {
-    fn total_skipped_or_blocked(self) -> usize {
-        self.skipped + self.blocked
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.skipped += other.skipped;
-        self.blocked += other.blocked;
-        self.blocked_unsafe += other.blocked_unsafe;
-        self.blocked_display_only += other.blocked_display_only;
-        self.blocked_protected_range += other.blocked_protected_range;
-        self.blocked_overlap_conflict += other.blocked_overlap_conflict;
-    }
-}
-
-#[derive(Debug, Clone)]
-struct LintFixExecution {
-    outcome: FixOutcome,
-    candidate_stats: FixCandidateStats,
-}
 
 enum LintFixComputation {
     Success(LintFixExecution),
     ParseError(String),
 }
 
-fn apply_lint_fixes_with_runtime_options(
-    sql: &str,
-    dialect: flowscope_core::Dialect,
-    lint_config: &LintConfig,
-    runtime_options: LintFixRuntimeOptions,
-) -> std::result::Result<LintFixExecution, ParseError> {
-    let fix_options = FixOptions {
-        include_unsafe_fixes: runtime_options.include_unsafe_fixes,
-        include_rewrite_candidates: runtime_options.legacy_ast_fixes,
-    };
-
-    let mut current_sql = sql.to_string();
-    let mut merged_counts = FixCounts::default();
-    let mut merged_candidate_stats = FixCandidateStats::default();
-    let mut any_changed = false;
-    let mut lt03_touched = false;
-    let mut lt02_touched = false;
-    let mut last_outcome = None;
-    let mut cached_lint_state: Option<FixLintState> = None;
-    let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
-    let mut overlap_retried_sql: HashSet<String> = HashSet::new();
-    let mut pass_limit = MAX_LINT_FIX_PASSES;
-    let mut bonus_passes_granted = 0usize;
-    let mut large_sql_lt02_extra_passes_granted = 0usize;
-    let mut pass_index = 0usize;
-
-    while pass_index < pass_limit {
-        let pass_result = apply_lint_fixes_with_options_and_lint_state(
-            &current_sql,
-            dialect,
-            lint_config,
-            fix_options,
-            cached_lint_state.take(),
-        )?;
-        let outcome = pass_result.outcome;
-        let post_lint_state = pass_result.post_lint_state;
-
-        // Avoid oscillating between previously seen SQL states across passes.
-        if outcome.changed && !seen_sql.insert(outcome.sql.clone()) {
-            break;
-        }
-
-        merged_counts.merge(&outcome.counts);
-        merged_candidate_stats.merge(collect_fix_candidate_stats(&outcome, runtime_options));
-        if outcome.counts.get(issue_codes::LINT_LT_003) > 0 {
-            lt03_touched = true;
-        }
-        if outcome.counts.get(issue_codes::LINT_LT_002) > 0 {
-            lt02_touched = true;
-        }
-        let lt_cleanup_progress = outcome.counts.get(issue_codes::LINT_LT_003) > 0
-            || outcome.counts.get(issue_codes::LINT_LT_002) > 0;
-        let lt02_remaining = post_lint_state
-            .counts()
-            .get(issue_codes::LINT_LT_002)
-            .copied()
-            .unwrap_or(0)
-            > 0;
-        let residual_is_mostly_unfixable = is_mostly_unfixable_residual(post_lint_state.counts());
-
-        if outcome.changed {
-            any_changed = true;
-            current_sql = outcome.sql.clone();
-        }
-        cached_lint_state = Some(post_lint_state);
-
-        let mut continue_fixing = outcome.changed
-            && !outcome.skipped_due_to_comments
-            && !outcome.skipped_due_to_regression;
-        if continue_fixing
-            && pass_index + 1 >= MAX_LINT_FIX_PASSES
-            && current_sql.len() >= LINT_FIX_MOSTLY_UNFIXABLE_STOP_THRESHOLD
-            && !lt02_touched
-            && !lt03_touched
-            && !lt_cleanup_progress
-            && residual_is_mostly_unfixable
-        {
-            continue_fixing = false;
-        }
-        // Only retry overlap conflicts once per unique SQL state: re-running on
-        // unchanged SQL would produce the same conflicts and waste the pass budget.
-        let overlap_retry = !outcome.changed
-            && !outcome.skipped_due_to_comments
-            && !outcome.skipped_due_to_regression
-            && outcome.skipped_counts.overlap_conflict_blocked > 0
-            && overlap_retried_sql.insert(current_sql.clone());
-
-        // Some files keep improving right at the bounded pass budget. Allow a
-        // small number of extra cleanup passes to avoid near-miss leftovers.
-        if (continue_fixing || overlap_retry)
-            && pass_index + 1 == pass_limit
-            && bonus_passes_granted < MAX_LINT_FIX_BONUS_PASSES
-            && (overlap_retry || lt03_touched || lt02_touched)
-        {
-            pass_limit += 1;
-            bonus_passes_granted += 1;
-        }
-
-        if continue_fixing
-            && pass_index + 1 == pass_limit
-            && bonus_passes_granted >= MAX_LINT_FIX_BONUS_PASSES
-            && large_sql_lt02_extra_passes_granted < MAX_LINT_FIX_LARGE_SQL_LT02_EXTRA_PASSES
-            && current_sql.len() >= LINT_FIX_LARGE_SQL_LT02_EXTRA_PASS_THRESHOLD
-            && lt02_remaining
-        {
-            pass_limit += 1;
-            large_sql_lt02_extra_passes_granted += 1;
-        }
-
-        last_outcome = Some(outcome);
-
-        if !continue_fixing && !overlap_retry {
-            break;
-        }
-
-        pass_index += 1;
+fn lint_fix_runtime_options_from_args(args: &Args) -> LintFixRuntimeOptions {
+    LintFixRuntimeOptions {
+        include_unsafe_fixes: args.unsafe_fixes,
+        legacy_ast_fixes: args.legacy_ast_fixes,
     }
-
-    let mut outcome = last_outcome.expect("at least one fix pass should run");
-    if any_changed {
-        outcome.sql = current_sql;
-        outcome.changed = true;
-        outcome.counts = merged_counts;
-        // Multi-pass terminated after no further changes or bounded pass limit.
-        outcome.skipped_due_to_comments = false;
-        outcome.skipped_due_to_regression = false;
-    }
-
-    Ok(LintFixExecution {
-        outcome,
-        candidate_stats: merged_candidate_stats,
-    })
-}
-
-fn collect_fix_candidate_stats(
-    outcome: &FixOutcome,
-    runtime_options: LintFixRuntimeOptions,
-) -> FixCandidateStats {
-    let blocked_unsafe = if runtime_options.include_unsafe_fixes {
-        0
-    } else {
-        outcome.skipped_counts.unsafe_skipped
-    };
-    let blocked_display_only = outcome.skipped_counts.display_only;
-
-    let blocked_protected_range = outcome.skipped_counts.protected_range_blocked;
-    let blocked_overlap_conflict = outcome.skipped_counts.overlap_conflict_blocked;
-    let blocked =
-        blocked_unsafe + blocked_display_only + blocked_protected_range + blocked_overlap_conflict;
-    FixCandidateStats {
-        skipped: 0,
-        blocked,
-        blocked_unsafe,
-        blocked_display_only,
-        blocked_protected_range,
-        blocked_overlap_conflict,
-    }
-}
-
-fn is_mostly_unfixable_rule(code: &str) -> bool {
-    matches!(
-        code,
-        issue_codes::LINT_AL_003
-            | issue_codes::LINT_RF_002
-            | issue_codes::LINT_RF_004
-            | issue_codes::LINT_LT_005
-    )
-}
-
-fn is_mostly_unfixable_residual(after_counts: &BTreeMap<String, usize>) -> bool {
-    let mut total_remaining = 0usize;
-    let mut potentially_fixable_remaining = 0usize;
-
-    for (code, count) in after_counts {
-        if *count == 0 || code == issue_codes::PARSE_ERROR {
-            continue;
-        }
-        total_remaining += *count;
-        if !is_mostly_unfixable_rule(code) {
-            potentially_fixable_remaining += *count;
-        }
-    }
-
-    if total_remaining == 0 {
-        return false;
-    }
-
-    potentially_fixable_remaining <= MAX_RESIDUAL_POTENTIALLY_FIXABLE_FOR_STOP
-        && potentially_fixable_remaining * MOSTLY_UNFIXABLE_RATIO_DENOMINATOR <= total_remaining
 }
 
 fn main() -> ExitCode {
@@ -413,10 +161,12 @@ fn run_serve_mode(args: Args) -> ExitCode {
 /// and formats them in a sqlfluff-style report.
 fn run_lint(args: Args) -> Result<bool> {
     let started_at = Instant::now();
-    let fix_runtime_options = LintFixRuntimeOptions::from_args(&args);
+    let fix_runtime_options = lint_fix_runtime_options_from_args(&args);
 
     if !args.fix_only {
         validate_lint_output_format(args.format)?;
+    } else if !matches!(args.format, OutputFormat::Table) && !args.quiet {
+        eprintln!("flowscope: warning: --format is ignored with --fix-only");
     }
 
     let respect_gitignore = !args.no_respect_gitignore;
@@ -1275,24 +1025,7 @@ fn print_issues_to_stderr(result: &flowscope_core::AnalyzeResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        collect_fix_candidate_stats, is_mostly_unfixable_residual, parse_rule_configs_json,
-        LintFixRuntimeOptions,
-    };
-    use flowscope_cli::fix::{FixCounts, FixOutcome, FixSkippedCounts};
-    use flowscope_core::issue_codes;
-    use std::collections::BTreeMap;
-
-    fn sample_outcome(skipped_counts: FixSkippedCounts) -> FixOutcome {
-        FixOutcome {
-            sql: String::new(),
-            counts: FixCounts::default(),
-            changed: false,
-            skipped_due_to_comments: false,
-            skipped_due_to_regression: false,
-            skipped_counts,
-        }
-    }
+    use super::parse_rule_configs_json;
 
     #[test]
     fn parse_rule_configs_json_accepts_object_map() {
@@ -1347,75 +1080,5 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(2)
         );
-    }
-
-    #[test]
-    fn collect_fix_candidate_stats_always_counts_display_only_as_blocked() {
-        let outcome = sample_outcome(FixSkippedCounts {
-            unsafe_skipped: 1,
-            protected_range_blocked: 2,
-            overlap_conflict_blocked: 3,
-            display_only: 4,
-        });
-
-        let stats = collect_fix_candidate_stats(
-            &outcome,
-            LintFixRuntimeOptions {
-                include_unsafe_fixes: false,
-                legacy_ast_fixes: false,
-            },
-        );
-
-        assert_eq!(stats.skipped, 0);
-        assert_eq!(stats.blocked, 10);
-        assert_eq!(stats.blocked_unsafe, 1);
-        assert_eq!(stats.blocked_display_only, 4);
-        assert_eq!(stats.blocked_protected_range, 2);
-        assert_eq!(stats.blocked_overlap_conflict, 3);
-    }
-
-    #[test]
-    fn collect_fix_candidate_stats_excludes_unsafe_when_unsafe_fixes_enabled() {
-        let outcome = sample_outcome(FixSkippedCounts {
-            unsafe_skipped: 2,
-            protected_range_blocked: 1,
-            overlap_conflict_blocked: 1,
-            display_only: 3,
-        });
-
-        let stats = collect_fix_candidate_stats(
-            &outcome,
-            LintFixRuntimeOptions {
-                include_unsafe_fixes: true,
-                legacy_ast_fixes: false,
-            },
-        );
-
-        assert_eq!(stats.blocked, 5);
-        assert_eq!(stats.blocked_unsafe, 0);
-        assert_eq!(stats.blocked_display_only, 3);
-    }
-
-    #[test]
-    fn mostly_unfixable_residual_detects_dominated_known_residuals() {
-        let counts = BTreeMap::from([
-            (issue_codes::LINT_LT_005.to_string(), 140usize),
-            (issue_codes::LINT_RF_002.to_string(), 116usize),
-            (issue_codes::LINT_AL_003.to_string(), 43usize),
-            (issue_codes::LINT_RF_004.to_string(), 2usize),
-            (issue_codes::LINT_ST_009.to_string(), 1usize),
-        ]);
-        assert!(is_mostly_unfixable_residual(&counts));
-    }
-
-    #[test]
-    fn mostly_unfixable_residual_rejects_when_fixable_tail_is_material() {
-        let counts = BTreeMap::from([
-            (issue_codes::LINT_LT_005.to_string(), 20usize),
-            (issue_codes::LINT_RF_002.to_string(), 10usize),
-            (issue_codes::LINT_ST_009.to_string(), 8usize),
-            (issue_codes::LINT_LT_003.to_string(), 3usize),
-        ]);
-        assert!(!is_mostly_unfixable_residual(&counts));
     }
 }

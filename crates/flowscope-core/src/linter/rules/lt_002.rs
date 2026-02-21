@@ -3,6 +3,18 @@
 //! SQLFluff LT02 parity: flag structural indentation violations (clause
 //! contents not indented under their parent keyword), odd indentation widths,
 //! mixed tab/space indentation, and wrong indent style.
+//!
+//! ## Module layout
+//!
+//! This module is large (~5 000 lines) because the PostgreSQL structural
+//! indentation engine (`postgres_keyword_break_and_indent_edits` and
+//! `postgres_lt02_extra_issue_spans`) shares ~40 helper functions with the
+//! generic indentation detection.  A future submodule split into
+//! `lt_002/{mod, postgres}.rs` is tracked but deferred until the shared
+//! helpers can be cleanly separated.
+//!
+//! See `docs/plans/2026-02-18-lt02-indentation-engine-parity.md` for the
+//! parity design doc.
 
 use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
@@ -467,6 +479,15 @@ impl LintRule for LayoutIndent {
         vec![issue]
     }
 }
+
+// ---------------------------------------------------------------------------
+// PostgreSQL-specific structural indentation
+//
+// The two entry points below (`postgres_lt02_extra_issue_spans` and
+// `postgres_keyword_break_and_indent_edits`) implement keyword-break and
+// clause-shaping rules for Postgres SQL.  They share ~40 helpers with the
+// generic indentation engine defined further down in this file.
+// ---------------------------------------------------------------------------
 
 fn postgres_lt02_extra_issue_spans(
     statement_sql: &str,
@@ -2642,6 +2663,10 @@ fn paren_delta_simple(text: &str) -> isize {
         _ => acc,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Generic (dialect-agnostic) indentation detection and helpers
+// ---------------------------------------------------------------------------
 
 fn first_line_is_indented(ctx: &LintContext) -> bool {
     let statement_start = ctx.statement_range.start;
