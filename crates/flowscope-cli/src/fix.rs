@@ -22,7 +22,15 @@ use sqlparser::ast::*;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
+
+/// Compute a 64-bit hash of a string for cheap cycle detection.
+fn hash_sql(sql: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut h);
+    h.finish()
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[must_use]
@@ -157,15 +165,21 @@ const MOSTLY_UNFIXABLE_RATIO_DENOMINATOR: usize = 5;
 /// well under a second.
 const FIX_LOOP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Runtime configuration for the multi-pass lint-fix execution.
+///
+/// Maps CLI/API flags to the internal fix engine options.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LintFixRuntimeOptions {
     pub include_unsafe_fixes: bool,
     pub legacy_ast_fixes: bool,
 }
 
+/// Aggregate statistics about fix candidates that were skipped or blocked
+/// across all passes of a multi-pass lint-fix execution.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FixCandidateStats {
     pub skipped: usize,
+    /// Total blocked candidates (sum of all `blocked_*` fields).
     pub blocked: usize,
     pub blocked_unsafe: usize,
     pub blocked_display_only: usize,
@@ -188,6 +202,10 @@ impl FixCandidateStats {
     }
 }
 
+/// Result of a multi-pass lint-fix execution.
+///
+/// Combines the final [`FixOutcome`] with aggregate [`FixCandidateStats`]
+/// collected across all passes.
 #[derive(Debug, Clone)]
 pub struct LintFixExecution {
     pub outcome: FixOutcome,
@@ -382,6 +400,11 @@ pub fn apply_lint_fixes_with_options(
     )
 }
 
+/// Apply lint fixes using a bounded multi-pass loop with cascading fallback.
+///
+/// Each pass applies safe fixes and re-lints to capture cascading improvements.
+/// The loop terminates when no further progress is made, the pass budget is
+/// exhausted, or a hard wall-clock timeout is reached.
 pub fn apply_lint_fixes_with_runtime_options(
     sql: &str,
     dialect: Dialect,
@@ -401,8 +424,8 @@ pub fn apply_lint_fixes_with_runtime_options(
     let mut lt02_touched = false;
     let mut last_outcome = None;
     let mut cached_lint_state: Option<FixLintState> = None;
-    let mut seen_sql: HashSet<String> = HashSet::from([current_sql.clone()]);
-    let mut overlap_retried_sql: HashSet<String> = HashSet::new();
+    let mut seen_sql: HashSet<u64> = HashSet::from([hash_sql(&current_sql)]);
+    let mut overlap_retried_sql: HashSet<u64> = HashSet::new();
     let mut pass_limit = MAX_LINT_FIX_PASSES;
     let mut bonus_passes_granted = 0usize;
     let mut large_sql_lt02_extra_passes_granted = 0usize;
@@ -424,7 +447,7 @@ pub fn apply_lint_fixes_with_runtime_options(
         let post_lint_state = pass_result.post_lint_state;
 
         // Avoid oscillating between previously seen SQL states across passes.
-        if outcome.changed && !seen_sql.insert(outcome.sql.clone()) {
+        if outcome.changed && !seen_sql.insert(hash_sql(&outcome.sql)) {
             break;
         }
 
@@ -473,7 +496,7 @@ pub fn apply_lint_fixes_with_runtime_options(
             && !outcome.skipped_due_to_comments
             && !outcome.skipped_due_to_regression
             && outcome.skipped_counts.overlap_conflict_blocked > 0
-            && overlap_retried_sql.insert(current_sql.clone());
+            && overlap_retried_sql.insert(hash_sql(&current_sql));
 
         // Some files keep improving right at the bounded pass budget. Allow a
         // small number of extra cleanup passes to avoid near-miss leftovers.
@@ -537,14 +560,23 @@ fn collect_fix_candidate_stats(
     let blocked =
         blocked_unsafe + blocked_display_only + blocked_protected_range + blocked_overlap_conflict;
 
-    FixCandidateStats {
+    let stats = FixCandidateStats {
         skipped: 0,
         blocked,
         blocked_unsafe,
         blocked_display_only,
         blocked_protected_range,
         blocked_overlap_conflict,
-    }
+    };
+    debug_assert_eq!(
+        stats.blocked,
+        stats.blocked_unsafe
+            + stats.blocked_display_only
+            + stats.blocked_protected_range
+            + stats.blocked_overlap_conflict,
+        "blocked total must equal sum of blocked_* components"
+    );
+    stats
 }
 
 fn is_mostly_unfixable_rule(code: &str) -> bool {
@@ -1261,6 +1293,7 @@ fn regression_guard_total(counts: &BTreeMap<String, usize>) -> usize {
 /// Try core-only then incremental fallback plans, returning the first
 /// successful `FixPassResult`.  Used when the primary fix plan causes a
 /// regression (parse errors, rewrite guard, or masked/worse counts).
+#[allow(clippy::too_many_arguments)]
 fn try_fallback_fix(
     sql: &str,
     dialect: Dialect,
@@ -1477,6 +1510,7 @@ fn merge_skipped_counts(total: &mut FixSkippedCounts, current: &FixSkippedCounts
     total.display_only += current.display_only;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_incremental_core_fix_plan(
     sql: &str,
     dialect: Dialect,
@@ -1492,8 +1526,8 @@ fn try_incremental_core_fix_plan(
     let mut changed = false;
     let mut skipped_counts = FixSkippedCounts::default();
     let mut counts_cache: HashMap<String, BTreeMap<String, usize>> = HashMap::new();
-    let mut seen_sql = HashSet::new();
-    seen_sql.insert(current_sql.clone());
+    let mut seen_sql: HashSet<u64> = HashSet::new();
+    seen_sql.insert(hash_sql(&current_sql));
 
     let max_iterations = max_iterations.max(1);
     let max_rule_evaluations_per_iteration = max_rule_evaluations_per_iteration.max(1);
@@ -1626,7 +1660,7 @@ fn try_incremental_core_fix_plan(
         let Some(next_counts) = best_counts else {
             break;
         };
-        if !seen_sql.insert(next_sql.clone()) {
+        if !seen_sql.insert(hash_sql(&next_sql)) {
             break;
         }
 

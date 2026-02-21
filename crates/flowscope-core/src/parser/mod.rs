@@ -127,6 +127,13 @@ fn sanitize_trailing_comma_before_from(sql: &str) -> Option<String> {
     (rewritten != sql).then_some(rewritten)
 }
 
+fn push_current_char(sql: &str, i: &mut usize, out: &mut String) {
+    if let Some(ch) = sql[*i..].chars().next() {
+        out.push(ch);
+        *i += ch.len_utf8();
+    }
+}
+
 fn sanitize_ansi_national_literal_spacing(sql: &str) -> Option<String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ScanMode {
@@ -213,12 +220,10 @@ fn sanitize_ansi_national_literal_spacing(sql: &str) -> Option<String> {
                     }
                 }
 
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
             }
             ScanMode::SingleQuote => {
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
                 if b == b'\'' {
                     if next == Some(b'\'') {
                         out.push('\'');
@@ -229,36 +234,31 @@ fn sanitize_ansi_national_literal_spacing(sql: &str) -> Option<String> {
                 }
             }
             ScanMode::DoubleQuote => {
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
                 if b == b'"' {
                     mode = ScanMode::Outside;
                 }
             }
             ScanMode::BacktickQuote => {
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
                 if b == b'`' {
                     mode = ScanMode::Outside;
                 }
             }
             ScanMode::BracketQuote => {
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
                 if b == b']' {
                     mode = ScanMode::Outside;
                 }
             }
             ScanMode::LineComment => {
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
                 if b == b'\n' || b == b'\r' {
                     mode = ScanMode::Outside;
                 }
             }
             ScanMode::BlockComment => {
-                out.push(b as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
                 if b == b'*' && next == Some(b'/') {
                     out.push('/');
                     i += 1;
@@ -292,8 +292,7 @@ fn sanitize_bigquery_raw_double_quoted_literals(sql: &str) -> Option<String> {
             if start < i {
                 out.push_str(prefix);
             } else if i < bytes.len() {
-                out.push(bytes[i] as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut out);
             }
             continue;
         }
@@ -314,8 +313,7 @@ fn sanitize_bigquery_raw_double_quoted_literals(sql: &str) -> Option<String> {
                 i += 1;
                 break;
             }
-            body.push(bytes[i] as char);
-            i += 1;
+            push_current_char(sql, &mut i, &mut body);
         }
 
         if !closed {
@@ -418,8 +416,7 @@ fn rewrite_escaped_quoted_identifiers(sql: &str, delimiters: &[u8]) -> String {
                     break;
                 }
 
-                content.push(bytes[i] as char);
-                i += 1;
+                push_current_char(sql, &mut i, &mut content);
             }
 
             if !closed {
@@ -438,8 +435,7 @@ fn rewrite_escaped_quoted_identifiers(sql: &str, delimiters: &[u8]) -> String {
             continue;
         }
 
-        out.push(bytes[i] as char);
-        i += 1;
+        push_current_char(sql, &mut i, &mut out);
     }
 
     out
@@ -484,8 +480,7 @@ fn remove_trailing_comma_before_from(sql: &str) -> String {
             }
         }
 
-        out.push(bytes[i] as char);
-        i += 1;
+        push_current_char(sql, &mut i, &mut out);
     }
 
     out
@@ -632,6 +627,21 @@ mod tests {
         let output = parse_sql_with_dialect_output(sql, Dialect::Ansi).expect("parse");
         assert!(output.parser_fallback_used);
         assert_eq!(output.statements.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_trailing_comma_before_from_preserves_utf8() {
+        let sql = "SELECT café,\nFROM résumé";
+        let rewritten = remove_trailing_comma_before_from(sql);
+        assert_eq!(rewritten, "SELECT café\nFROM résumé");
+    }
+
+    #[test]
+    fn test_sanitize_escaped_identifiers_preserves_utf8() {
+        let sql = "SELECT naïve, `\\`id` FROM café";
+        let rewritten =
+            sanitize_escaped_identifiers_for_dialect(sql, Dialect::Bigquery).expect("rewrite");
+        assert_eq!(rewritten, "SELECT naïve, `_id` FROM café");
     }
 
     #[test]

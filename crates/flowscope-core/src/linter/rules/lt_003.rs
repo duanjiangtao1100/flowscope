@@ -284,6 +284,7 @@ fn line_ranges(sql: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
+#[allow(clippy::too_many_arguments)]
 fn safe_operator_autofix_edits(
     sql: &str,
     operator_idx: usize,

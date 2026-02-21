@@ -209,31 +209,31 @@ async fn lint_fix(
         rule_configs,
     };
 
-    let outcome = crate::fix::apply_lint_fixes_with_options(
+    let execution = crate::fix::apply_lint_fixes_with_runtime_options(
         &payload.sql,
         state.config.dialect,
         &lint_config,
-        crate::fix::FixOptions {
+        crate::fix::LintFixRuntimeOptions {
             include_unsafe_fixes: payload.unsafe_fixes,
-            include_rewrite_candidates: payload.legacy_ast_fixes,
+            legacy_ast_fixes: payload.legacy_ast_fixes,
         },
     )
     .map_err(|err| {
+        eprintln!("flowscope: lint-fix failed: {err}");
         (
             StatusCode::BAD_REQUEST,
-            format!("Failed to apply lint fixes: {err}"),
+            "Failed to apply lint fixes".to_string(),
         )
     })?;
+    let outcome = execution.outcome;
+    let candidate_stats = execution.candidate_stats;
 
     let skipped_counts = LintFixSkippedCountsResponse {
-        unsafe_skipped: outcome.skipped_counts.unsafe_skipped,
-        protected_range_blocked: outcome.skipped_counts.protected_range_blocked,
-        overlap_conflict_blocked: outcome.skipped_counts.overlap_conflict_blocked,
-        display_only: outcome.skipped_counts.display_only,
-        blocked_total: outcome.skipped_counts.unsafe_skipped
-            + outcome.skipped_counts.protected_range_blocked
-            + outcome.skipped_counts.overlap_conflict_blocked
-            + outcome.skipped_counts.display_only,
+        unsafe_skipped: candidate_stats.blocked_unsafe,
+        protected_range_blocked: candidate_stats.blocked_protected_range,
+        overlap_conflict_blocked: candidate_stats.blocked_overlap_conflict,
+        display_only: candidate_stats.blocked_display_only,
+        blocked_total: candidate_stats.blocked,
     };
 
     Ok(Json(LintFixResponse {

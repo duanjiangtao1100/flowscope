@@ -78,7 +78,7 @@ pub struct Args {
     pub show_fixes: bool,
 
     /// Comma-separated list of lint rule codes to exclude (e.g., LINT_AM_008,LINT_ST_006)
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, requires = "lint", value_delimiter = ',')]
     pub exclude_rules: Vec<String>,
 
     /// JSON object for per-rule lint options keyed by rule reference
@@ -433,6 +433,17 @@ mod tests {
             "test.sql",
         ]);
         assert_eq!(args.exclude_rules, vec!["LINT_AM_008", "LINT_ST_006"]);
+    }
+
+    #[test]
+    fn test_lint_exclude_rules_requires_lint() {
+        let result = Args::try_parse_from([
+            "flowscope",
+            "--exclude-rules",
+            "LINT_AM_008,LINT_ST_006",
+            "test.sql",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

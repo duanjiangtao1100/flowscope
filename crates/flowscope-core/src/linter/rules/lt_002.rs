@@ -647,26 +647,26 @@ fn postgres_lt02_extra_issue_spans(
             set_block_expected_indent = Some(expected_set_indent + indent_unit);
         }
 
-        if is_join_clause(first, second) {
-            if should_break_inline_join_on(&scans, idx, first, second, &upper) {
-                if let Some(on_offset) = inline_join_on_offset(line.trimmed) {
-                    push_trimmed_offset_issue_span(
-                        &mut issue_spans,
-                        &line_infos,
-                        idx,
-                        on_offset,
-                        sql_len,
-                    );
-                }
-                push_join_on_block_indent_spans(
+        if is_join_clause(first, second)
+            && should_break_inline_join_on(&scans, idx, first, second, &upper)
+        {
+            if let Some(on_offset) = inline_join_on_offset(line.trimmed) {
+                push_trimmed_offset_issue_span(
                     &mut issue_spans,
                     &line_infos,
-                    &scans,
                     idx,
-                    indent_unit,
+                    on_offset,
                     sql_len,
                 );
             }
+            push_join_on_block_indent_spans(
+                &mut issue_spans,
+                &line_infos,
+                &scans,
+                idx,
+                indent_unit,
+                sql_len,
+            );
         }
 
         if matches!(first, Some("SELECT")) {

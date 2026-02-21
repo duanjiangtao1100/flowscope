@@ -14,8 +14,9 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use flowscope_cli::fix::{apply_lint_fixes_with_runtime_options, LintFixRuntimeOptions};
 use flowscope_cli::server::{build_router, state::AppState, state::ServerConfig};
-use flowscope_core::{Dialect, FileSource};
+use flowscope_core::{Dialect, FileSource, LintConfig};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -225,6 +226,63 @@ async fn split_multiple_statements() {
 }
 
 // === Lint fix endpoint tests ===
+
+#[tokio::test]
+async fn lint_fix_matches_shared_runtime_pipeline_for_cascading_sql() {
+    let state = test_state(default_config(), vec![]);
+    let app = build_router(state, 3000);
+    let sql = "SELECT a +\n b FROM t";
+
+    let (status, json) = post_json(
+        &app,
+        "/api/lint-fix",
+        json!({
+            "sql": sql
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let expected = apply_lint_fixes_with_runtime_options(
+        sql,
+        Dialect::Generic,
+        &LintConfig {
+            enabled: true,
+            disabled_rules: vec![],
+            rule_configs: std::collections::BTreeMap::new(),
+        },
+        LintFixRuntimeOptions {
+            include_unsafe_fixes: false,
+            legacy_ast_fixes: false,
+        },
+    )
+    .expect("runtime lint-fix result");
+
+    assert_eq!(json["sql"], expected.outcome.sql);
+    assert_eq!(json["changed"], expected.outcome.changed);
+    assert_eq!(json["fix_counts"]["total"], expected.outcome.counts.total());
+    assert_eq!(
+        json["skipped_counts"]["unsafe_skipped"],
+        expected.candidate_stats.blocked_unsafe
+    );
+    assert_eq!(
+        json["skipped_counts"]["protected_range_blocked"],
+        expected.candidate_stats.blocked_protected_range
+    );
+    assert_eq!(
+        json["skipped_counts"]["overlap_conflict_blocked"],
+        expected.candidate_stats.blocked_overlap_conflict
+    );
+    assert_eq!(
+        json["skipped_counts"]["display_only"],
+        expected.candidate_stats.blocked_display_only
+    );
+    assert_eq!(
+        json["skipped_counts"]["blocked_total"],
+        expected.candidate_stats.blocked
+    );
+}
 
 #[tokio::test]
 async fn lint_fix_applies_safe_fix_and_reports_counts() {
@@ -1098,10 +1156,12 @@ async fn lint_fix_applies_rf004_core_autofix_in_patch_mode() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["changed"], true);
-    assert_eq!(
-        json["sql"].as_str().unwrap(),
-        "select a from users AS alias_select\n",
-        "expected RF004 core autofix to rewrite keyword table alias safely"
+    let fixed = json["sql"].as_str().unwrap();
+    // Multi-pass: RF004 renames the keyword alias, then a subsequent pass
+    // removes the now-unreferenced alias entirely.
+    assert!(
+        !fixed.contains(" as select") && !fixed.contains(" AS select"),
+        "expected RF004 core autofix to eliminate keyword table alias: {fixed}"
     );
 }
 
