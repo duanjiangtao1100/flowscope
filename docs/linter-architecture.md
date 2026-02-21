@@ -1,17 +1,18 @@
 # Linter Architecture Design
 
-Status: In progress  
-Owner: `flowscope-core`  
-Last updated: 2026-02-13
+Status: Active
+Owner: `flowscope-core`
+Last updated: 2026-02-21
 
 ## Context
 
-FlowScope currently ships:
+FlowScope ships 72 lint rules across 9 families (AL, AM, CP, CV, JJ, LT, RF, ST, TQ),
+each implemented in a dedicated one-rule-per-file module under `linter/rules/`.
 
-- 15 core lint rules implemented as dedicated AST rules.
-- 57 SQLFluff parity rules, many implemented in a single parity module with regex or heuristic matching.
-
-This gave strong coverage quickly, but it is not the long-term architecture for an industry-standard linter.
+The linter started with a handful of core AST rules plus a monolithic `parity.rs` that
+used regex/heuristic matching for SQLFluff compatibility. That monolith has been fully
+decommissioned — all rules are now in dedicated modules using AST-driven or
+token-stream-driven implementations.
 
 ## Goals
 
@@ -113,7 +114,7 @@ Rule metadata should include whether a deterministic fix is supported.
 - No inferred fix logic from message text.
 - Fix support should be explicit and tested per rule.
 
-## Proposed Execution Pipeline
+## Execution Pipeline
 
 1. Parse SQL into statements with selected dialect.
 2. Tokenize full source with token spans.
@@ -125,40 +126,41 @@ Rule metadata should include whether a deterministic fix is supported.
 
 ## Migration Plan
 
-## Phase 0: Foundation
+## Phase 0: Foundation [COMPLETE]
 
-- Add `LintDocument` and engine scaffolding.
-- Add token stream provider in lint pipeline.
-- Keep current rules running unchanged via adapter layer.
+- `LintDocument` model, tokenization pass, and document-level lint execution path are live.
+- Token stream provider propagated through rule context (`parse once, tokenize once`).
 
-## Phase 1: High-risk semantic migrations
+## Phase 1: High-risk semantic migrations [COMPLETE]
 
-Migrate semantic-heavy heuristic rules first:
-- references (`RF_001`, `RF_002`, `RF_003`)
-- structure join/constant/unused checks (`ST_009`, `ST_010`, `ST_011`)
-- ambiguous join/reference rules (`AM_006` to `AM_009`)
-- convention join condition (`CV_012`)
+All semantic-heavy rules migrated to AST-driven implementations:
+- references (`RF_001`–`RF_006`)
+- structure checks (`ST_001`–`ST_012`)
+- ambiguous join/reference rules (`AM_001`–`AM_009`)
+- convention rules (`CV_001`–`CV_012`)
+- aliasing rules (`AL_001`–`AL_009`)
 
-## Phase 2: Lexical/style migrations
+## Phase 2: Lexical/style migrations [COMPLETE]
 
-Move style-oriented checks to lexical engine:
-- capitalization (`CP_*`)
-- layout (`LT_*`)
-- jinja padding (`JJ_001`)
-- selected convention style rules (`CV_007`, `CV_010`, `CV_011`)
+All style-oriented checks migrated to dedicated modules:
+- capitalization (`CP_001`–`CP_005`) — tokenizer-driven
+- layout (`LT_001`–`LT_015`) — tokenizer/line-aware checks
+- jinja padding (`JJ_001`) — delimiter scanning
+- TSQL checks (`TQ_001`–`TQ_003`) — AST/token-driven
 
-## Phase 3: Decommission parity monolith
+Remaining work: SQLFluff configuration-depth parity gaps for some CP/LT/JJ rules.
 
-- Remove migrated rules from `parity.rs`.
-- Keep only temporary compatibility shims if needed.
-- Delete shims after equivalent rule quality gates are met.
+## Phase 3: Decommission parity monolith [COMPLETE]
 
-## Progress Snapshot (2026-02-12)
+- `parity.rs` retired and deleted.
+- All 72 rules live in one-rule-per-file modules under `linter/rules/`.
+
+## Progress Snapshot
 
 - [x] Phase 0 foundation shipped: `LintDocument` model, tokenization pass, and document-level lint execution path are live.
 - [x] Engine split is active in linter orchestration: semantic + lexical + document passes run with deterministic sort/dedupe.
 - [x] Issue provenance metadata is implemented (`lint_engine`, `lint_confidence`, `lint_fallback_source`).
-- [x] Phase 1 AST migrations landed for: `AM_002`, `AM_004`-`AM_009`, `CV_001`, `CV_012`, `RF_001`-`RF_003`, `ST_003`, `ST_009`-`ST_011`.
+- [x] Phase 1 AST migrations landed for: `AM_001`-`AM_009`, `CV_001`-`CV_012`, `RF_001`-`RF_006`, `ST_001`-`ST_012`, `AL_001`-`AL_009`.
 - [x] `LINT_AM_009` now follows SQLFluff AM09 semantics via AST query-clause analysis, flagging LIMIT/OFFSET usage without ORDER BY across top-level and nested SELECTs.
 - [x] `LINT_AM_004` now follows SQLFluff AM04 semantics via AST output-width analysis, flagging queries whose result column count is unknown due to unresolved wildcard expansion (`*`/`alias.*`) across CTE/subquery/set-operation scopes, and now resolves wildcard width through declared CTE column lists, table-factor alias column lists (`AS alias(col1, ...)`), and aliased nested-join factors (including `USING(...)` width deduction plus `NATURAL JOIN` overlap deduction when both sides expose deterministic output column names).
 - [x] `LINT_AM_002` now follows SQLFluff AM02 core semantics by flagging bare `UNION` (without explicit `ALL`/`DISTINCT`), with CLI fixer behavior inserting explicit `DISTINCT` through AST set-operation quantifier rewrites (text-regex path removed), and dialect-scoped execution aligned to SQLFluff-supported dialects available in FlowScope.
@@ -224,8 +226,8 @@ Move style-oriented checks to lexical engine:
 - [x] `LINT_CV_012` now broadens AST join-operator handling to include `INNER JOIN` forms represented as `JoinOperator::Inner` without `ON/USING`, and now aligns closer to SQLFluff CV12 chain semantics by flagging only when all naked joins in a join chain are represented via WHERE join predicates.
 - [x] `LINT_AM_007` now performs AST set-expression branch-width checks with deterministic wildcard resolution for CTE/derived sources (including declared CTE column lists and table-factor alias column lists) and aliased nested-join factors (including `USING(...)` width deduction plus `NATURAL JOIN` overlap deduction when both sides expose deterministic output column names), while unresolved wildcard expansions remain non-violating (SQLFluff-aligned behavior).
 - [x] Parity monolith decommission is complete: migrated rule registrations and parity tests are removed, and `crates/flowscope-core/src/linter/rules/parity.rs` has been retired.
-- [~] SQLFluff fixture adoption is in progress for migrated rules; AM02/AM03/AM04/AM05/AM06/AM07/AM08/AM09, CV02, CV05, ST02, ST04, ST06, ST07, ST08, and ST09 fixture cases were adopted for `LINT_AM_002`/`LINT_AM_003`/`LINT_AM_004`/`LINT_AM_005`/`LINT_AM_006`/`LINT_AM_007`/`LINT_AM_008`/`LINT_AM_009`/`LINT_CV_002`/`LINT_CV_005`/`LINT_ST_002`/`LINT_ST_004`/`LINT_ST_007`/`LINT_ST_006`/`LINT_ST_008`/`LINT_ST_009`, and additional rule-level coverage is still being expanded.
-- [ ] Phase 2 lexical/style migrations remain open for semantic-depth parity improvements (token-aware behavior/configuration parity), with remaining major lexical work centered on LT/JJ families and SQLFluff configuration-depth gaps across CP/LT/JJ.
+- [~] SQLFluff fixture adoption is in progress; AM, CV, ST fixture cases adopted for most semantic rules. Additional rule-level coverage is still being expanded.
+- [~] SQLFluff parity quality gaps remain for a subset of rules. See `docs/sqlfluff-gap-matrix.md` for the current status of per-rule parity deltas.
 
 ## Quality Gates
 
@@ -246,12 +248,13 @@ Each migrated rule must pass:
 - Mitigation: dialect-specific behavior tables and confidence downgrade on fallback paths.
 
 3. Migration churn and temporary duplicate logic
-- Mitigation: phased rule-by-rule migration with adapter compatibility layer.
+- Resolved: phased rule-by-rule migration completed; parity monolith retired.
 
 ## Success Criteria
 
-- All semantic rules run through AST/scope engine.
-- All style/layout rules run through lexical/document engines.
-- `parity.rs` no longer acts as a long-term rule home.
-- Rule additions are modular, testable, and engine-scoped by default.
-- Lint output quality and determinism improve while preserving stable public rule codes.
+- [x] All semantic rules run through AST/scope engine.
+- [x] All style/layout rules run through lexical/document engines.
+- [x] `parity.rs` no longer acts as a rule home.
+- [x] Rule additions are modular, testable, and engine-scoped by default.
+- [~] Lint output quality and determinism improve while preserving stable public rule codes.
+- [ ] Close remaining SQLFluff parity gaps (see `docs/sqlfluff-gap-matrix.md`).
