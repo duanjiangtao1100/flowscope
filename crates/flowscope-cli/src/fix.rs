@@ -329,7 +329,7 @@ fn apply_lint_fixes_with_options_internal(
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT: usize = 24;
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL: usize = 12;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
-    const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 2;
+    const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 1;
     const INCREMENTAL_MAX_RULE_EVALUATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 2;
     let is_large_sql = sql.len() >= INCREMENTAL_LARGE_SQL_THRESHOLD;
     let incremental_parse_error_iterations = if is_large_sql {
