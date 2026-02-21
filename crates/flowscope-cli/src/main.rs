@@ -162,6 +162,12 @@ fn apply_lint_fixes_with_runtime_options(
         }
         let lt_cleanup_progress = outcome.counts.get(issue_codes::LINT_LT_003) > 0
             || outcome.counts.get(issue_codes::LINT_LT_002) > 0;
+        let lt02_remaining = post_lint_state
+            .counts()
+            .get(issue_codes::LINT_LT_002)
+            .copied()
+            .unwrap_or(0)
+            > 0;
         let residual_is_mostly_unfixable = is_mostly_unfixable_residual(post_lint_state.counts());
 
         if outcome.changed {
@@ -207,7 +213,7 @@ fn apply_lint_fixes_with_runtime_options(
             && bonus_passes_granted >= MAX_LINT_FIX_BONUS_PASSES
             && large_sql_lt02_extra_passes_granted < MAX_LINT_FIX_LARGE_SQL_LT02_EXTRA_PASSES
             && current_sql.len() >= LINT_FIX_LARGE_SQL_LT02_EXTRA_PASS_THRESHOLD
-            && lt02_touched
+            && lt02_remaining
         {
             pass_limit += 1;
             large_sql_lt02_extra_passes_granted += 1;
