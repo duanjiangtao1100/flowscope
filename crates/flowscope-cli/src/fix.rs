@@ -20,6 +20,7 @@ use flowscope_core::{TemplateConfig, TemplateMode};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::*;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -505,6 +506,7 @@ fn apply_lint_fixes_with_options_internal(
             dialect,
             lint_config,
             &before_counts,
+            Some(before_issues.as_slice()),
             fix_options.include_unsafe_fixes,
             incremental_parse_error_iterations,
             incremental_parse_error_rule_evaluations,
@@ -560,6 +562,7 @@ fn apply_lint_fixes_with_options_internal(
             dialect,
             lint_config,
             &before_counts,
+            Some(before_issues.as_slice()),
             fix_options.include_unsafe_fixes,
             incremental_default_iterations,
             usize::MAX,
@@ -605,6 +608,7 @@ fn apply_lint_fixes_with_options_internal(
             dialect,
             lint_config,
             &before_counts,
+            Some(before_issues.as_slice()),
             fix_options.include_unsafe_fixes,
             incremental_default_iterations,
             usize::MAX,
@@ -653,6 +657,7 @@ fn apply_lint_fixes_with_options_internal(
             dialect,
             lint_config,
             &after_counts,
+            Some(after_lint_state.issues.as_slice()),
             fix_options.include_unsafe_fixes,
             incremental_overlap_recovery_iterations,
             incremental_overlap_recovery_rule_evaluations,
@@ -1177,6 +1182,7 @@ fn try_incremental_core_fix_plan(
     dialect: Dialect,
     lint_config: &LintConfig,
     before_counts: &BTreeMap<String, usize>,
+    initial_issues: Option<&[Issue]>,
     allow_unsafe: bool,
     max_iterations: usize,
     max_rule_evaluations_per_iteration: usize,
@@ -1191,8 +1197,13 @@ fn try_incremental_core_fix_plan(
 
     let max_iterations = max_iterations.max(1);
     let max_rule_evaluations_per_iteration = max_rule_evaluations_per_iteration.max(1);
+    let mut initial_issues = initial_issues;
     for _ in 0..max_iterations {
-        let issues = lint_issues(&current_sql, dialect, lint_config);
+        let issues: Cow<'_, [Issue]> = if let Some(issues) = initial_issues.take() {
+            Cow::Borrowed(issues)
+        } else {
+            Cow::Owned(lint_issues(&current_sql, dialect, lint_config))
+        };
         let mut all_candidates = build_fix_candidates_from_issue_autofixes(&current_sql, &issues);
         all_candidates.extend(build_al001_fallback_candidates(
             &current_sql,
@@ -5130,6 +5141,7 @@ mod tests {
             Dialect::Generic,
             &lint_config,
             &before_counts,
+            None,
             false,
             24,
             usize::MAX,
