@@ -329,6 +329,7 @@ fn apply_lint_fixes_with_options_internal(
     const INCREMENTAL_MAX_ITERATIONS_DEFAULT_LARGE_SQL: usize = 12;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY: usize = 8;
     const INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 2;
+    const INCREMENTAL_MAX_RULE_EVALUATIONS_OVERLAP_RECOVERY_LARGE_SQL: usize = 4;
     let is_large_sql = sql.len() >= INCREMENTAL_LARGE_SQL_THRESHOLD;
     let incremental_parse_error_iterations = if is_large_sql {
         INCREMENTAL_MAX_ITERATIONS_PARSE_ERROR_LARGE_SQL
@@ -349,6 +350,11 @@ fn apply_lint_fixes_with_options_internal(
         INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY_LARGE_SQL
     } else {
         INCREMENTAL_MAX_ITERATIONS_OVERLAP_RECOVERY
+    };
+    let incremental_overlap_recovery_rule_evaluations = if is_large_sql {
+        INCREMENTAL_MAX_RULE_EVALUATIONS_OVERLAP_RECOVERY_LARGE_SQL
+    } else {
+        usize::MAX
     };
     let rule_filter = RuleFilter::from_lint_config(lint_config);
 
@@ -649,7 +655,7 @@ fn apply_lint_fixes_with_options_internal(
             &after_counts,
             fix_options.include_unsafe_fixes,
             incremental_overlap_recovery_iterations,
-            usize::MAX,
+            incremental_overlap_recovery_rule_evaluations,
         ) {
             profile.record("incremental_overlap_recovery", stage_started);
             merge_skipped_counts(&mut skipped_counts, &incremental.skipped_counts);
