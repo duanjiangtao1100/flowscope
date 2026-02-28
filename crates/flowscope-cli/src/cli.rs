@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[command(about = "Analyze SQL files for data lineage", long_about = None)]
 #[command(version)]
 pub struct Args {
-    /// SQL files to analyze (reads from stdin if none provided)
+    /// SQL files to analyze (reads from stdin if none provided; --lint also accepts directories)
     #[arg(value_name = "FILES")]
     pub files: Vec<PathBuf>,
 
@@ -52,6 +52,52 @@ pub struct Args {
     /// Graph detail level for mermaid output
     #[arg(short, long, default_value = "table", value_enum)]
     pub view: ViewMode,
+
+    /// Run SQL linter and report violations
+    #[arg(long)]
+    pub lint: bool,
+
+    /// Apply deterministic SQL lint auto-fixes in place (requires --lint)
+    #[arg(long, requires = "lint")]
+    pub fix: bool,
+
+    /// Apply fixes only and skip post-fix lint reporting (requires --lint and --fix)
+    #[arg(long, requires_all = ["lint", "fix"])]
+    pub fix_only: bool,
+
+    /// Include unsafe lint auto-fixes (requires --lint and --fix)
+    #[arg(long, requires_all = ["lint", "fix"])]
+    pub unsafe_fixes: bool,
+
+    /// Enable legacy AST-based lint rewrites (opt-in; defaults to off)
+    #[arg(long, requires_all = ["lint", "fix"])]
+    pub legacy_ast_fixes: bool,
+
+    /// Show blocked/display-only fix candidates in lint mode (requires --lint)
+    #[arg(long, requires = "lint")]
+    pub show_fixes: bool,
+
+    /// Comma-separated list of lint rule codes to exclude (e.g., LINT_AM_008,LINT_ST_006)
+    #[arg(long, requires = "lint", value_delimiter = ',')]
+    pub exclude_rules: Vec<String>,
+
+    /// JSON object for per-rule lint options keyed by rule reference
+    /// (e.g., '{"structure.subquery":{"forbid_subquery_in":"both"}}')
+    #[arg(long, requires = "lint", value_name = "JSON")]
+    pub rule_configs: Option<String>,
+
+    /// Number of worker threads to use for lint/fix file processing
+    #[arg(
+        long,
+        requires = "lint",
+        value_name = "N",
+        value_parser = parse_positive_usize
+    )]
+    pub jobs: Option<usize>,
+
+    /// Disable `.gitignore` and standard ignore-file filtering during lint path discovery
+    #[arg(long, requires = "lint")]
+    pub no_respect_gitignore: bool,
 
     /// Suppress warnings on stderr
     #[arg(short, long)]
@@ -99,6 +145,7 @@ pub enum DialectArg {
     Ansi,
     Bigquery,
     Clickhouse,
+    #[value(alias = "sparksql")]
     Databricks,
     Duckdb,
     Hive,
@@ -151,6 +198,16 @@ pub enum OutputFormat {
     Duckdb,
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{value}', expected a positive integer"))?;
+    if parsed == 0 {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
 /// Template mode for SQL preprocessing
 #[cfg(feature = "templating")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -192,6 +249,14 @@ mod tests {
     fn test_dialect_conversion() {
         let dialect: flowscope_core::Dialect = DialectArg::Postgres.into();
         assert_eq!(dialect, flowscope_core::Dialect::Postgres);
+    }
+
+    #[test]
+    fn test_sparksql_dialect_alias_maps_to_databricks() {
+        let args = Args::parse_from(["flowscope", "-d", "sparksql", "test.sql"]);
+        assert_eq!(args.dialect, DialectArg::Databricks);
+        let core_dialect: flowscope_core::Dialect = args.dialect.into();
+        assert_eq!(core_dialect, flowscope_core::Dialect::Databricks);
     }
 
     #[test]
@@ -237,6 +302,193 @@ mod tests {
         assert!(args.quiet);
         assert!(args.compact);
         assert_eq!(args.files.len(), 2);
+    }
+
+    #[test]
+    fn test_lint_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "test.sql"]);
+        assert!(args.lint);
+        assert!(!args.fix);
+        assert!(!args.fix_only);
+        assert!(!args.unsafe_fixes);
+        assert!(!args.legacy_ast_fixes);
+        assert!(!args.show_fixes);
+        assert!(args.exclude_rules.is_empty());
+        assert!(args.rule_configs.is_none());
+        assert!(args.jobs.is_none());
+        assert!(!args.no_respect_gitignore);
+    }
+
+    #[test]
+    fn test_lint_fix_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--fix", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(!args.fix_only);
+        assert!(!args.unsafe_fixes);
+        assert!(!args.legacy_ast_fixes);
+        assert!(!args.show_fixes);
+    }
+
+    #[test]
+    fn test_fix_only_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--fix", "--fix-only", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(args.fix_only);
+    }
+
+    #[test]
+    fn test_fix_only_requires_lint_and_fix() {
+        let missing_both = Args::try_parse_from(["flowscope", "--fix-only", "test.sql"]);
+        assert!(missing_both.is_err());
+
+        let missing_fix = Args::try_parse_from(["flowscope", "--lint", "--fix-only", "test.sql"]);
+        assert!(missing_fix.is_err());
+    }
+
+    #[test]
+    fn test_fix_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--fix", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unsafe_fixes_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--fix", "--unsafe-fixes", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(args.unsafe_fixes);
+    }
+
+    #[test]
+    fn test_unsafe_fixes_requires_lint_and_fix() {
+        let missing_both = Args::try_parse_from(["flowscope", "--unsafe-fixes", "test.sql"]);
+        assert!(missing_both.is_err());
+
+        let missing_fix =
+            Args::try_parse_from(["flowscope", "--lint", "--unsafe-fixes", "test.sql"]);
+        assert!(missing_fix.is_err());
+    }
+
+    #[test]
+    fn test_legacy_ast_fixes_flag() {
+        let args = Args::parse_from([
+            "flowscope",
+            "--lint",
+            "--fix",
+            "--legacy-ast-fixes",
+            "test.sql",
+        ]);
+        assert!(args.lint);
+        assert!(args.fix);
+        assert!(args.legacy_ast_fixes);
+    }
+
+    #[test]
+    fn test_legacy_ast_fixes_requires_lint_and_fix() {
+        let missing_both = Args::try_parse_from(["flowscope", "--legacy-ast-fixes", "test.sql"]);
+        assert!(missing_both.is_err());
+
+        let missing_fix =
+            Args::try_parse_from(["flowscope", "--lint", "--legacy-ast-fixes", "test.sql"]);
+        assert!(missing_fix.is_err());
+    }
+
+    #[test]
+    fn test_show_fixes_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--show-fixes", "test.sql"]);
+        assert!(args.lint);
+        assert!(args.show_fixes);
+    }
+
+    #[test]
+    fn test_show_fixes_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--show-fixes", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lint_exclude_rules() {
+        let args = Args::parse_from([
+            "flowscope",
+            "--lint",
+            "--exclude-rules",
+            "LINT_AM_008,LINT_ST_006",
+            "test.sql",
+        ]);
+        assert!(args.lint);
+        assert_eq!(args.exclude_rules, vec!["LINT_AM_008", "LINT_ST_006"]);
+    }
+
+    #[test]
+    fn test_lint_exclude_rules_repeated() {
+        let args = Args::parse_from([
+            "flowscope",
+            "--lint",
+            "--exclude-rules",
+            "LINT_AM_008",
+            "--exclude-rules",
+            "LINT_ST_006",
+            "test.sql",
+        ]);
+        assert_eq!(args.exclude_rules, vec!["LINT_AM_008", "LINT_ST_006"]);
+    }
+
+    #[test]
+    fn test_lint_exclude_rules_requires_lint() {
+        let result = Args::try_parse_from([
+            "flowscope",
+            "--exclude-rules",
+            "LINT_AM_008,LINT_ST_006",
+            "test.sql",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lint_rule_configs_json() {
+        let args = Args::parse_from([
+            "flowscope",
+            "--lint",
+            "--rule-configs",
+            r#"{"structure.subquery":{"forbid_subquery_in":"both"}}"#,
+            "test.sql",
+        ]);
+        assert_eq!(
+            args.rule_configs.as_deref(),
+            Some(r#"{"structure.subquery":{"forbid_subquery_in":"both"}}"#)
+        );
+    }
+
+    #[test]
+    fn test_lint_jobs_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--jobs", "4", "test.sql"]);
+        assert_eq!(args.jobs, Some(4));
+    }
+
+    #[test]
+    fn test_lint_jobs_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--jobs", "4", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lint_jobs_must_be_positive() {
+        let result = Args::try_parse_from(["flowscope", "--lint", "--jobs", "0", "test.sql"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_lint_no_respect_gitignore_flag() {
+        let args = Args::parse_from(["flowscope", "--lint", "--no-respect-gitignore", "test.sql"]);
+        assert!(args.no_respect_gitignore);
+    }
+
+    #[test]
+    fn test_lint_no_respect_gitignore_requires_lint() {
+        let result = Args::try_parse_from(["flowscope", "--no-respect-gitignore", "test.sql"]);
+        assert!(result.is_err());
     }
 
     #[cfg(feature = "serve")]

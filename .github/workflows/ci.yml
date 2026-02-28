@@ -44,6 +44,72 @@ jobs:
       - name: Verify API schema snapshot
         run: cargo test -p flowscope-core --test schema_guard --locked
 
+  cli-fix-perf:
+    name: CLI Fix Perf Gate
+    runs-on: ubuntu-latest
+    env:
+      CLI_FIX_PERF_BUDGET_MS: 5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-cli-fix-perf-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build CLI release binary
+        run: cargo build -p flowscope-cli --release --locked
+
+      - name: Benchmark CLI fix batch performance
+        run: |
+          python3 scripts/sql-corpus-fix-benchmark.py \
+            --sql-dir crates/flowscope-core/tests/fixtures/postgres \
+            --dialect postgres \
+            --mode batch \
+            --json-output /tmp/fs_cli_fix_perf.json
+
+      - name: Enforce perf budget
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import os
+
+          report = pathlib.Path('/tmp/fs_cli_fix_perf.json')
+          payload = json.loads(report.read_text())
+          elapsed_ms = float(payload['result']['elapsed_ms'])
+          budget_ms = float(os.environ['CLI_FIX_PERF_BUDGET_MS'])
+          print(f'CLI fix batch elapsed={elapsed_ms:.3f}ms (budget={budget_ms:.1f}ms)')
+          summary = pathlib.Path('/tmp/fs_cli_fix_perf_summary.txt')
+          summary.write_text(
+              f'elapsed_ms={elapsed_ms:.3f}\n'
+              f'budget_ms={budget_ms:.1f}\n'
+              f'sql_dir={payload["sql_dir"]}\n'
+          )
+          if elapsed_ms > budget_ms:
+              raise SystemExit(
+                  f'CLI fix performance regression: elapsed {elapsed_ms:.3f}ms exceeds budget {budget_ms:.1f}ms'
+              )
+          PY
+
+      - name: Upload perf telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-fix-perf
+          path: |
+            /tmp/fs_cli_fix_perf.json
+            /tmp/fs_cli_fix_perf_summary.txt
+
   wasm-build:
     name: WASM Build
     runs-on: ubuntu-latest

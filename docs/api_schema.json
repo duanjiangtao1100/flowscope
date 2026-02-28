@@ -118,6 +118,17 @@
           "hideCtes": {
             "description": "Hide CTEs from output, creating bypass edges (A→CTE→B becomes A→B)",
             "type": ["boolean", "null"]
+          },
+          "lint": {
+            "description": "SQL lint configuration",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/LintConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -140,6 +151,29 @@
             "const": "column"
           }
         ]
+      },
+      "LintConfig": {
+        "description": "Configuration for the SQL linter.\n\nControls which lint rules are enabled/disabled. By default, all rules are enabled.",
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "description": "Master toggle for linting (default: true).",
+            "type": "boolean",
+            "default": true
+          },
+          "disabledRules": {
+            "description": "List of rule codes to disable (e.g., [\"LINT_AM_008\"]).",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "ruleConfigs": {
+            "description": "Per-rule option objects keyed by rule reference (`LINT_*`, `AL01`,\n`aliasing.table`, etc).",
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
       },
       "SchemaMetadata": {
         "description": "Schema metadata for accurate column and table resolution.\n\nWhen provided, allows the analyzer to resolve ambiguous references and\nproduce more accurate lineage information.",
@@ -990,6 +1024,10 @@
             "description": "Human-readable error message",
             "type": "string"
           },
+          "sqlfluffName": {
+            "description": "SQLFluff dotted rule name (e.g., `aliasing.table`).",
+            "type": ["string", "null"]
+          },
           "span": {
             "description": "Optional: location in source SQL where issue occurred",
             "anyOf": [
@@ -1010,6 +1048,50 @@
           "sourceName": {
             "description": "Optional: source file name where the issue occurred",
             "type": ["string", "null"]
+          },
+          "lintEngine": {
+            "description": "Optional: linter engine provenance (`semantic`, `lexical`, `document`).",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/LintEngine"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lintConfidence": {
+            "description": "Optional: confidence level for lint detection quality.",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/LintConfidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lintFallbackSource": {
+            "description": "Optional: fallback mode used while evaluating this lint.",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/LintFallbackSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "autofix": {
+            "description": "Optional: autofix metadata for this issue.",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/IssueAutofix"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": ["severity", "code", "message"]
@@ -1017,6 +1099,82 @@
       "Severity": {
         "type": "string",
         "enum": ["error", "warning", "info"]
+      },
+      "LintEngine": {
+        "description": "Lint execution engine category.",
+        "type": "string",
+        "enum": ["semantic", "lexical", "document"]
+      },
+      "LintConfidence": {
+        "description": "Confidence level attached to lint findings.",
+        "type": "string",
+        "enum": ["high", "medium", "low"]
+      },
+      "LintFallbackSource": {
+        "description": "Source of degraded lint confidence or fallback behavior.",
+        "type": "string",
+        "enum": ["parser_fallback", "tokenizer_fallback", "heuristic_rule"]
+      },
+      "IssueAutofix": {
+        "description": "Autofix metadata attached to an issue.",
+        "type": "object",
+        "properties": {
+          "applicability": {
+            "description": "Applicability category for this fix.",
+            "allOf": [
+              {
+                "$ref": "#/definitions/IssueAutofixApplicability"
+              }
+            ]
+          },
+          "edits": {
+            "description": "Edits required to apply this fix.",
+            "type": "array",
+            "items": {
+              "$ref": "#/definitions/IssuePatchEdit"
+            }
+          }
+        },
+        "required": ["applicability", "edits"]
+      },
+      "IssueAutofixApplicability": {
+        "description": "Autofix applicability metadata for an issue.",
+        "oneOf": [
+          {
+            "description": "The fix is considered safe and should not change semantics.",
+            "type": "string",
+            "const": "safe"
+          },
+          {
+            "description": "The fix may change semantics and should require explicit opt-in.",
+            "type": "string",
+            "const": "unsafe"
+          },
+          {
+            "description": "The fix is presented for visibility only and should not be auto-applied.",
+            "type": "string",
+            "const": "displayOnly"
+          }
+        ]
+      },
+      "IssuePatchEdit": {
+        "description": "A text patch edit associated with an issue autofix.",
+        "type": "object",
+        "properties": {
+          "span": {
+            "description": "Byte range in the source SQL to replace.",
+            "allOf": [
+              {
+                "$ref": "#/definitions/Span"
+              }
+            ]
+          },
+          "replacement": {
+            "description": "Replacement text for the target span.",
+            "type": "string"
+          }
+        },
+        "required": ["span", "replacement"]
       },
       "Summary": {
         "description": "Summary statistics for the analysis result.",

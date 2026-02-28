@@ -50,7 +50,7 @@ flowscope -f mermaid -v column query.sql > lineage.mmd
 Usage: flowscope [OPTIONS] [FILES]...
 
 Arguments:
-  [FILES]...  SQL files to analyze (reads from stdin if none provided)
+  [FILES]...  SQL files to analyze (reads from stdin if none provided; --lint also accepts directories)
 
 Options:
   -d, --dialect <DIALECT>  SQL dialect [default: generic]
@@ -72,6 +72,16 @@ Options:
                            Schema name to prefix DuckDB SQL export
   -v, --view <VIEW>        Graph detail level for mermaid output [default: table]
                            [possible values: script, table, column, hybrid]
+      --lint               Run SQL linter and report violations
+      --fix                Apply deterministic SQL lint auto-fixes in place (requires --lint)
+      --unsafe-fixes       Include unsafe auto-fixes (requires --lint --fix)
+      --legacy-ast-fixes   Enable legacy AST-based rewrites (requires --lint --fix)
+      --show-fixes         Show detailed skipped/blocked fix candidate stats (requires --lint)
+      --exclude-rules <EXCLUDE_RULES>
+                           Comma-separated lint rule codes to exclude
+      --jobs <N>           Number of worker threads for lint/fix file processing (requires --lint)
+      --no-respect-gitignore
+                           Disable `.gitignore` filtering during lint path discovery (requires --lint)
   -q, --quiet              Suppress warnings on stderr
   -c, --compact            Compact JSON output (no pretty-printing)
   -h, --help               Print help
@@ -79,6 +89,39 @@ Options:
 ```
 
 ## Examples
+
+### Lint and Auto-fix
+
+```bash
+# Lint SQL files
+flowscope --lint queries/*.sql
+
+# Lint every .sql file under a directory (recursive)
+flowscope --lint ./queries
+
+# Lint with a fixed worker count
+flowscope --lint --jobs 8 ./queries
+
+# Include files ignored by `.gitignore`
+flowscope --lint --no-respect-gitignore ./queries
+
+# Apply supported auto-fixes, then report remaining violations
+flowscope --lint --fix queries/*.sql
+
+# Include unsafe patch fixes
+flowscope --lint --fix --unsafe-fixes queries/*.sql
+
+# Include legacy AST rewrite fixes (experimental opt-in)
+flowscope --lint --fix --unsafe-fixes --legacy-ast-fixes queries/*.sql
+
+# Show detailed skipped/blocked fix candidate stats
+flowscope --lint --fix --show-fixes queries/*.sql
+
+# Exclude specific lint rules
+flowscope --lint --exclude-rules LINT_AM_001,LINT_ST_001 queries/*.sql
+```
+
+`--fix` applies deterministic **safe** patch fixes by default. Comment and template regions are protected so files with comments are no longer globally skipped. Use `--unsafe-fixes` to include lower-confidence patch fixes, and `--legacy-ast-fixes` to opt into legacy AST rewrite candidates. Use `--show-fixes` to inspect skipped/blocked candidate counts.
 
 ### JSON Output
 
@@ -193,6 +236,7 @@ flowscope --serve --watch ./sql -d postgres --metadata-url postgres://user@local
 |----------|--------|-------------|
 | `/api/health` | GET | Health check with version |
 | `/api/analyze` | POST | Run lineage analysis |
+| `/api/lint-fix` | POST | Apply lint auto-fixes with safe/unsafe options |
 | `/api/completion` | POST | Get code completion items |
 | `/api/split` | POST | Split SQL into statements |
 | `/api/files` | GET | List watched files with content |

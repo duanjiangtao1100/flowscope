@@ -399,6 +399,106 @@ check-generated:
     fi
     echo "Generated code is up to date."
 
+# Run SQLFluff parity comparison report
+sqlfluff-parity SQLFLUFF_DIR="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{SQLFLUFF_DIR}}" ]; then
+        dir="{{SQLFLUFF_DIR}}"
+    elif [ -n "${SQLFLUFF_DIR:-}" ]; then
+        dir="$SQLFLUFF_DIR"
+    else
+        echo "Usage: just sqlfluff-parity /path/to/sqlfluff"
+        echo "  or:  SQLFLUFF_DIR=/path/to/sqlfluff just sqlfluff-parity"
+        exit 1
+    fi
+    venv="$dir/.venv/bin/python"
+    if [ ! -x "$venv" ]; then
+        echo "SQLFluff venv not found at $venv"
+        echo "Expected a SQLFluff source checkout with .venv containing PyYAML."
+        exit 1
+    fi
+    "$venv" scripts/sqlfluff-parity-report.py "$dir"
+
+# Compare FlowScope vs SQLFluff lint/fix behavior on a real SQL corpus
+sql-corpus-parity SQL_DIR="" SQLFLUFF_BIN="" DIALECT="postgres":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{SQL_DIR}}" ]; then
+        sql_dir="{{SQL_DIR}}"
+    elif [ -n "${SQL_DIR:-}" ]; then
+        sql_dir="$SQL_DIR"
+    else
+        echo "Usage: just sql-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "  or:  SQL_DIR=/path/to/sql-dir SQLFLUFF_BIN=/path/to/sqlfluff just sql-corpus-parity"
+        exit 1
+    fi
+    if [ -n "{{SQLFLUFF_BIN}}" ]; then
+        sqlfluff_bin="{{SQLFLUFF_BIN}}"
+    elif [ -n "${SQLFLUFF_BIN:-}" ]; then
+        sqlfluff_bin="$SQLFLUFF_BIN"
+    elif [ -n "${SQLFLUFF_DIR:-}" ] && [ -x "${SQLFLUFF_DIR}/.venv/bin/sqlfluff" ]; then
+        sqlfluff_bin="${SQLFLUFF_DIR}/.venv/bin/sqlfluff"
+    else
+        echo "SQLFluff binary not found."
+        echo "Provide it explicitly:"
+        echo "  just sql-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "or set SQLFLUFF_BIN=/path/to/sqlfluff"
+        echo "or set SQLFLUFF_DIR with a .venv/bin/sqlfluff binary."
+        exit 1
+    fi
+    python3 scripts/sql-corpus-parity-report.py \
+        --sql-dir "$sql_dir" \
+        --sqlfluff-bin "$sqlfluff_bin" \
+        --dialect "{{DIALECT}}"
+
+# LT02-only corpus parity workbench (indentation engine project)
+lt02-corpus-parity SQL_DIR="" SQLFLUFF_BIN="" DIALECT="postgres" JSON_OUTPUT="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "{{SQL_DIR}}" ]; then
+        sql_dir="{{SQL_DIR}}"
+    elif [ -n "${SQL_DIR:-}" ]; then
+        sql_dir="$SQL_DIR"
+    else
+        echo "Usage: just lt02-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "  or:  SQL_DIR=/path/to/sql-dir SQLFLUFF_BIN=/path/to/sqlfluff just lt02-corpus-parity"
+        exit 1
+    fi
+    if [ -n "{{SQLFLUFF_BIN}}" ]; then
+        sqlfluff_bin="{{SQLFLUFF_BIN}}"
+    elif [ -n "${SQLFLUFF_BIN:-}" ]; then
+        sqlfluff_bin="$SQLFLUFF_BIN"
+    elif [ -n "${SQLFLUFF_DIR:-}" ] && [ -x "${SQLFLUFF_DIR}/.venv/bin/sqlfluff" ]; then
+        sqlfluff_bin="${SQLFLUFF_DIR}/.venv/bin/sqlfluff"
+    else
+        echo "SQLFluff binary not found."
+        echo "Provide it explicitly:"
+        echo "  just lt02-corpus-parity /path/to/sql-dir /path/to/sqlfluff"
+        echo "or set SQLFLUFF_BIN=/path/to/sqlfluff"
+        echo "or set SQLFLUFF_DIR with a .venv/bin/sqlfluff binary."
+        exit 1
+    fi
+    if [ -n "{{JSON_OUTPUT}}" ]; then
+        json_output="{{JSON_OUTPUT}}"
+    elif [ -n "${JSON_OUTPUT:-}" ]; then
+        json_output="$JSON_OUTPUT"
+    else
+        json_output=""
+    fi
+    if [ -n "$json_output" ]; then
+        python3 scripts/lt02-indent-parity-workbench.py \
+            --sql-dir "$sql_dir" \
+            --sqlfluff-bin "$sqlfluff_bin" \
+            --dialect "{{DIALECT}}" \
+            --json-output "$json_output"
+    else
+        python3 scripts/lt02-indent-parity-workbench.py \
+            --sql-dir "$sql_dir" \
+            --sqlfluff-bin "$sqlfluff_bin" \
+            --dialect "{{DIALECT}}"
+    fi
+
 # Pre-release validation: all checks needed before tagging a release
 pre-release: check-generated check-all
     @echo "All pre-release checks passed!"

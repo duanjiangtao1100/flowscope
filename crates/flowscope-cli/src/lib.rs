@@ -4,6 +4,8 @@
 //! The main entry point is the `flowscope` binary.
 
 pub mod cli;
+pub mod fix;
+pub mod fix_engine;
 pub mod input;
 #[cfg(feature = "metadata-provider")]
 pub mod metadata;
