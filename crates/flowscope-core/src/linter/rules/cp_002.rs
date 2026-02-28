@@ -1232,7 +1232,7 @@ mod tests {
             Dialect::Databricks,
             LintConfig::default(),
         );
-        assert!(issues.len() >= 1);
+        assert!(!issues.is_empty());
         assert!(issues.iter().all(|i| i.code == issue_codes::LINT_CP_002));
     }
 

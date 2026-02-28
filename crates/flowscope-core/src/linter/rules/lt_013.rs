@@ -52,6 +52,10 @@ fn leading_blank_line_trim_end(sql: &str) -> Option<usize> {
     (first_non_ws > 0).then_some(first_non_ws)
 }
 
+fn has_leading_blank_lines_for_context(ctx: &LintContext) -> bool {
+    leading_blank_line_trim_end(ctx.sql).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +163,4 @@ mod tests {
         assert!(run_statementless(sql).is_empty());
     }
 }
-fn has_leading_blank_lines_for_context(ctx: &LintContext) -> bool {
-    leading_blank_line_trim_end(ctx.sql).is_some()
-}
+
