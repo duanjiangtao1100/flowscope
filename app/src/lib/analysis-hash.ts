@@ -1,7 +1,7 @@
 import type { Dialect } from './project-store';
 import type { TemplateMode } from '@/types';
 
-const HASH_VERSION = 'v1';
+const HASH_VERSION = 'v2';
 const FNV_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV_PRIME = 0x100000001b3n;
 const FNV_MASK = 0xffffffffffffffffn;

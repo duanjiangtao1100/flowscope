@@ -99,7 +99,7 @@ jobs:
         run: |
           cargo publish -p flowscope-core --dry-run --locked
           cargo publish -p flowscope-export --dry-run --locked
-          cargo publish -p flowscope-cli --dry-run --locked
+          cargo publish -p flowscope-cli --dry-run --locked --allow-dirty
 
       - name: Publish crates
         if: ${{ env.DRY_RUN != 'true' }}
@@ -117,7 +117,11 @@ jobs:
             if [ "$STATUS" = "200" ]; then
               echo "${CRATE}@${VERSION} already published; skipping."
             elif [ "$STATUS" = "404" ]; then
-              cargo publish -p "${CRATE}" --locked
+              EXTRA_FLAGS=""
+              if [ "$CRATE" = "flowscope-cli" ]; then
+                EXTRA_FLAGS="--allow-dirty"
+              fi
+              cargo publish -p "${CRATE}" --locked $EXTRA_FLAGS
             else
               echo "Unexpected crates.io status ${STATUS} for ${CRATE}@${VERSION}."
               exit 1

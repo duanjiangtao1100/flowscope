@@ -66,6 +66,8 @@ export interface IssuesViewState {
   codes: string[];
   /** Selected source files to show (empty = show all) */
   sourceFiles: string[];
+  /** Whether to show lint issues (codes starting with LINT_) */
+  showLintIssues: boolean;
 }
 
 /**
@@ -134,6 +136,7 @@ const DEFAULT_ISSUES_STATE: IssuesViewState = {
   severity: 'all',
   codes: [],
   sourceFiles: [],
+  showLintIssues: true,
 };
 
 const DEFAULT_NAMESPACE_FILTER_STATE: NamespaceFilterState = {

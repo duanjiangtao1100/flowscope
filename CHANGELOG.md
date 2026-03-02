@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-02
+
+### Added
+
+#### SQL Linter Engine (flowscope-core)
+- **Full SQL linting engine** with 60+ rules targeting SQLFluff parity
+  - **Aliasing rules** (AL001–AL009): alias expression style, column alias quoting, unused aliases, duplicate column names, alias length limits, force-enable aliasing
+  - **Ambiguity rules** (AM001–AM009): DISTINCT with GROUP BY, UNION type handling, ORDER BY column ordinals, ambiguous column counts, bare JOINs, set-column mismatches, implicit cross joins, limit without ORDER BY
+  - **Capitalisation rules** (CP001–CP005): keyword, identifier, function name, literal, and type-annotation casing with consistent/upper/lower modes and `ignore_words_regex` support
+  - **Convention rules** (CV001–CV012): operator style, COALESCE usage, trailing commas, COUNT row-style, IS NULL comparison, statement terminators, unnecessary brackets, LEFT JOIN preference, block quotes, quoted literals, CAST shorthand, implicit join detection
+  - **Jinja rules** (JJ001): template tag detection with trim-marker parity
+  - **Layout rules** (LT001–LT015): trailing whitespace, indentation, operator placement, comma position, long lines, function spacing, bracket placement, CTE newlines, SELECT modifiers, set operators, end-of-file newlines, start-of-file blanks, keyword line position, blank line limits
+  - **Reference rules** (RF001–RF006): keyword references, qualified wildcards, single-table qualifications, keyword aliases, identifier quoting policies
+  - **Structure rules** (ST001–ST012): ELSE/THEN on new lines, simple CASE, unused CTEs, nested CASE, subquery-to-CTE, column ordering, USING joins, DISTINCT parentheses, join condition order, constant predicates, unused joins, consecutive semicolons
+  - **T-SQL rules** (TQ001–TQ003): SP_ prefix, SET NOCOUNT, batch separators
+- **Rule configuration system** supporting SQLFluff `.sqlfluff` config format with per-rule options (e.g., `capitalisation_policy`, `line_position`, `max_line_length`, `allow_scalar`)
+- **Dialect-aware detection** adapting rule behavior for PostgreSQL, BigQuery, Snowflake, Redshift, SparkSQL, MSSQL, and others
+- **Autofix metadata** on issues with `Safe`/`Unsafe` applicability markers and patch edits
+
+#### CLI (flowscope-cli)
+- `--lint` flag for SQL linting with JSON, compact, and human-readable output formats
+- `--fix` flag for automatic SQL fixing with safe-only default and `--legacy-ast-fixes` for additional rewrites
+- `--fix-only` mode for applying fixes without re-linting
+- `--exclude-rules` for disabling specific lint rules
+- `--rule-configs-json` for passing rule configuration as JSON
+- `--show-fixes` to display applied fix details
+- `--jobs` for parallel multi-file lint/fix processing
+- `--no-respect-gitignore` for including gitignored files
+- Fix engine with iterative convergence loop, overlap recovery, and incremental rule evaluation budgets
+- Performance-tuned large-SQL handling with capped fix passes and targeted LT02 cleanup
+
+#### CI
+- GitHub Actions CI workflow for lint, test, and parity validation
+
+### Improved
+
+#### Core Engine (flowscope-core)
+- Migrated all lint rules from regex to AST/tokenizer-driven detection for accuracy and performance
+- Shared document token stream across rules to avoid redundant tokenization
+- Token-span-based issue reporting for precise editor navigation
+
+#### Web App (app/)
+- Integrated linter into the web app: lint is now enabled by default in the analysis worker
+- Updated WASM bindings to include lint API surface (`LintIssue`, `LintRequest`, `LintConfig` types)
+- Lint-aware issues panel with updated filtering
+- Updated mascot to purple-headed duck and added favicon, removed beta badge
+
 ## [0.3.1] - 2026-01-23
 
 ### Fixed

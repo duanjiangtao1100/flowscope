@@ -24,10 +24,10 @@ export function FlowScopeLogo({ className }: FlowScopeLogoProps) {
         fill="currentColor"
         fillOpacity="0.3"
       />
-      {/* Head - green */}
+      {/* Head - purple */}
       <path
         d="M31.5 27C24.0442 27 18 20.9558 18 13.5C18 6.04416 24.0442 3.25905e-07 31.5 0C38.9558 -3.25905e-07 45 6.04416 45 13.5C45 20.9558 38.9558 27 31.5 27Z"
-        fill="#4CAE4F"
+        fill="#A78BFA"
       />
       {/* Eyes - dark blue */}
       <path

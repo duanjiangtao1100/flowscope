@@ -21,6 +21,10 @@ function isSchemaIssue(issue: Issue): boolean {
   return SCHEMA_ISSUE_CODES.includes(issue.code);
 }
 
+function isLintIssue(issue: Issue): boolean {
+  return issue.code.startsWith('LINT_');
+}
+
 export function SchemaAwareIssuesPanel({
   projectId,
   onOpenSchemaEditor,
@@ -76,6 +80,11 @@ export function SchemaAwareIssuesPanel({
   // Apply filters to issues
   const filteredIssues = useMemo(() => {
     return sortedIssues.filter((issue) => {
+      // Lint issues toggle
+      if (!filterState.showLintIssues && isLintIssue(issue)) {
+        return false;
+      }
+
       // Severity filter
       if (filterState.severity !== 'all' && issue.severity !== filterState.severity) {
         return false;
@@ -98,21 +107,28 @@ export function SchemaAwareIssuesPanel({
     });
   }, [sortedIssues, filterState, getIssueSourceName]);
 
-  // Calculate counts for the filter bar (total, not filtered)
+  // Base issues after applying the lint toggle (used for counts and empty states)
+  const baseIssues = useMemo(() => {
+    if (filterState.showLintIssues) return sortedIssues;
+    return sortedIssues.filter((i) => !isLintIssue(i));
+  }, [sortedIssues, filterState.showLintIssues]);
+
+  // Calculate counts for the filter bar (respects lint toggle, ignores other filters)
   const counts = useMemo(() => {
-    const errors = sortedIssues.filter((i) => i.severity === 'error').length;
-    const warnings = sortedIssues.filter((i) => i.severity === 'warning').length;
-    const infos = sortedIssues.filter((i) => i.severity === 'info').length;
+    const errors = baseIssues.filter((i) => i.severity === 'error').length;
+    const warnings = baseIssues.filter((i) => i.severity === 'warning').length;
+    const infos = baseIssues.filter((i) => i.severity === 'info').length;
     return {
-      all: sortedIssues.length,
+      all: baseIssues.length,
       errors,
       warnings,
       infos,
     };
-  }, [sortedIssues]);
+  }, [baseIssues]);
 
-  // Count schema issues from total (not filtered) to keep banner stable
+  // Count schema and lint issues from total (not filtered) to keep banner stable
   const schemaIssueCount = sortedIssues.filter(isSchemaIssue).length;
+  const lintIssueCount = sortedIssues.filter(isLintIssue).length;
 
   // Pre-compute locations for all filtered issues to avoid repeated calculations during render
   const issueLocationsMap = useMemo(
@@ -141,7 +157,8 @@ export function SchemaAwareIssuesPanel({
   const hasActiveFilters =
     filterState.severity !== 'all' ||
     filterState.codes.length > 0 ||
-    filterState.sourceFiles.length > 0;
+    filterState.sourceFiles.length > 0 ||
+    !filterState.showLintIssues;
 
   return (
     <div className="flex flex-col h-full bg-background">
@@ -153,6 +170,7 @@ export function SchemaAwareIssuesPanel({
           availableSourceFiles={availableSourceFiles}
           counts={counts}
           schemaIssueCount={schemaIssueCount}
+          lintIssueCount={lintIssueCount}
           onOpenSchemaEditor={onOpenSchemaEditor}
         />
       )}
@@ -172,7 +190,7 @@ export function SchemaAwareIssuesPanel({
             {/* Filtered count indicator */}
             {hasActiveFilters && (
               <p className="text-xs text-muted-foreground mb-3">
-                Showing {filteredIssues.length} of {sortedIssues.length} issues
+                Showing {filteredIssues.length} of {baseIssues.length} issues
               </p>
             )}
             {filteredIssues.map((issue, idx) => {

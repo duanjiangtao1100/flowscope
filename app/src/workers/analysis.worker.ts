@@ -274,6 +274,7 @@ async function runAnalysis(
     options: {
       enableColumnLineage: resolvedPayload.enableColumnLineage,
       hideCtes: resolvedPayload.hideCTEs,
+      lint: { enabled: true },
     },
   };
   if (templateConfig) {

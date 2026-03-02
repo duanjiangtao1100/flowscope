@@ -32,6 +32,8 @@ interface IssuesFilterBarProps {
   };
   /** Number of schema-related issues (UNKNOWN_COLUMN, UNKNOWN_TABLE, etc.) */
   schemaIssueCount?: number;
+  /** Number of lint issues (codes starting with LINT_) */
+  lintIssueCount?: number;
   /** Callback to open the schema editor */
   onOpenSchemaEditor?: () => void;
   className?: string;
@@ -58,6 +60,7 @@ export function IssuesFilterBar({
   availableSourceFiles,
   counts,
   schemaIssueCount,
+  lintIssueCount,
   onOpenSchemaEditor,
   className,
 }: IssuesFilterBarProps) {
@@ -114,18 +117,24 @@ export function IssuesFilterBar({
     [filterState.sourceFiles, updateFilter]
   );
 
+  const toggleLintIssues = useCallback(() => {
+    updateFilter({ showLintIssues: !filterState.showLintIssues });
+  }, [filterState.showLintIssues, updateFilter]);
+
   const clearAll = useCallback(() => {
     updateFilter({
       severity: 'all',
       codes: [],
       sourceFiles: [],
+      showLintIssues: true,
     });
   }, [updateFilter]);
 
   const hasActiveFilters =
     filterState.severity !== 'all' ||
     filterState.codes.length > 0 ||
-    filterState.sourceFiles.length > 0;
+    filterState.sourceFiles.length > 0 ||
+    !filterState.showLintIssues;
 
   return (
     <div className={cn('flex flex-col gap-2 px-4 py-2 border-b bg-muted/5', className)}>
@@ -247,8 +256,45 @@ export function IssuesFilterBar({
           </DropdownMenu>
         )}
 
-        {/* Right-aligned section: schema badge + clear all */}
+        {/* Clear all button */}
+        {hasActiveFilters && (
+          <button
+            onClick={clearAll}
+            className="h-6 px-2 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-slate-100 transition-colors"
+          >
+            Clear all
+          </button>
+        )}
+
+        {/* Right-aligned section: lint toggle + schema badge */}
         <div className="flex items-center gap-2 ml-auto">
+          {/* Lint issues toggle */}
+          {lintIssueCount !== undefined && lintIssueCount > 0 && (
+            <button
+              role="switch"
+              aria-checked={filterState.showLintIssues}
+              onClick={toggleLintIssues}
+              className="flex items-center gap-2 h-8 text-xs font-medium text-slate-600 dark:text-slate-400"
+            >
+              <span>Lint</span>
+              <span
+                className={cn(
+                  'relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors',
+                  filterState.showLintIssues
+                    ? 'bg-slate-600 dark:bg-slate-400'
+                    : 'bg-slate-300 dark:bg-slate-600'
+                )}
+              >
+                <span
+                  className={cn(
+                    'inline-block h-3 w-3 rounded-full bg-white shadow-sm transition-transform',
+                    filterState.showLintIssues ? 'translate-x-3.5' : 'translate-x-0.5'
+                  )}
+                />
+              </span>
+            </button>
+          )}
+
           {/* Schema issues badge */}
           {schemaIssueCount !== undefined && schemaIssueCount > 0 && onOpenSchemaEditor && (
             <button
@@ -262,16 +308,6 @@ export function IssuesFilterBar({
               <Database className="h-3.5 w-3.5" />
               <span className="text-xs font-medium tabular-nums">{schemaIssueCount}</span>
               <span className="text-xs font-medium">schema</span>
-            </button>
-          )}
-
-          {/* Clear all button */}
-          {hasActiveFilters && (
-            <button
-              onClick={clearAll}
-              className="h-6 px-2 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-slate-100 transition-colors"
-            >
-              Clear all
             </button>
           )}
         </div>

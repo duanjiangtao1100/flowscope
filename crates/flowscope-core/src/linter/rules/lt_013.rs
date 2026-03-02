@@ -163,4 +163,3 @@ mod tests {
         assert!(run_statementless(sql).is_empty());
     }
 }
-

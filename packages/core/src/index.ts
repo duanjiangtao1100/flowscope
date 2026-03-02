@@ -38,6 +38,7 @@ export type {
   Dialect,
   Encoding,
   ExportFormat,
+  LintConfig,
   MermaidView,
   StatementSplitRequest,
   StatementSplitResult,
