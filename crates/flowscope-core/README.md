@@ -17,6 +17,7 @@ Core SQL lineage analysis engine for FlowScope.
 - **Complex SQL Support:** Handles CTEs (Common Table Expressions), Subqueries, Joins, Unions, Window Functions, and lateral column aliases.
 - **Schema Awareness:** Utilize provided schema metadata to validate column references and resolve wildcards (`SELECT *`).
 - **Type Inference:** Infer expression types with dialect-aware type compatibility checking.
+- **SQL Linting:** 72 lint rules across 9 families (AL, AM, CP, CV, JJ, LT, RF, ST, TQ) with AST-driven semantic checks and token-aware formatting checks. Rules include autofix metadata with safe/unsafe classification.
 - **Diagnostics:** Returns structured issues (errors, warnings) with source spans for precise highlighting.
 
 ## Structure
@@ -37,6 +38,13 @@ src/
 │   ├── diagnostics.rs       # Issue reporting
 │   ├── input.rs             # Input merging and deduplication
 │   └── helpers/             # Utility functions
+├── linter/                  # SQL lint engine
+│   ├── mod.rs               # Linter orchestration
+│   ├── config.rs            # Rule configuration
+│   ├── document.rs          # Document model (shared tokens)
+│   ├── rule.rs              # Rule trait and context
+│   ├── visit.rs             # AST visitor for rules
+│   └── rules/               # 72 rule implementations
 ├── parser/                  # SQL dialect handling
 ├── types/                   # Request/response types
 └── lineage/                 # Lineage graph construction
@@ -63,6 +71,17 @@ fn main() {
         println!("Edges: {:?}", statement.edges);
     }
 }
+```
+
+### Linting
+
+```rust
+use flowscope_core::linter::{Linter, LintConfig, LintDocument};
+
+let config = LintConfig::default();
+let linter = Linter::new(config);
+let document = LintDocument::new(sql, dialect);
+let issues = linter.check_document(&document);
 ```
 
 ## Testing

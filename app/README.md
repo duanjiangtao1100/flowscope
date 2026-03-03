@@ -7,6 +7,7 @@ The official web interface for FlowScope. This application demonstrates the full
 - **Interactive Lineage Graph:** Visualize table and column dependencies.
 - **Multi-File Workspace:** Manage multiple SQL files and analyze cross-file dependencies (simulated).
 - **Schema Editor:** Define table schemas to enable advanced analysis features like wildcard expansion and column validation.
+- **SQL Linting:** Real-time lint diagnostics in the Issues panel. 72 rules check aliasing, layout, conventions, and structure.
 - **Privacy-First:** All processing happens locally in the browser via WebAssembly.
 
 ## Development

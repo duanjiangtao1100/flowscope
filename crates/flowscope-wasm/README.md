@@ -17,9 +17,14 @@ The primary entry point for analysis. It takes a JSON-serialized `AnalyzeRequest
 {
   "sql": "SELECT * FROM users",
   "dialect": "postgres",
-  "schema": { ... }
+  "schema": { ... },
+  "options": {
+    "lint": { "enabled": true }
+  }
 }
 ```
+
+When `options.lint.enabled` is `true`, lint diagnostics are included in the `issues` array of the response. Lint issue codes use the `LINT_` prefix (e.g. `LINT_AL_001`).
 
 **Output JSON Format:**
 ```json

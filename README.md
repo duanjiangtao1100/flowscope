@@ -63,6 +63,23 @@ cat query.sql | flowscope -d postgres
 
 Output formats: `table` (default), `json`, `mermaid`, `html`, `sql`, `csv`, `xlsx`, `duckdb`
 
+### Linting
+
+FlowScope includes a SQL linter with 72 rules covering aliasing, layout, conventions, structure, and more:
+
+```bash
+# Lint SQL files
+flowscope --lint queries/*.sql
+
+# Lint and auto-fix
+flowscope --lint --fix queries/*.sql
+
+# JSON output for CI integration
+flowscope --lint -f json queries/*.sql
+```
+
+See [CLI documentation](crates/flowscope-cli/README.md) for all lint options and rule configuration.
+
 ### Serve Mode (Local Web UI)
 
 Run FlowScope as a local HTTP server with the full web UI embedded in a single binary:
@@ -88,6 +105,8 @@ See [CLI documentation](crates/flowscope-cli/README.md) for all options.
 - Multi-dialect coverage (PostgreSQL, Snowflake, BigQuery, DuckDB, Redshift, and more)
 - dbt and Jinja templating support with built-in macro stubs (`ref()`, `source()`, `var()`)
 - Table and column lineage with schema-aware wildcard expansion
+- SQL linting with 72 rules across 9 categories (aliasing, layout, convention, structure, and more)
+- Auto-fix engine with safe and unsafe fix modes
 - Structured diagnostics with spans for precise highlighting
 - Completion API for SQL authoring workflows
 - TypeScript API and optional React visualization components
@@ -165,6 +184,7 @@ npm install @pondpilot/flowscope-react
 - [docs/guides/schema-metadata.md](docs/guides/schema-metadata.md) — schema metadata setup
 - [docs/dialect-coverage.md](docs/dialect-coverage.md) — dialect and statement coverage
 - [crates/flowscope-cli/README.md](crates/flowscope-cli/README.md) — CLI usage and examples
+- [docs/linter-architecture.md](docs/linter-architecture.md) — linter engine design and rule families
 - [docs/workspace-structure.md](docs/workspace-structure.md) — monorepo layout and build entry points
 
 ## Development

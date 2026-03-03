@@ -25,4 +25,18 @@ const result = await analyzeSql({
 });
 ```
 
+### Lint Diagnostics
+
+Enable linting via the `options.lint` field. Lint issues appear in `result.issues` with codes prefixed by `LINT_`:
+
+```typescript
+const result = await analyzeSql({
+  sql: 'SELECT * FROM users',
+  dialect: 'postgres',
+  options: { lint: { enabled: true } },
+});
+
+const lintIssues = result.issues.filter(i => i.code.startsWith('LINT_'));
+```
+
 See the root [README](../../README.md) for more details.
