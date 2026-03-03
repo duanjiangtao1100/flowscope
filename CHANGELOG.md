@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-03-03
+
+### Improved
+
+- Added linter documentation to README files across the monorepo (core, CLI, export crates)
+- Aligned npm package versions with Cargo workspace version (was 0.3.1, now 0.4.1)
+- Rebuilt WASM artifacts from current Rust source
+
 ## [0.4.0] - 2026-03-02
 
 ### Added
