@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { AnalyzeRequest, AnalyzeResult, Dialect, Node, Edge, Issue } from '../src/types';
-import { IssueCodes } from '../src/types';
+import { IssueCodes, applyEdits } from '../src/types';
 
 describe('Types', () => {
   describe('AnalyzeRequest', () => {
@@ -155,6 +155,93 @@ describe('Types', () => {
       };
 
       expect(issue.severity).toBe('warning');
+    });
+  });
+
+  describe('applyEdits', () => {
+    it('returns original string for empty edits', () => {
+      expect(applyEdits('select 1', [])).toBe('select 1');
+    });
+
+    it('applies a single edit', () => {
+      const result = applyEdits('select id from t', [
+        { span: { start: 0, end: 6 }, replacement: 'SELECT' },
+      ]);
+      expect(result).toBe('SELECT id from t');
+    });
+
+    it('applies multiple non-overlapping edits', () => {
+      const result = applyEdits('select id from t', [
+        { span: { start: 0, end: 6 }, replacement: 'SELECT' },
+        { span: { start: 10, end: 14 }, replacement: 'FROM' },
+      ]);
+      expect(result).toBe('SELECT id FROM t');
+    });
+
+    it('applies edits regardless of input order', () => {
+      // Provide edits in reverse order; applyEdits should sort internally
+      const result = applyEdits('select id from t', [
+        { span: { start: 10, end: 14 }, replacement: 'FROM' },
+        { span: { start: 0, end: 6 }, replacement: 'SELECT' },
+      ]);
+      expect(result).toBe('SELECT id FROM t');
+    });
+
+    it('handles multi-byte UTF-8 characters', () => {
+      // '你好' is 6 bytes in UTF-8 (3 bytes per character), starting at byte 7
+      const result = applyEdits('select 你好', [
+        { span: { start: 7, end: 13 }, replacement: 'hello' },
+      ]);
+      expect(result).toBe('select hello');
+    });
+
+    it('handles edit at start of string', () => {
+      const result = applyEdits('abc', [
+        { span: { start: 0, end: 1 }, replacement: 'X' },
+      ]);
+      expect(result).toBe('Xbc');
+    });
+
+    it('handles edit at end of string', () => {
+      const result = applyEdits('abc', [
+        { span: { start: 2, end: 3 }, replacement: 'Z' },
+      ]);
+      expect(result).toBe('abZ');
+    });
+
+    it('handles insertion (zero-width span)', () => {
+      const result = applyEdits('ab', [
+        { span: { start: 1, end: 1 }, replacement: 'X' },
+      ]);
+      expect(result).toBe('aXb');
+    });
+
+    it('handles deletion (empty replacement)', () => {
+      const result = applyEdits('abcdef', [
+        { span: { start: 2, end: 4 }, replacement: '' },
+      ]);
+      expect(result).toBe('abef');
+    });
+
+    it('throws RangeError for out-of-bounds span', () => {
+      expect(() =>
+        applyEdits('abc', [{ span: { start: 0, end: 100 }, replacement: 'x' }])
+      ).toThrow(RangeError);
+    });
+
+    it('throws RangeError when start > end', () => {
+      expect(() =>
+        applyEdits('abc', [{ span: { start: 2, end: 1 }, replacement: 'x' }])
+      ).toThrow(RangeError);
+    });
+
+    it('throws for overlapping edits', () => {
+      expect(() =>
+        applyEdits('select id', [
+          { span: { start: 0, end: 6 }, replacement: 'SELECT' },
+          { span: { start: 3, end: 9 }, replacement: 'other' },
+        ])
+      ).toThrow('Overlapping edits');
     });
   });
 });

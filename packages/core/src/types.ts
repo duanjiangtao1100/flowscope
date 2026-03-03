@@ -588,6 +588,51 @@ export interface GlobalEdge {
   metadata?: Record<string, unknown>;
 }
 
+/** Lint execution engine category. */
+export type LintEngine = 'semantic' | 'lexical' | 'document';
+
+/** Confidence level attached to lint findings. */
+export type LintConfidence = 'high' | 'medium' | 'low';
+
+/** Source of degraded lint confidence or fallback behavior. */
+export type LintFallbackSource = 'parser_fallback' | 'tokenizer_fallback' | 'heuristic_rule';
+
+/**
+ * Autofix applicability metadata for an issue.
+ * - `safe`: can be applied programmatically with high confidence.
+ * - `unsafe`: may alter semantics; requires user review before applying.
+ * - `displayOnly`: shown as a preview only; should not be applied automatically.
+ */
+export type IssueAutofixApplicability = 'safe' | 'unsafe' | 'displayOnly';
+
+/**
+ * A text patch edit associated with an issue autofix.
+ *
+ * Spans use UTF-8 byte offsets relative to the original source string.
+ * Within a single autofix, edits must not overlap (`end` of one edit must
+ * be <= `start` of the next). Adjacent edits (where `end === start` of the
+ * next) and zero-width spans (insertions, where `start === end`) are allowed.
+ */
+export interface IssuePatchEdit {
+  /** UTF-8 byte range in the source SQL to replace. */
+  span: Span;
+  /** Replacement text for the target span. */
+  replacement: string;
+}
+
+/**
+ * Autofix metadata attached to an issue.
+ *
+ * All spans within `edits` are relative to the original `sql` string
+ * supplied in the analysis request.
+ */
+export interface IssueAutofix {
+  /** Applicability category for this fix. */
+  applicability: IssueAutofixApplicability;
+  /** Edits required to apply this fix. */
+  edits: IssuePatchEdit[];
+}
+
 /** An issue encountered during SQL analysis (error, warning, or info). */
 export interface Issue {
   /** Severity level */
@@ -596,12 +641,22 @@ export interface Issue {
   code: string;
   /** Human-readable error message */
   message: string;
+  /** SQLFluff dotted rule name (e.g., `aliasing.table`). */
+  sqlfluffName?: string;
   /** Optional: location in source SQL where issue occurred */
   span?: Span;
   /** Optional: which statement index this issue relates to */
   statementIndex?: number;
   /** Optional: source file name where the issue occurred */
   sourceName?: string;
+  /** Optional: linter engine provenance. */
+  lintEngine?: LintEngine;
+  /** Optional: confidence level for lint detection quality. */
+  lintConfidence?: LintConfidence;
+  /** Optional: fallback mode used while evaluating this lint. */
+  lintFallbackSource?: LintFallbackSource;
+  /** Optional: autofix metadata for this issue. */
+  autofix?: IssueAutofix;
 }
 
 export type Severity = 'error' | 'warning' | 'info';
@@ -896,4 +951,88 @@ export function byteOffsetToCharOffset(str: string, byteOffset: number): number 
   }
 
   throw new Error(`Byte offset ${byteOffset} does not land on a character boundary`);
+}
+
+// Shared TextDecoder instance for performance (avoid creating per-call)
+const utf8Decoder = new TextDecoder();
+
+/**
+ * Apply a set of patch edits to a source string.
+ *
+ * Edits use UTF-8 byte offsets (matching the `Span` type). They are sorted
+ * internally and applied in a single forward pass.
+ *
+ * @param source - The original source string
+ * @param edits - The patch edits to apply (each with a byte-offset span and replacement text)
+ * @returns The source string with all edits applied
+ * @throws {RangeError} If any edit span is out of bounds or has start > end
+ * @throws {Error} If edits overlap
+ *
+ * @example
+ * ```typescript
+ * const result = await analyzeSql({ sql: 'select ID from T', dialect: 'postgres' });
+ * const issue = result.issues.find(i => i.autofix);
+ * if (issue?.autofix) {
+ *   const fixed = applyEdits('select ID from T', issue.autofix.edits);
+ * }
+ * ```
+ */
+export function applyEdits(source: string, edits: IssuePatchEdit[]): string {
+  if (edits.length === 0) {
+    return source;
+  }
+
+  // Encode source to bytes so we can work with byte offsets
+  const sourceBytes = utf8Encoder.encode(source);
+
+  // Sort edits by span.start ascending for a single forward pass
+  const sorted = [...edits].sort((a, b) => a.span.start - b.span.start);
+
+  // Pre-encode replacements so we can compute total size and avoid encoding twice
+  const replacements = sorted.map((e) => utf8Encoder.encode(e.replacement));
+
+  // Validate spans and detect overlaps; also compute result byte length
+  let resultLength = sourceBytes.length;
+  let previousEnd = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const { start, end } = sorted[i].span;
+    if (start < 0 || end > sourceBytes.length || start > end) {
+      throw new RangeError(
+        `Invalid edit span [${start}, ${end}) for source of ${sourceBytes.length} bytes`
+      );
+    }
+    if (start < previousEnd) {
+      const prev = sorted[i - 1].span;
+      throw new Error(
+        `Overlapping edits: span [${start}, ${end}) overlaps with span [${prev.start}, ${prev.end})`
+      );
+    }
+    resultLength += replacements[i].length - (end - start);
+    previousEnd = end;
+  }
+
+  // Single-allocation forward pass: copy unchanged regions and replacements
+  const result = new Uint8Array(resultLength);
+  let readPos = 0;
+  let writePos = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const { start, end } = sorted[i].span;
+
+    // Copy unchanged bytes before this edit
+    const unchanged = sourceBytes.subarray(readPos, start);
+    result.set(unchanged, writePos);
+    writePos += unchanged.length;
+
+    // Copy replacement bytes
+    result.set(replacements[i], writePos);
+    writePos += replacements[i].length;
+
+    readPos = end;
+  }
+
+  // Copy remaining bytes after the last edit
+  const tail = sourceBytes.subarray(readPos);
+  result.set(tail, writePos);
+
+  return utf8Decoder.decode(result);
 }

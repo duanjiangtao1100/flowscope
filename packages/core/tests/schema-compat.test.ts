@@ -80,4 +80,82 @@ describe('API schema compatibility', () => {
       expect(validate?.errors).toBeUndefined();
     }
   });
+
+  it('validates an AnalyzeResult with autofix metadata against Rust schema', () => {
+    const ajv = loadSchemas();
+    const validate = ajv.getSchema<AnalyzeResult>('AnalyzeResult');
+    expect(validate).toBeDefined();
+
+    const result: AnalyzeResult = {
+      statements: [
+        {
+          statementIndex: 0,
+          statementType: 'SELECT',
+          sourceName: 'inline.sql',
+          nodes: [],
+          edges: [],
+          joinCount: 0,
+          complexityScore: 1,
+        },
+      ],
+      globalLineage: { nodes: [], edges: [] },
+      issues: [
+        {
+          severity: 'warning',
+          code: 'LINT_CP_001',
+          message: 'Keywords should be upper-case.',
+          sqlfluffName: 'capitalisation.keywords',
+          span: { start: 0, end: 6 },
+          statementIndex: 0,
+          lintEngine: 'lexical',
+          lintConfidence: 'high',
+          autofix: {
+            applicability: 'safe',
+            edits: [{ span: { start: 0, end: 6 }, replacement: 'SELECT' }],
+          },
+        },
+        {
+          severity: 'warning',
+          code: 'LINT_CP_002',
+          message: 'Identifiers should be lower-case.',
+          span: { start: 7, end: 9 },
+          statementIndex: 0,
+          lintEngine: 'semantic',
+          lintConfidence: 'medium',
+          lintFallbackSource: 'parser_fallback',
+          autofix: {
+            applicability: 'displayOnly',
+            edits: [{ span: { start: 7, end: 9 }, replacement: 'id' }],
+          },
+        },
+        {
+          severity: 'info',
+          code: 'LINT_DOC_001',
+          message: 'Document-level check.',
+          lintEngine: 'document',
+          lintConfidence: 'low',
+          lintFallbackSource: 'heuristic_rule',
+          autofix: {
+            applicability: 'unsafe',
+            edits: [],
+          },
+        },
+      ],
+      summary: {
+        statementCount: 1,
+        tableCount: 1,
+        columnCount: 1,
+        joinCount: 0,
+        complexityScore: 1,
+        issueCount: { errors: 0, warnings: 2, infos: 1 },
+        hasErrors: false,
+      },
+    };
+
+    const valid = validate?.(result);
+    expect(valid).toBe(true);
+    if (!valid) {
+      expect(validate?.errors).toBeUndefined();
+    }
+  });
 });

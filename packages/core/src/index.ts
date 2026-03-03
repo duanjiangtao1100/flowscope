@@ -68,6 +68,12 @@ export type {
   CanonicalName,
   StatementRef,
   Issue,
+  IssueAutofix,
+  IssueAutofixApplicability,
+  IssuePatchEdit,
+  LintEngine,
+  LintConfidence,
+  LintFallbackSource,
   Severity,
   Span,
   Summary,
@@ -85,4 +91,5 @@ export {
   isTableLikeType,
   charOffsetToByteOffset,
   byteOffsetToCharOffset,
+  applyEdits,
 } from './types';
