@@ -42,6 +42,7 @@ export type Dialect =
   | 'hive'
   | 'mssql'
   | 'mysql'
+  | 'oracle'
   | 'postgres'
   | 'redshift'
   | 'snowflake'
@@ -58,6 +59,7 @@ const DIALECT_LABELS: Record<Dialect, string> = {
   hive: 'Hive',
   mssql: 'MS SQL Server',
   mysql: 'MySQL',
+  oracle: 'Oracle',
   postgres: 'PostgreSQL',
   redshift: 'Redshift',
   snowflake: 'Snowflake',
@@ -75,6 +77,7 @@ export const VALID_DIALECTS: readonly Dialect[] = [
   'hive',
   'mssql',
   'mysql',
+  'oracle',
   'postgres',
   'redshift',
   'snowflake',
