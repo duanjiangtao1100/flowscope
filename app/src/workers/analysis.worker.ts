@@ -22,6 +22,7 @@ export interface AnalysisWorkerPayload {
   schemaSQL: string;
   hideCTEs: boolean;
   enableColumnLineage: boolean;
+  enableLinting?: boolean;
   templateMode?: TemplateMode;
 }
 
@@ -207,6 +208,7 @@ async function runAnalysis(
     schemaSQL: resolvedPayload.schemaSQL,
     hideCTEs: resolvedPayload.hideCTEs,
     enableColumnLineage: resolvedPayload.enableColumnLineage,
+    enableLinting: resolvedPayload.enableLinting,
     templateMode: resolvedPayload.templateMode,
   });
 
@@ -274,7 +276,7 @@ async function runAnalysis(
     options: {
       enableColumnLineage: resolvedPayload.enableColumnLineage,
       hideCtes: resolvedPayload.hideCTEs,
-      lint: { enabled: true },
+      lint: { enabled: resolvedPayload.enableLinting ?? false },
     },
   };
   if (templateConfig) {
@@ -325,6 +327,7 @@ async function getCachedAnalysis(payload: AnalysisWorkerPayload): Promise<Analys
     schemaSQL: resolvedPayload.schemaSQL,
     hideCTEs: resolvedPayload.hideCTEs,
     enableColumnLineage: resolvedPayload.enableColumnLineage,
+    enableLinting: resolvedPayload.enableLinting,
     templateMode: resolvedPayload.templateMode,
   });
 

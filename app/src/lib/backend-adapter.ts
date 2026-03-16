@@ -29,6 +29,7 @@ export interface AnalysisPayload {
   schemaSQL: string;
   hideCTEs: boolean;
   enableColumnLineage: boolean;
+  enableLinting?: boolean;
   templateMode?: TemplateMode;
 }
 
@@ -109,6 +110,7 @@ export class RestBackendAdapter implements BackendAdapter {
         files: payload.files,
         hide_ctes: payload.hideCTEs,
         enable_column_lineage: payload.enableColumnLineage,
+        enable_linting: payload.enableLinting ?? false,
         template_mode: payload.templateMode,
       }),
     });
@@ -175,6 +177,7 @@ export class WasmBackendAdapter implements BackendAdapter {
         schemaSQL: payload.schemaSQL,
         hideCTEs: payload.hideCTEs,
         enableColumnLineage: payload.enableColumnLineage,
+        enableLinting: payload.enableLinting,
         templateMode: payload.templateMode,
       },
       options
@@ -199,6 +202,7 @@ export class WasmBackendAdapter implements BackendAdapter {
       schemaSQL: payload.schemaSQL,
       hideCTEs: payload.hideCTEs,
       enableColumnLineage: payload.enableColumnLineage,
+      enableLinting: payload.enableLinting,
       templateMode: payload.templateMode,
     });
 

@@ -196,43 +196,35 @@ describe('Types', () => {
     });
 
     it('handles edit at start of string', () => {
-      const result = applyEdits('abc', [
-        { span: { start: 0, end: 1 }, replacement: 'X' },
-      ]);
+      const result = applyEdits('abc', [{ span: { start: 0, end: 1 }, replacement: 'X' }]);
       expect(result).toBe('Xbc');
     });
 
     it('handles edit at end of string', () => {
-      const result = applyEdits('abc', [
-        { span: { start: 2, end: 3 }, replacement: 'Z' },
-      ]);
+      const result = applyEdits('abc', [{ span: { start: 2, end: 3 }, replacement: 'Z' }]);
       expect(result).toBe('abZ');
     });
 
     it('handles insertion (zero-width span)', () => {
-      const result = applyEdits('ab', [
-        { span: { start: 1, end: 1 }, replacement: 'X' },
-      ]);
+      const result = applyEdits('ab', [{ span: { start: 1, end: 1 }, replacement: 'X' }]);
       expect(result).toBe('aXb');
     });
 
     it('handles deletion (empty replacement)', () => {
-      const result = applyEdits('abcdef', [
-        { span: { start: 2, end: 4 }, replacement: '' },
-      ]);
+      const result = applyEdits('abcdef', [{ span: { start: 2, end: 4 }, replacement: '' }]);
       expect(result).toBe('abef');
     });
 
     it('throws RangeError for out-of-bounds span', () => {
-      expect(() =>
-        applyEdits('abc', [{ span: { start: 0, end: 100 }, replacement: 'x' }])
-      ).toThrow(RangeError);
+      expect(() => applyEdits('abc', [{ span: { start: 0, end: 100 }, replacement: 'x' }])).toThrow(
+        RangeError
+      );
     });
 
     it('throws RangeError when start > end', () => {
-      expect(() =>
-        applyEdits('abc', [{ span: { start: 2, end: 1 }, replacement: 'x' }])
-      ).toThrow(RangeError);
+      expect(() => applyEdits('abc', [{ span: { start: 2, end: 1 }, replacement: 'x' }])).toThrow(
+        RangeError
+      );
     });
 
     it('throws for overlapping edits', () => {

@@ -12,6 +12,7 @@ export interface AnalysisHashInput {
   schemaSQL: string;
   hideCTEs: boolean;
   enableColumnLineage: boolean;
+  enableLinting?: boolean;
   templateMode?: TemplateMode;
 }
 
@@ -55,6 +56,7 @@ export function buildAnalysisCacheKey(input: AnalysisHashInput): string {
   hash = updateHashWithString(hash, input.dialect);
   hash = updateHashWithString(hash, input.hideCTEs ? '1' : '0');
   hash = updateHashWithString(hash, input.enableColumnLineage ? '1' : '0');
+  hash = updateHashWithString(hash, input.enableLinting ? '1' : '0');
   hash = updateHashWithString(hash, input.templateMode ?? 'raw');
   // Variable-length fields use updateHashWithField (length-prefixed)
   hash = updateHashWithField(hash, input.schemaSQL ?? '');

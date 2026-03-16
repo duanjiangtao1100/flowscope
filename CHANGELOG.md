@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-03-16
+
+### Fixed
+
+- **Linting disabled by default in web app** — linting was hardcoded as always-on in the analysis worker, causing significant performance degradation on large projects. The "Show Lint Issues" toggle now controls both display and computation, defaulting to off.
+
+### Changed
+
+- Rebuilt WASM artifacts and formatted generated code
+
 ## [0.5.0] - 2026-03-16
 
 ### Added

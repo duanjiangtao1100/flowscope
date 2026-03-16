@@ -136,7 +136,7 @@ const DEFAULT_ISSUES_STATE: IssuesViewState = {
   severity: 'all',
   codes: [],
   sourceFiles: [],
-  showLintIssues: true,
+  showLintIssues: false,
 };
 
 const DEFAULT_NAMESPACE_FILTER_STATE: NamespaceFilterState = {

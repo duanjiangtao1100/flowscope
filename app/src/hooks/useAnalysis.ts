@@ -5,6 +5,7 @@ import type { BackendAdapter, AnalysisPayload } from '@/lib/backend-adapter';
 import { useProject } from '@/lib/project-store';
 import type { Project } from '@/lib/project-store';
 import { useAnalysisStore } from '@/lib/analysis-store';
+import { useViewStateStore, getIssuesStateWithDefaults } from '@/lib/view-state-store';
 import { FILE_LIMITS, ANALYSIS_SQL_PREVIEW_LIMITS } from '@/lib/constants';
 import { AnalysisErrorCode, isAnalysisError } from '@/types';
 import type { AnalysisState, AnalysisContext, FileValidationResult } from '@/types';
@@ -43,6 +44,10 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
   const { actions, state: lineageState } = useLineage();
   const { hideCTEs } = lineageState;
   const { getResult, getMetrics, setResult: storeResult, setMetrics } = useAnalysisStore();
+  const getViewState = useViewStateStore((s) => s.getViewState);
+  const enableLinting = activeProjectId
+    ? getIssuesStateWithDefaults(getViewState(activeProjectId, 'issues')).showLintIssues
+    : false;
   const [state, setState] = useState<AnalysisState>({
     isAnalyzing: false,
     error: null,
@@ -248,6 +253,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
       schemaSQL: project.schemaSQL ?? '',
       hideCTEs,
       enableColumnLineage: true,
+      enableLinting,
       templateMode: project.templateMode,
     };
 
@@ -265,6 +271,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
             schemaSQL: project.schemaSQL ?? '',
             hideCTEs,
             enableColumnLineage: true,
+            enableLinting,
             templateMode: project.templateMode,
           });
         });
@@ -312,6 +319,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
   }, [
     activeProjectId,
     hideCTEs,
+    enableLinting,
     getResult,
     storeResult,
     setMetrics,
@@ -384,6 +392,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
           schemaSQL: currentProject.schemaSQL ?? '',
           hideCTEs,
           enableColumnLineage: true,
+          enableLinting,
           templateMode: currentProject.templateMode,
         };
 
@@ -422,6 +431,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
             schemaSQL: currentProject.schemaSQL ?? '',
             hideCTEs,
             enableColumnLineage: true,
+            enableLinting,
             templateMode: currentProject.templateMode,
           };
 
@@ -498,6 +508,7 @@ export function useAnalysis(backendReady: boolean, options?: UseAnalysisOptions)
       setAnalyzing,
       setError,
       hideCTEs,
+      enableLinting,
       adapter,
     ]
   );
