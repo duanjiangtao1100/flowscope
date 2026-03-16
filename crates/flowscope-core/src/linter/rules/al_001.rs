@@ -6,8 +6,8 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{
-    Expr, FromTable, Ident, Query, SetExpr, Statement, TableFactor, TableWithJoins,
-    UpdateTableFromKind,
+    CreateView, Expr, FromTable, Ident, Merge, Query, SetExpr, Statement, TableFactor,
+    TableWithJoins, Update, UpdateTableFromKind,
 };
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 
@@ -188,18 +188,20 @@ fn collect_table_aliases_in_statement<F: FnMut(&Ident)>(statement: &Statement, v
                 collect_table_aliases_in_query(source, visitor);
             }
         }
-        Statement::CreateView { query, .. } => collect_table_aliases_in_query(query, visitor),
+        Statement::CreateView(CreateView { query, .. }) => {
+            collect_table_aliases_in_query(query, visitor)
+        }
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 collect_table_aliases_in_query(query, visitor);
             }
         }
-        Statement::Update {
+        Statement::Update(Update {
             table,
             from,
             selection,
             ..
-        } => {
+        }) => {
             // SQLFluff does not flag the UPDATE target's own alias —
             // only FROM/JOIN aliases in subqueries or PostgreSQL FROM clause.
             // Visit joins on the target table but not the target table itself.
@@ -237,7 +239,7 @@ fn collect_table_aliases_in_statement<F: FnMut(&Ident)>(statement: &Statement, v
                 collect_table_aliases_in_expr(selection, visitor);
             }
         }
-        Statement::Merge { table, source, .. } => {
+        Statement::Merge(Merge { table, source, .. }) => {
             collect_table_aliases_in_table_factor(table, visitor);
             collect_table_aliases_in_table_factor(source, visitor);
         }

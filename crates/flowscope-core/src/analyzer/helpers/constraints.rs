@@ -19,20 +19,16 @@ pub fn extract_column_constraints(
 
     for opt in options {
         match &opt.option {
-            ColumnOption::Unique { is_primary, .. } if *is_primary => {
+            ColumnOption::PrimaryKey(_) => {
                 is_pk = Some(true);
             }
-            ColumnOption::ForeignKey {
-                foreign_table,
-                referred_columns,
-                ..
-            } => {
+            ColumnOption::ForeignKey(fk) => {
                 // Only create FK ref if we have a referenced column.
                 // If referred_columns is empty (e.g., `REFERENCES orders`), we skip
                 // creating the FK reference since we can't determine the target column.
-                if let Some(col) = referred_columns.first() {
+                if let Some(col) = fk.referred_columns.first() {
                     fk_ref = Some(ForeignKeyRef {
-                        table: foreign_table.to_string(),
+                        table: fk.foreign_table.to_string(),
                         column: col.value.clone(),
                     });
                 }
@@ -56,10 +52,13 @@ pub fn extract_table_constraints(
 
     for constraint in constraints {
         match constraint {
-            TableConstraint::PrimaryKey { columns, .. } => {
+            TableConstraint::PrimaryKey(pk) => {
                 // IndexColumn has column: OrderByExpr, we extract the column name from expr
-                let col_names: Vec<String> =
-                    columns.iter().map(|c| c.column.expr.to_string()).collect();
+                let col_names: Vec<String> = pk
+                    .columns
+                    .iter()
+                    .map(|c| c.column.expr.to_string())
+                    .collect();
                 pk_columns.extend(col_names.clone());
                 constraint_infos.push(TableConstraintInfo {
                     constraint_type: ConstraintType::PrimaryKey,
@@ -68,27 +67,28 @@ pub fn extract_table_constraints(
                     referenced_columns: None,
                 });
             }
-            TableConstraint::ForeignKey {
-                columns,
-                foreign_table,
-                referred_columns,
-                ..
-            } => {
+            TableConstraint::ForeignKey(fk) => {
                 // FK columns are Vec<Ident>
-                let col_names: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
-                let ref_col_names: Vec<String> =
-                    referred_columns.iter().map(|c| c.value.clone()).collect();
+                let col_names: Vec<String> = fk.columns.iter().map(|c| c.value.clone()).collect();
+                let ref_col_names: Vec<String> = fk
+                    .referred_columns
+                    .iter()
+                    .map(|c| c.value.clone())
+                    .collect();
                 constraint_infos.push(TableConstraintInfo {
                     constraint_type: ConstraintType::ForeignKey,
                     columns: col_names,
-                    referenced_table: Some(foreign_table.to_string()),
+                    referenced_table: Some(fk.foreign_table.to_string()),
                     referenced_columns: Some(ref_col_names),
                 });
             }
-            TableConstraint::Unique { columns, .. } => {
+            TableConstraint::Unique(uc) => {
                 // IndexColumn has column: OrderByExpr
-                let col_names: Vec<String> =
-                    columns.iter().map(|c| c.column.expr.to_string()).collect();
+                let col_names: Vec<String> = uc
+                    .columns
+                    .iter()
+                    .map(|c| c.column.expr.to_string())
+                    .collect();
                 constraint_infos.push(TableConstraintInfo {
                     constraint_type: ConstraintType::Unique,
                     columns: col_names,

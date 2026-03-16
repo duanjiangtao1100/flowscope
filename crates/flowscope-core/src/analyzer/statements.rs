@@ -95,23 +95,23 @@ impl<'a> Analyzer<'a> {
                     "CREATE_TABLE".to_string()
                 }
             }
-            Statement::CreateView {
-                name,
-                query,
-                temporary,
-                ..
-            } => {
-                self.analyze_create_view(&mut ctx, name, query, *temporary);
+            Statement::CreateView(create_view) => {
+                self.analyze_create_view(
+                    &mut ctx,
+                    &create_view.name,
+                    &create_view.query,
+                    create_view.temporary,
+                );
                 "CREATE_VIEW".to_string()
             }
-            Statement::Update {
-                table,
-                assignments,
-                from,
-                selection,
-                ..
-            } => {
-                self.analyze_update(&mut ctx, table, assignments, from, selection);
+            Statement::Update(update) => {
+                self.analyze_update(
+                    &mut ctx,
+                    &update.table,
+                    &update.assignments,
+                    &update.from,
+                    &update.selection,
+                );
                 "UPDATE".to_string()
             }
             Statement::Delete(delete) => {
@@ -124,15 +124,15 @@ impl<'a> Analyzer<'a> {
                 );
                 "DELETE".to_string()
             }
-            Statement::Merge {
-                into,
-                table,
-                source,
-                on,
-                clauses,
-                ..
-            } => {
-                self.analyze_merge(&mut ctx, *into, table, source, on, clauses);
+            Statement::Merge(merge) => {
+                self.analyze_merge(
+                    &mut ctx,
+                    merge.into,
+                    &merge.table,
+                    &merge.source,
+                    &merge.on,
+                    &merge.clauses,
+                );
                 "MERGE".to_string()
             }
             Statement::Drop {
@@ -141,10 +141,8 @@ impl<'a> Analyzer<'a> {
                 self.analyze_drop(&mut ctx, object_type, names);
                 "DROP".to_string()
             }
-            Statement::AlterTable {
-                name, operations, ..
-            } => {
-                self.analyze_alter_table(&mut ctx, name, operations);
+            Statement::AlterTable(alter_table) => {
+                self.analyze_alter_table(&mut ctx, &alter_table.name, &alter_table.operations);
                 "ALTER_TABLE".to_string()
             }
             // Statements that are recognized but don't produce lineage
@@ -526,9 +524,8 @@ impl<'a> Analyzer<'a> {
         // 4. Analyze MERGE clauses
         for clause in clauses {
             match &clause.action {
-                MergeAction::Update { assignments } => {
-                    // Analyze assignments in UPDATE clause
-                    for assignment in assignments {
+                MergeAction::Update(update_expr) => {
+                    for assignment in &update_expr.assignments {
                         expr_analyzer.analyze(&assignment.value);
                     }
                 }
@@ -548,7 +545,7 @@ impl<'a> Analyzer<'a> {
                         }
                     }
                 }
-                MergeAction::Delete => {
+                MergeAction::Delete { .. } => {
                     // DELETE has no additional expressions
                 }
             }

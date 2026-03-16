@@ -6,8 +6,8 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SetExpr, Statement,
-    TableFactor, TableWithJoins, WindowType,
+    CreateView, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SetExpr,
+    Statement, TableFactor, TableWithJoins, WindowType,
 };
 use std::collections::HashSet;
 
@@ -102,7 +102,7 @@ fn first_duplicate_table_alias_in_statement(
         Statement::Insert(insert) => insert.source.as_deref().and_then(|query| {
             first_duplicate_table_alias_in_query_with_parent(query, &[], alias_case_check)
         }),
-        Statement::CreateView { query, .. } => {
+        Statement::CreateView(CreateView { query, .. }) => {
             first_duplicate_table_alias_in_query_with_parent(query, &[], alias_case_check)
         }
         Statement::CreateTable(create) => create.query.as_deref().and_then(|query| {

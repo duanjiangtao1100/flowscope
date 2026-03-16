@@ -82,6 +82,7 @@ impl Dialect {
             Dialect::Hive => NormalizationStrategy::CaseInsensitive,
             Dialect::Mssql => NormalizationStrategy::CaseInsensitive,
             Dialect::Mysql => NormalizationStrategy::CaseSensitive,
+            Dialect::Oracle => NormalizationStrategy::Uppercase,
             Dialect::Postgres => NormalizationStrategy::Lowercase,
             Dialect::Redshift => NormalizationStrategy::CaseInsensitive,
             Dialect::Snowflake => NormalizationStrategy::Uppercase,

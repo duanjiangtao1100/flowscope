@@ -4,8 +4,8 @@
 use crate::linter::config::LintConfig;
 use crate::linter::visit::visit_expressions;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Expr, Ident, ObjectName, Query, SelectItem, SetExpr, Statement,
-    TableAlias, TableFactor,
+    Assignment, AssignmentTarget, CreateView, Expr, Ident, Merge, MergeUpdateExpr, ObjectName,
+    Query, SelectItem, SetExpr, Statement, TableAlias, TableFactor, Update,
 };
 
 use super::semantic_helpers::visit_selects_in_statement;
@@ -181,7 +181,9 @@ fn collect_cte_identifiers_in_statement(
                 collect_cte_identifiers_in_query(source, candidates);
             }
         }
-        Statement::CreateView { query, .. } => collect_cte_identifiers_in_query(query, candidates),
+        Statement::CreateView(CreateView { query, .. }) => {
+            collect_cte_identifiers_in_query(query, candidates)
+        }
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 collect_cte_identifiers_in_query(query, candidates);
@@ -238,12 +240,15 @@ fn collect_assignment_target_identifiers(
                 }
             }
         }
-        Statement::Update { assignments, .. } => {
+        Statement::Update(Update { assignments, .. }) => {
             collect_assignment_targets(assignments, candidates)
         }
-        Statement::Merge { clauses, .. } => {
+        Statement::Merge(Merge { clauses, .. }) => {
             for clause in clauses {
-                if let sqlparser::ast::MergeAction::Update { assignments } = &clause.action {
+                if let sqlparser::ast::MergeAction::Update(MergeUpdateExpr {
+                    assignments, ..
+                }) = &clause.action
+                {
                     collect_assignment_targets(assignments, candidates);
                 }
             }

@@ -5,7 +5,7 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit};
-use sqlparser::ast::{Query, Statement};
+use sqlparser::ast::{CreateView, Query, Statement};
 use sqlparser::keywords::Keyword;
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::ops::Range;
@@ -79,7 +79,7 @@ fn misplaced_cte_closing_bracket_for_statement(
 ) -> Option<Lt07Violation> {
     let query = match statement {
         Statement::Query(query) => query.as_ref(),
-        Statement::CreateView { query, .. } => query.as_ref(),
+        Statement::CreateView(CreateView { query, .. }) => query.as_ref(),
         _ => return None,
     };
 

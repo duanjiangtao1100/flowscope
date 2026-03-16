@@ -100,6 +100,7 @@ pub enum Dialect {
     Hive,
     Mssql,
     Mysql,
+    Oracle,
     Postgres,
     Redshift,
     Snowflake,
@@ -110,8 +111,8 @@ impl Dialect {
     pub fn to_sqlparser_dialect(&self) -> Box<dyn sqlparser::dialect::Dialect> {
         use sqlparser::dialect::{
             AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, DuckDbDialect,
-            GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
-            RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
+            GenericDialect, HiveDialect, MsSqlDialect, MySqlDialect, OracleDialect,
+            PostgreSqlDialect, RedshiftSqlDialect, SQLiteDialect, SnowflakeDialect,
         };
         match self {
             Self::Generic => Box::new(GenericDialect {}),
@@ -123,6 +124,7 @@ impl Dialect {
             Self::Hive => Box::new(HiveDialect {}),
             Self::Mssql => Box::new(MsSqlDialect {}),
             Self::Mysql => Box::new(MySqlDialect {}),
+            Self::Oracle => Box::new(OracleDialect {}),
             Self::Postgres => Box::new(PostgreSqlDialect {}),
             Self::Redshift => Box::new(RedshiftSqlDialect {}),
             Self::Snowflake => Box::new(SnowflakeDialect {}),

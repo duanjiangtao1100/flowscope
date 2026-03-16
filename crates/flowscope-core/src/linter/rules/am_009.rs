@@ -6,8 +6,8 @@
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind, Query, Select,
-    SetExpr, Statement, TableFactor, WindowType,
+    CreateView, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, LimitClause, OrderByKind,
+    Query, Select, SetExpr, Statement, TableFactor, WindowType,
 };
 
 use super::semantic_helpers::join_on_expr;
@@ -51,7 +51,7 @@ fn check_statement(statement: &Statement, violations: &mut usize) {
                 check_query(source, violations);
             }
         }
-        Statement::CreateView { query, .. } => check_query(query, violations),
+        Statement::CreateView(CreateView { query, .. }) => check_query(query, violations),
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 check_query(query, violations);

@@ -91,7 +91,7 @@ impl LintRule for UnusedTableAlias {
                     check_query(source, self.alias_case_check, ctx, &mut issues);
                 }
             }
-            Statement::CreateView { query, .. } => {
+            Statement::CreateView(CreateView { query, .. }) => {
                 check_query(query, self.alias_case_check, ctx, &mut issues)
             }
             Statement::CreateTable(create) => {
@@ -472,10 +472,16 @@ fn collect_identifier_prefixes_from_select(
     for lateral_view in &select.lateral_views {
         collect_identifier_prefixes(&lateral_view.lateral_view, dialect, prefixes);
     }
-    if let Some(connect_by) = &select.connect_by {
-        collect_identifier_prefixes(&connect_by.condition, dialect, prefixes);
-        for relationship in &connect_by.relationships {
-            collect_identifier_prefixes(relationship, dialect, prefixes);
+    for connect_by_kind in &select.connect_by {
+        match connect_by_kind {
+            ConnectByKind::ConnectBy { relationships, .. } => {
+                for relationship in relationships {
+                    collect_identifier_prefixes(relationship, dialect, prefixes);
+                }
+            }
+            ConnectByKind::StartWith { condition, .. } => {
+                collect_identifier_prefixes(condition, dialect, prefixes);
+            }
         }
     }
     for from_item in &select.from {

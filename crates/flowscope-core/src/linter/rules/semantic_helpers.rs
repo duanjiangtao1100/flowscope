@@ -23,7 +23,7 @@ pub fn visit_selects_in_statement<F: FnMut(&Select)>(statement: &Statement, visi
                 visit_selects_in_select_items(returning, visitor);
             }
         }
-        Statement::Update {
+        Statement::Update(Update {
             table,
             assignments,
             from,
@@ -31,7 +31,7 @@ pub fn visit_selects_in_statement<F: FnMut(&Select)>(statement: &Statement, visi
             returning,
             limit,
             ..
-        } => {
+        }) => {
             visit_selects_in_table_with_joins(table, visitor);
             for assignment in assignments {
                 visit_selects_in_expr(&assignment.value, visitor);
@@ -82,14 +82,14 @@ pub fn visit_selects_in_statement<F: FnMut(&Select)>(statement: &Statement, visi
                 visit_selects_in_expr(limit, visitor);
             }
         }
-        Statement::Merge {
+        Statement::Merge(Merge {
             table,
             source,
             on,
             clauses,
             output,
             ..
-        } => {
+        }) => {
             visit_selects_in_table_factor(table, visitor);
             visit_selects_in_table_factor(source, visitor);
             visit_selects_in_expr(on, visitor);
@@ -107,24 +107,24 @@ pub fn visit_selects_in_statement<F: FnMut(&Select)>(statement: &Statement, visi
                             }
                         }
                     }
-                    MergeAction::Update { assignments } => {
+                    MergeAction::Update(MergeUpdateExpr { assignments, .. }) => {
                         for assignment in assignments {
                             visit_selects_in_expr(&assignment.value, visitor);
                         }
                     }
-                    MergeAction::Delete => {}
+                    MergeAction::Delete { .. } => {}
                 }
             }
             if let Some(output) = output {
                 match output {
                     OutputClause::Output { select_items, .. }
-                    | OutputClause::Returning { select_items } => {
+                    | OutputClause::Returning { select_items, .. } => {
                         visit_selects_in_select_items(select_items, visitor);
                     }
                 }
             }
         }
-        Statement::CreateView { query, .. } => visit_selects_in_query(query, visitor),
+        Statement::CreateView(CreateView { query, .. }) => visit_selects_in_query(query, visitor),
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 visit_selects_in_query(query, visitor);

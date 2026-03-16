@@ -5,7 +5,7 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
-use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, Value};
+use sqlparser::ast::{CreateView, Expr, SelectItem, SetExpr, Statement, Value};
 use std::collections::HashMap;
 
 use super::column_count_helpers::{resolve_query_output_columns_strict, CteColumnCounts};
@@ -51,7 +51,7 @@ fn statement_has_unknown_result_columns(stmt: &Statement, outer_ctes: &CteColumn
         Statement::Insert(insert) => insert.source.as_ref().is_some_and(|source| {
             resolve_query_output_columns_strict(source, outer_ctes).is_none()
         }),
-        Statement::CreateView { query, .. } => {
+        Statement::CreateView(CreateView { query, .. }) => {
             query_outputs_result_set(query)
                 && resolve_query_output_columns_strict(query, outer_ctes).is_none()
         }

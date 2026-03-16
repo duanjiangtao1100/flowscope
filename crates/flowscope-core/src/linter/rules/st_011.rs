@@ -7,8 +7,9 @@ use std::collections::HashSet;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, JoinOperator, NamedWindowExpr, OrderByKind, Query, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor,
+    ConnectByKind, CreateView, Expr, FunctionArg, FunctionArgExpr, JoinOperator, NamedWindowExpr,
+    OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
+    TableFactor,
 };
 
 use super::semantic_helpers::{
@@ -50,7 +51,7 @@ fn unused_join_count_for_statement(statement: &Statement) -> usize {
             .source
             .as_ref()
             .map_or(0, |query| unused_join_count_for_query(query)),
-        Statement::CreateView { query, .. } => unused_join_count_for_query(query),
+        Statement::CreateView(CreateView { query, .. }) => unused_join_count_for_query(query),
         Statement::CreateTable(create) => create
             .query
             .as_ref()
@@ -485,10 +486,16 @@ fn visit_non_join_select_expressions<F: FnMut(&sqlparser::ast::Expr)>(
         visitor(qualify);
     }
 
-    if let Some(connect_by) = &select.connect_by {
-        visitor(&connect_by.condition);
-        for relationship in &connect_by.relationships {
-            visitor(relationship);
+    for connect_by_kind in &select.connect_by {
+        match connect_by_kind {
+            ConnectByKind::ConnectBy { relationships, .. } => {
+                for relationship in relationships {
+                    visitor(relationship);
+                }
+            }
+            ConnectByKind::StartWith { condition, .. } => {
+                visitor(condition);
+            }
         }
     }
 

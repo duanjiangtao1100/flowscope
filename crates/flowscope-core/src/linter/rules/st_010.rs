@@ -4,7 +4,7 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
-use sqlparser::ast::{BinaryOperator, Expr, Statement};
+use sqlparser::ast::{BinaryOperator, Expr, Merge, Statement, Update};
 
 use super::semantic_helpers::{visit_select_expressions, visit_selects_in_statement};
 
@@ -46,14 +46,14 @@ impl LintRule for StructureConstantExpression {
 
 fn statement_constant_predicate_count(statement: &Statement) -> usize {
     match statement {
-        Statement::Update { selection, .. } => {
+        Statement::Update(Update { selection, .. }) => {
             selection.as_ref().map_or(0, constant_predicate_count)
         }
         Statement::Delete(delete) => delete
             .selection
             .as_ref()
             .map_or(0, constant_predicate_count),
-        Statement::Merge { on, .. } => constant_predicate_count(on),
+        Statement::Merge(Merge { on, .. }) => constant_predicate_count(on),
         _ => 0,
     }
 }

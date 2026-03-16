@@ -1,7 +1,7 @@
 use crate::linter::document::{LintDocument, LintStatement};
 use crate::linter::Linter;
 use crate::types::*;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{CreateView, Statement};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -353,7 +353,7 @@ impl<'a> Analyzer<'a> {
                 Statement::CreateTable(create) => {
                     self.precollect_create_table(create, index);
                 }
-                Statement::CreateView { name, .. } => {
+                Statement::CreateView(CreateView { name, .. }) => {
                     self.precollect_create_view(name);
                 }
                 _ => {}

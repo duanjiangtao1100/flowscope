@@ -33,7 +33,7 @@ impl LintRule for UnusedCte {
                     return Vec::new();
                 }
             }
-            Statement::CreateView { query, .. } => query,
+            Statement::CreateView(CreateView { query, .. }) => query,
             Statement::CreateTable(create) => {
                 if let Some(ref q) = create.query {
                     q
@@ -221,18 +221,18 @@ fn collect_statement_refs(stmt: &Statement, refs: &mut HashSet<String>) {
                 collect_query_refs(source, refs);
             }
         }
-        Statement::CreateView { query, .. } => collect_query_refs(query, refs),
+        Statement::CreateView(CreateView { query, .. }) => collect_query_refs(query, refs),
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 collect_query_refs(query, refs);
             }
         }
-        Statement::Update {
+        Statement::Update(Update {
             table,
             from,
             selection,
             ..
-        } => {
+        }) => {
             collect_relation_refs(&table.relation, refs);
             for join in &table.joins {
                 collect_relation_refs(&join.relation, refs);

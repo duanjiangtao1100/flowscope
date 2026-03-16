@@ -2639,13 +2639,15 @@ fn collect_table_alias_idents_in_statement<F: FnMut(&Ident)>(
                 collect_table_alias_idents_in_query(source, visitor);
             }
         }
-        Statement::CreateView { query, .. } => collect_table_alias_idents_in_query(query, visitor),
+        Statement::CreateView(CreateView { query, .. }) => {
+            collect_table_alias_idents_in_query(query, visitor)
+        }
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 collect_table_alias_idents_in_query(query, visitor);
             }
         }
-        Statement::Merge { table, source, .. } => {
+        Statement::Merge(Merge { table, source, .. }) => {
             collect_table_alias_idents_in_table_factor(table, visitor);
             collect_table_alias_idents_in_table_factor(source, visitor);
         }
@@ -2972,7 +2974,7 @@ fn fix_statement(stmt: &mut Statement, rule_filter: &RuleFilter) {
                 fix_query(source, rule_filter);
             }
         }
-        Statement::CreateView { query, .. } => fix_query(query, rule_filter),
+        Statement::CreateView(CreateView { query, .. }) => fix_query(query, rule_filter),
         Statement::CreateTable(create) => {
             if let Some(query) = create.query.as_mut() {
                 fix_query(query, rule_filter);
@@ -3112,10 +3114,16 @@ fn fix_select(select: &mut Select, rule_filter: &RuleFilter) {
         fix_expr(&mut lateral_view.lateral_view, rule_filter);
     }
 
-    if let Some(connect_by) = select.connect_by.as_mut() {
-        fix_expr(&mut connect_by.condition, rule_filter);
-        for relationship in &mut connect_by.relationships {
-            fix_expr(relationship, rule_filter);
+    for connect_by_kind in &mut select.connect_by {
+        match connect_by_kind {
+            ConnectByKind::ConnectBy { relationships, .. } => {
+                for relationship in relationships {
+                    fix_expr(relationship, rule_filter);
+                }
+            }
+            ConnectByKind::StartWith { condition, .. } => {
+                fix_expr(condition, rule_filter);
+            }
         }
     }
 }
@@ -3190,6 +3198,7 @@ fn rewrite_derived_table_factor_to_cte(
             lateral,
             subquery,
             alias,
+            ..
         } => (lateral, subquery, alias),
         _ => return None,
     };
@@ -3207,6 +3216,7 @@ fn rewrite_derived_table_factor_to_cte(
     }
 
     let cte_alias = alias.clone().unwrap_or_else(|| TableAlias {
+        explicit: false,
         name: Ident::new(next_generated_cte_name(used_cte_names)),
         columns: Vec::new(),
     });

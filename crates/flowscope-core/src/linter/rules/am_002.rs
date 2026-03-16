@@ -33,7 +33,7 @@ impl LintRule for BareUnion {
                     check_query(source, &mut unions, ctx, &mut issues);
                 }
             }
-            Statement::CreateView { query, .. } => {
+            Statement::CreateView(CreateView { query, .. }) => {
                 check_query(query, &mut unions, ctx, &mut issues)
             }
             Statement::CreateTable(create) => {

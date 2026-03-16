@@ -5,7 +5,9 @@
 
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
-use sqlparser::ast::{Query, Select, SetExpr, Statement, TableFactor, UpdateTableFromKind};
+use sqlparser::ast::{
+    CreateView, Query, Select, SetExpr, Statement, TableFactor, Update, UpdateTableFromKind,
+};
 use std::collections::{HashMap, HashSet};
 
 use super::column_count_helpers::{
@@ -61,16 +63,18 @@ fn lint_statement_set_ops(
                 lint_query_set_ops(source, outer_ctes, violations);
             }
         }
-        Statement::CreateView { query, .. } => lint_query_set_ops(query, outer_ctes, violations),
+        Statement::CreateView(CreateView { query, .. }) => {
+            lint_query_set_ops(query, outer_ctes, violations)
+        }
         Statement::CreateTable(create) => {
             if let Some(query) = &create.query {
                 lint_query_set_ops(query, outer_ctes, violations);
             }
         }
-        Statement::Update {
+        Statement::Update(Update {
             from: Some(from_kind),
             ..
-        } => {
+        }) => {
             let tables = match from_kind {
                 UpdateTableFromKind::BeforeSet(t) | UpdateTableFromKind::AfterSet(t) => t,
             };

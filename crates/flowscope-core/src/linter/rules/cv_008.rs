@@ -37,7 +37,7 @@ fn check_statement(stmt: &Statement, ctx: &LintContext, issues: &mut Vec<Issue>)
                 check_query(source, ctx, issues);
             }
         }
-        Statement::CreateView { query, .. } => check_query(query, ctx, issues),
+        Statement::CreateView(CreateView { query, .. }) => check_query(query, ctx, issues),
         Statement::CreateTable(create) => {
             if let Some(ref q) = create.query {
                 check_query(q, ctx, issues);

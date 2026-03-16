@@ -4,7 +4,8 @@
 //! including CTEs, table aliases, and subquery aliases with their columns.
 
 use sqlparser::ast::{
-    Cte, Expr, Query, Select, SelectItem, SetExpr, Spanned, Statement, TableFactor, TableWithJoins,
+    CreateView, Cte, Expr, Query, Select, SelectItem, SetExpr, Spanned, Statement, TableFactor,
+    TableWithJoins,
 };
 
 use crate::analyzer::helpers::{infer_expr_type, line_col_to_offset};
@@ -79,7 +80,7 @@ fn extract_from_statement(stmt: &Statement, ctx: &mut AstContext, depth: usize) 
                 extract_from_query(query, ctx, depth);
             }
         }
-        Statement::CreateView { query, .. } => {
+        Statement::CreateView(CreateView { query, .. }) => {
             extract_from_query(query, ctx, depth);
         }
         _ => {}

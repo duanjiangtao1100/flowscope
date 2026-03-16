@@ -62,7 +62,9 @@ fn check_statement(
                 check_query(source, ctx, allow_scalar, issues, false);
             }
         }
-        Statement::CreateView { query, .. } => check_query(query, ctx, allow_scalar, issues, false),
+        Statement::CreateView(CreateView { query, .. }) => {
+            check_query(query, ctx, allow_scalar, issues, false)
+        }
         Statement::CreateTable(create) => {
             if let Some(ref q) = create.query {
                 check_query(q, ctx, allow_scalar, issues, false);

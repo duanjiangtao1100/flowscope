@@ -14,8 +14,8 @@ use super::select_analyzer::SelectAnalyzer;
 use super::Analyzer;
 use crate::types::{issue_codes, Issue, Node, NodeType, Span};
 use sqlparser::ast::{
-    self, Cte, Expr, Ident, Join, Query, Select, SetExpr, SetOperator, Statement, TableAlias,
-    TableFactor, TableWithJoins, Values,
+    self, CreateView, Cte, Expr, Ident, Join, Query, Select, SetExpr, SetOperator, Statement,
+    TableAlias, TableFactor, TableWithJoins, Values,
 };
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ pub trait Visitor {
                     self.visit_query(query);
                 }
             }
-            Statement::CreateView { query, .. } => self.visit_query(query),
+            Statement::CreateView(CreateView { query, .. }) => self.visit_query(query),
             _ => {}
         }
     }

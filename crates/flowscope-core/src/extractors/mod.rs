@@ -1,4 +1,4 @@
-use sqlparser::ast::{Statement, TableFactor};
+use sqlparser::ast::{Merge, Statement, TableFactor, Update};
 
 pub fn extract_tables(statements: &[Statement]) -> Vec<String> {
     let mut tables = Vec::new();
@@ -14,7 +14,7 @@ pub fn extract_tables(statements: &[Statement]) -> Vec<String> {
                     extract_tables_from_query_body(&source.body, &mut tables);
                 }
             }
-            Statement::Update { table, from, .. } => {
+            Statement::Update(Update { table, from, .. }) => {
                 extract_tables_from_table_factor(&table.relation, &mut tables);
                 for join in &table.joins {
                     extract_tables_from_table_factor(&join.relation, &mut tables);
@@ -60,7 +60,7 @@ pub fn extract_tables(statements: &[Statement]) -> Vec<String> {
                     }
                 }
             }
-            Statement::Merge { table, source, .. } => {
+            Statement::Merge(Merge { table, source, .. }) => {
                 extract_tables_from_table_factor(table, &mut tables);
                 extract_tables_from_table_factor(source, &mut tables);
             }
@@ -101,7 +101,7 @@ fn extract_tables_from_query_body(body: &sqlparser::ast::SetExpr, tables: &mut V
             }
         }
         SetExpr::Update(stmt) => {
-            if let sqlparser::ast::Statement::Update { table, from, .. } = stmt {
+            if let sqlparser::ast::Statement::Update(Update { table, from, .. }) = stmt {
                 extract_tables_from_table_factor(&table.relation, tables);
                 for join in &table.joins {
                     extract_tables_from_table_factor(&join.relation, tables);
@@ -156,7 +156,7 @@ fn extract_tables_from_query_body(body: &sqlparser::ast::SetExpr, tables: &mut V
             }
         }
         SetExpr::Merge(stmt) => {
-            if let sqlparser::ast::Statement::Merge { table, source, .. } = stmt {
+            if let sqlparser::ast::Statement::Merge(Merge { table, source, .. }) = stmt {
                 extract_tables_from_table_factor(table, tables);
                 extract_tables_from_table_factor(source, tables);
             }

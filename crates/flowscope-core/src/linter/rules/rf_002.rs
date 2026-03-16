@@ -11,9 +11,9 @@ use crate::linter::rule::{LintContext, LintRule};
 use crate::parser::parse_sql_with_dialect;
 use crate::types::{issue_codes, Dialect, Issue};
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart,
-    OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement,
-    TableFactor, TableWithJoins,
+    CreateView, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    ObjectNamePart, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
+    SetExpr, Statement, TableFactor, TableWithJoins,
 };
 
 use super::semantic_helpers::{
@@ -174,7 +174,9 @@ fn violations_in_statement(
             .source
             .as_ref()
             .map_or(0, |query| violations_in_query(query, ctx, external_sources)),
-        Statement::CreateView { query, .. } => violations_in_query(query, ctx, external_sources),
+        Statement::CreateView(CreateView { query, .. }) => {
+            violations_in_query(query, ctx, external_sources)
+        }
         Statement::CreateTable(create) => create
             .query
             .as_ref()

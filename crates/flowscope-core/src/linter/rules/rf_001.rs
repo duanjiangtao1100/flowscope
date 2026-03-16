@@ -9,10 +9,11 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
 use sqlparser::ast::{
-    AlterPolicyOperation, Assignment, AssignmentTarget, ConditionalStatements, Expr, FromTable,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, MergeAction, MergeInsertKind,
-    ObjectName, OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    Statement, TableFactor, TableWithJoins, UpdateTableFromKind,
+    AlterPolicy, AlterPolicyOperation, Assignment, AssignmentTarget, ConditionalStatements,
+    CreatePolicy, CreateView, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Ident, Merge, MergeAction, MergeInsertKind, MergeUpdateExpr, ObjectName, OrderByKind, Query,
+    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor,
+    TableWithJoins, Update, UpdateTableFromKind,
 };
 
 use super::semantic_helpers::{join_on_expr, table_factor_alias_name, visit_select_expressions};
@@ -199,20 +200,20 @@ fn unresolved_references_in_statement(
         Statement::Insert(insert) => insert.source.as_ref().map_or(0, |query| {
             unresolved_references_in_query(query, inherited_sources, dialect, in_trigger)
         }),
-        Statement::CreateView { query, .. } => {
+        Statement::CreateView(CreateView { query, .. }) => {
             unresolved_references_in_query(query, inherited_sources, dialect, in_trigger)
         }
         Statement::CreateTable(create) => create.query.as_ref().map_or(0, |query| {
             unresolved_references_in_query(query, inherited_sources, dialect, in_trigger)
         }),
-        Statement::Update {
+        Statement::Update(Update {
             table,
             assignments,
             from,
             selection,
             returning,
             ..
-        } => {
+        }) => {
             let mut scope_sources = inherited_sources.clone();
             register_table_with_joins_sources(table, &mut scope_sources);
             if let Some(from_tables) = from {
@@ -295,13 +296,13 @@ fn unresolved_references_in_statement(
             }
             count
         }
-        Statement::Merge {
+        Statement::Merge(Merge {
             table,
             source,
             on,
             clauses,
             ..
-        } => {
+        }) => {
             let mut scope_sources = inherited_sources.clone();
             register_table_factor_sources(table, &mut scope_sources);
             register_table_factor_sources(source, &mut scope_sources);
@@ -323,7 +324,7 @@ fn unresolved_references_in_statement(
                     );
                 }
                 match &clause.action {
-                    MergeAction::Update { assignments } => {
+                    MergeAction::Update(MergeUpdateExpr { assignments, .. }) => {
                         for assignment in assignments {
                             count += unresolved_references_in_expr(
                                 &assignment.value,
@@ -347,18 +348,18 @@ fn unresolved_references_in_statement(
                             }
                         }
                     }
-                    MergeAction::Delete => {}
+                    MergeAction::Delete { .. } => {}
                 }
             }
 
             count
         }
-        Statement::CreatePolicy {
+        Statement::CreatePolicy(CreatePolicy {
             table_name,
             using,
             with_check,
             ..
-        } => {
+        }) => {
             let mut scope_sources = inherited_sources.clone();
             scope_sources.register_object_name(table_name);
             scope_sources.register_pseudo_sources(in_trigger);
@@ -373,11 +374,11 @@ fn unresolved_references_in_statement(
             }
             count
         }
-        Statement::AlterPolicy {
+        Statement::AlterPolicy(AlterPolicy {
             table_name,
             operation,
             ..
-        } => {
+        }) => {
             let mut scope_sources = inherited_sources.clone();
             scope_sources.register_object_name(table_name);
             scope_sources.register_pseudo_sources(in_trigger);

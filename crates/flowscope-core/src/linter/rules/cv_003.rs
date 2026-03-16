@@ -255,10 +255,12 @@ fn select_clause_boundary(select: &Select) -> Option<(u64, u64)> {
             candidates.push(start);
         }
     }
-    if let Some(connect_by) = &select.connect_by {
-        if let Some(start) = span_start(connect_by.span()) {
-            candidates.push(start);
-        }
+    if let Some(start) = select
+        .connect_by
+        .first()
+        .and_then(|cb| span_start(cb.span()))
+    {
+        candidates.push(start);
     }
 
     if let GroupByExpr::Expressions(exprs, _) = &select.group_by {

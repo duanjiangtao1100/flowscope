@@ -11,7 +11,8 @@
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Dialect, Issue, IssueAutofixApplicability, IssuePatchEdit, Span};
 use sqlparser::ast::{
-    Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    CreateView, Expr, GroupByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    Update,
 };
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace};
 use std::collections::{HashMap, HashSet};
@@ -193,7 +194,7 @@ fn visit_order_safe_selects<F: FnMut(&Select)>(statement: &Statement, visitor: &
         // INSERT: column order matters — skip entirely.
         Statement::Insert(_) => {}
         // MERGE: column order matters — skip entirely.
-        Statement::Merge { .. } => {}
+        Statement::Merge(..) => {}
         // CREATE TABLE AS SELECT: column order matters — skip entirely.
         Statement::CreateTable(create) => {
             if create.query.is_some() {
@@ -201,15 +202,15 @@ fn visit_order_safe_selects<F: FnMut(&Select)>(statement: &Statement, visitor: &
             }
             // Regular CREATE TABLE without AS SELECT — nothing relevant to visit.
         }
-        Statement::CreateView { query, .. } => {
+        Statement::CreateView(CreateView { query, .. }) => {
             visit_query_selects(query, visitor, false);
         }
-        Statement::Update {
+        Statement::Update(Update {
             table,
             from,
             selection,
             ..
-        } => {
+        }) => {
             // Visit subqueries in table/from/where but not the statement columns.
             visit_table_factor_selects(&table.relation, visitor);
             for join in &table.joins {

@@ -7,8 +7,9 @@ use crate::linter::config::LintConfig;
 use crate::linter::rule::{LintContext, LintRule};
 use crate::types::{issue_codes, Issue};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, GroupByWithModifier,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value, WindowType,
+    CreateView, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    GroupByWithModifier, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    Value, WindowType,
 };
 
 use super::semantic_helpers::join_on_expr;
@@ -104,7 +105,7 @@ fn check_statement(
                 check_query(source, statement_index, style_policy, prior_style, issues);
             }
         }
-        Statement::CreateView { query, .. } => {
+        Statement::CreateView(CreateView { query, .. }) => {
             check_query(query, statement_index, style_policy, prior_style, issues);
         }
         Statement::CreateTable(create) => {
