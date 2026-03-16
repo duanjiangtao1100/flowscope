@@ -102,6 +102,7 @@ impl Dialect {
     pub fn pseudocolumns(&self) -> &'static [&'static str] {
         match self {
             Dialect::Bigquery => &["_FILE_NAME", "_PARTITIONDATE", "_PARTITIONTIME", "_TABLE_SUFFIX"],
+            Dialect::Oracle => &["LEVEL", "OBJECT_ID", "OBJECT_VALUE", "ROWID", "ROWNUM"],
             Dialect::Snowflake => &["LEVEL"],
             _ => &[],
         }
@@ -119,6 +120,7 @@ impl Dialect {
             Dialect::Hive => &["`"],
             Dialect::Mssql => &["[", "\""],
             Dialect::Mysql => &["`"],
+            Dialect::Oracle => &["\""],
             Dialect::Postgres => &["\""],
             Dialect::Redshift => &["\""],
             Dialect::Snowflake => &["\""],

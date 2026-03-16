@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-16
+
+### Added
+
+- **Oracle dialect** support across CLI (`-d oracle`), core engine, and web app UI
+- Autofix metadata types, `applyEdits` utility, and lint provenance fields
+
+### Changed
+
+- **Bumped sqlparser from 0.59 to 0.61** — migrates all AST pattern matches to the new tuple-variant API where `Statement`, `TableConstraint`, `ColumnOption`, and `MergeAction` variants now wrap dedicated structs
+- Adapted to `ConnectBy` becoming `Vec<ConnectByKind>`, `TableAlias` gaining an `explicit` field, and `TableFactor::Derived` gaining a `sample` field
+
 ## [0.4.1] - 2026-03-03
 
 ### Improved

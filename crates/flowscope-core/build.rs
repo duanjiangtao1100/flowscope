@@ -29,6 +29,7 @@ const KNOWN_DIALECTS: &[&str] = &[
     "hive",
     "mssql",
     "mysql",
+    "oracle",
     "postgres",
     "redshift",
     "snowflake",
@@ -1803,12 +1804,13 @@ fn dialect_to_variant(dialect: &str) -> Option<&'static str> {
         "hive" => Some("Hive"),
         "mssql" | "tsql" => Some("Mssql"),
         "mysql" => Some("Mysql"),
+        "oracle" => Some("Oracle"),
         "postgres" => Some("Postgres"),
         "redshift" => Some("Redshift"),
         "snowflake" => Some("Snowflake"),
         "sqlite" => Some("Sqlite"),
         // Dialects in specs but not in our enum
-        "doris" | "drill" | "oracle" | "presto" | "spark" | "starrocks" | "tableau"
+        "doris" | "drill" | "presto" | "spark" | "starrocks" | "tableau"
         | "teradata" | "trino" => None,
         _ => {
             println!("cargo:warning=Unknown dialect '{dialect}' in specs");

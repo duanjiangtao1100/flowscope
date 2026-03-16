@@ -116,6 +116,7 @@ impl Dialect {
             Dialect::Hive => NullOrdering::NullsAreSmall,
             Dialect::Mssql => NullOrdering::NullsAreSmall,
             Dialect::Mysql => NullOrdering::NullsAreSmall,
+            Dialect::Oracle => NullOrdering::NullsAreLarge,
             Dialect::Postgres => NullOrdering::NullsAreLarge,
             Dialect::Redshift => NullOrdering::NullsAreLarge,
             Dialect::Snowflake => NullOrdering::NullsAreLarge,
