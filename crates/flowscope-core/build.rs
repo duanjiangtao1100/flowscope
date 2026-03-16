@@ -1810,8 +1810,9 @@ fn dialect_to_variant(dialect: &str) -> Option<&'static str> {
         "snowflake" => Some("Snowflake"),
         "sqlite" => Some("Sqlite"),
         // Dialects in specs but not in our enum
-        "doris" | "drill" | "presto" | "spark" | "starrocks" | "tableau"
-        | "teradata" | "trino" => None,
+        "doris" | "drill" | "presto" | "spark" | "starrocks" | "tableau" | "teradata" | "trino" => {
+            None
+        }
         _ => {
             println!("cargo:warning=Unknown dialect '{dialect}' in specs");
             None
