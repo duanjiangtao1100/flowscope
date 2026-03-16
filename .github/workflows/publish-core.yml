@@ -97,7 +97,7 @@ jobs:
       - name: Dry-run publish crates
         if: ${{ env.DRY_RUN == 'true' }}
         run: |
-          cargo publish -p flowscope-core --dry-run --locked
+          cargo publish -p flowscope-core --dry-run --locked --allow-dirty
           cargo publish -p flowscope-export --dry-run --locked
           cargo publish -p flowscope-cli --dry-run --locked --allow-dirty
 
@@ -118,7 +118,7 @@ jobs:
               echo "${CRATE}@${VERSION} already published; skipping."
             elif [ "$STATUS" = "404" ]; then
               EXTRA_FLAGS=""
-              if [ "$CRATE" = "flowscope-cli" ]; then
+              if [ "$CRATE" = "flowscope-core" ] || [ "$CRATE" = "flowscope-cli" ]; then
                 EXTRA_FLAGS="--allow-dirty"
               fi
               cargo publish -p "${CRATE}" --locked $EXTRA_FLAGS
