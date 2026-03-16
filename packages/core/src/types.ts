@@ -16,6 +16,7 @@ export type Dialect =
   | 'hive'
   | 'mssql'
   | 'mysql'
+  | 'oracle'
   | 'postgres'
   | 'redshift'
   | 'snowflake'
