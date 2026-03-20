@@ -51,6 +51,9 @@ pub(crate) struct Scope {
     /// Scope-local output columns for subquery/CTE aliases materialized in this scope.
     /// These shadow statement-global CTE definitions when alias names are reused.
     pub(crate) subquery_columns: HashMap<String, Vec<OutputColumn>>,
+    /// True when the scope contains a table function relation whose output
+    /// columns may be dialect-provided rather than schema-backed.
+    pub(crate) has_table_function_relation: bool,
 }
 
 impl Scope {
@@ -97,7 +100,12 @@ pub(crate) struct StatementContext {
     pub(crate) last_operation: Option<String>,
     /// Current join information (type + condition) for edge labeling
     pub(crate) current_join_info: JoinInfo,
-    /// Table canonical name -> node ID (for column ownership) - global registry
+    /// Table canonical name -> node ID (for column ownership) — global registry.
+    ///
+    /// In self-joins, the last registered instance overwrites the previous entry,
+    /// so this map points to an arbitrary instance for self-joined tables. Use
+    /// `resolve_alias_instance` (via `alias_instances` on `Scope`) for
+    /// instance-specific lookups when an alias is available.
     pub(crate) table_node_ids: HashMap<String, Arc<str>>,
     /// Output columns for this statement (for column lineage)
     pub(crate) output_columns: Vec<OutputColumn>,
@@ -474,6 +482,19 @@ impl StatementContext {
         if let Some(scope) = self.current_scope_mut() {
             scope.subquery_aliases.insert(alias);
         }
+    }
+
+    /// Mark that the current scope contains a table function relation.
+    pub(crate) fn mark_table_function_in_scope(&mut self) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.has_table_function_relation = true;
+        }
+    }
+
+    /// Returns true when the current scope contains a table function relation.
+    pub(crate) fn current_scope_has_table_function_relation(&self) -> bool {
+        self.current_scope()
+            .is_some_and(|scope| scope.has_table_function_relation)
     }
 
     /// Register statement-global output columns for a named CTE definition.

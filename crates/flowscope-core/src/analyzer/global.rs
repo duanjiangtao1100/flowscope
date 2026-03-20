@@ -6,6 +6,8 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(feature = "tracing")]
+use tracing::debug;
 
 impl<'a> Analyzer<'a> {
     pub(super) fn build_result(&self) -> crate::AnalyzeResult {
@@ -125,16 +127,36 @@ impl<'a> Analyzer<'a> {
                     });
             }
 
-            // Collect edges
+            // Collect edges, remapping local node IDs to their global equivalents.
+            // If a local ID is missing from the mapping (e.g., the node was filtered
+            // or never added), the original local ID is used as a fallback. This can
+            // produce dangling references in the global graph but is preferable to
+            // silently dropping edges.
             for edge in &lineage.edges {
                 let from = local_to_global_id
                     .get(&edge.from)
                     .cloned()
-                    .unwrap_or_else(|| edge.from.clone());
+                    .unwrap_or_else(|| {
+                        #[cfg(feature = "tracing")]
+                        debug!(
+                            edge_id = %edge.id,
+                            node_id = %edge.from,
+                            "global edge source not in local-to-global mapping, using local ID"
+                        );
+                        edge.from.clone()
+                    });
                 let to = local_to_global_id
                     .get(&edge.to)
                     .cloned()
-                    .unwrap_or_else(|| edge.to.clone());
+                    .unwrap_or_else(|| {
+                        #[cfg(feature = "tracing")]
+                        debug!(
+                            edge_id = %edge.id,
+                            node_id = %edge.to,
+                            "global edge target not in local-to-global mapping, using local ID"
+                        );
+                        edge.to.clone()
+                    });
 
                 if seen_global_edges.insert((
                     from.clone(),

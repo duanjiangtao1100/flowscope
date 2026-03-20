@@ -2188,6 +2188,51 @@ fn repeated_cte_aliases_create_distinct_reference_nodes() {
 }
 
 #[test]
+fn repeated_cte_aliases_across_statements_keep_distinct_global_instance_nodes() {
+    let sql = r#"
+        WITH org AS (
+            SELECT id, manager_id
+            FROM employees
+        )
+        SELECT a.id
+        FROM org a
+        JOIN org b ON a.manager_id = b.id;
+
+        WITH org AS (
+            SELECT id, parent_id AS manager_id
+            FROM departments
+        )
+        SELECT a.id
+        FROM org a
+        JOIN org b ON a.manager_id = b.id;
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+
+    let global_org_nodes: Vec<_> = result
+        .global_lineage
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == NodeType::Cte && node.canonical_name.name == "org")
+        .collect();
+
+    assert_eq!(
+        global_org_nodes.len(),
+        3,
+        "global lineage should keep one shared org definition node plus one org b instance per statement"
+    );
+
+    let statement_scoped_instances = global_org_nodes
+        .iter()
+        .filter(|node| node.statement_refs.len() == 1)
+        .count();
+    assert_eq!(
+        statement_scoped_instances, 2,
+        "non-definition CTE self-join instances should remain statement-local in global lineage"
+    );
+}
+
+#[test]
 fn cte_self_join_alias_columns_do_not_leak_across_union_scopes() {
     let sql = r#"
         WITH emp AS (
@@ -8740,6 +8785,10 @@ fn snowflake_lateral_flatten_tracks_source_table() {
     assert!(
         columns.iter().any(|c| c.eq_ignore_ascii_case("p_id")),
         "LATERAL FLATTEN pseudocolumns should still produce visible output columns"
+    );
+    assert!(
+        columns.iter().any(|c| c.eq_ignore_ascii_case("name")),
+        "best-effort unresolved projections should remain visible alongside FLATTEN outputs"
     );
 }
 

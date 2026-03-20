@@ -232,6 +232,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                 }
                 SelectItem::QualifiedWildcard(name, _) => {
                     let qualifier = name.to_string();
+                    // SelectItemQualifiedWildcardKind::Display appends ".*"
                     let qualifier = qualifier.strip_suffix(".*").unwrap_or(&qualifier);
                     self.analyzer.expand_wildcard(
                         self.ctx,

@@ -12,6 +12,7 @@ use super::helpers::{
 };
 use super::select_analyzer::SelectAnalyzer;
 use super::Analyzer;
+use crate::generated::is_value_table_function;
 use crate::types::{issue_codes, Issue, Node, NodeType, Span};
 use sqlparser::ast::{
     self, CreateView, Cte, Expr, Ident, Join, Query, Select, SetExpr, SetOperator, Statement,
@@ -740,6 +741,13 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
             }
             TableFactor::TableFunction { expr, alias, .. } => {
                 self.extract_identifiers_from_expr(expr);
+                let is_value_table = matches!(expr, Expr::Function(func) if is_value_table_function(
+                    self.analyzer.request.dialect,
+                    &func.name.to_string(),
+                ));
+                if is_value_table {
+                    self.ctx.mark_table_function_in_scope();
+                }
                 if let Some(a) = alias {
                     self.ctx
                         .register_subquery_alias_in_scope(a.name.to_string());

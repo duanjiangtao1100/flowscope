@@ -130,7 +130,9 @@ impl<'a> Analyzer<'a> {
 
         let node_id = if is_self_join {
             let alias_key = alias.unwrap_or(cte_name);
-            let instance_id = generate_node_id("cte", &format!("{cte_name}::{alias_key}"));
+            let instance_key =
+                format!("statement_{}::{cte_name}::{alias_key}", ctx.statement_index);
+            let instance_id = generate_node_id("cte", &instance_key);
             if !ctx.node_ids.contains(&instance_id) {
                 ctx.add_node(Node {
                     id: instance_id.clone(),
@@ -1078,8 +1080,15 @@ impl<'a> Analyzer<'a> {
             && params.sources.len() == 1
             && params.sources[0].table.is_none()
             && self.normalize_identifier(&params.sources[0].column) == normalized_name
+            && !ctx.current_scope_has_table_function_relation()
             && self.is_definitely_ambiguous_unqualified_column(ctx, &params.sources[0].column);
         if should_drop_unresolved_projection {
+            #[cfg(feature = "tracing")]
+            debug!(
+                column = %normalized_name,
+                node_id = %node_id,
+                "dropping ambiguous unqualified column from output (no resolved sources)"
+            );
             ctx.nodes.retain(|node| node.id != node_id);
             ctx.node_ids.remove(&node_id);
 
