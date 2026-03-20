@@ -1591,6 +1591,133 @@ fn self_join_with_aggregation() {
 }
 
 #[test]
+fn self_join_filters_attach_to_correct_instance() {
+    let sql = r#"
+        SELECT e1.name, e2.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        WHERE e1.active = true
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(table_nodes.len(), 2, "self-join should have 2 table nodes");
+
+    // Exactly one node should have the WHERE filter
+    let nodes_with_filters: Vec<_> = table_nodes
+        .iter()
+        .filter(|n| !n.filters.is_empty())
+        .collect();
+    assert_eq!(
+        nodes_with_filters.len(),
+        1,
+        "only the e1 instance should have the filter, got filters on {} nodes",
+        nodes_with_filters.len()
+    );
+
+    let filtered_node = nodes_with_filters[0];
+    assert_eq!(filtered_node.filters.len(), 1);
+    assert!(
+        filtered_node.filters[0].expression.contains("active"),
+        "filter should reference 'active'"
+    );
+}
+
+#[test]
+fn self_join_column_ownership_is_instance_aware() {
+    // Verify that columns from different aliases attach to different table nodes
+    let sql = r#"
+        SELECT e1.name AS emp_name, e2.name AS mgr_name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(table_nodes.len(), 2);
+
+    // Each table node should own different source column nodes
+    // Check that both table nodes have ownership edges to column nodes
+    for table_node in &table_nodes {
+        let owned_columns: Vec<_> = stmt
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Ownership && e.from == table_node.id)
+            .collect();
+        assert!(
+            !owned_columns.is_empty(),
+            "each self-join instance should own at least one column, but node {} has none",
+            table_node.id
+        );
+    }
+
+    // The two table nodes should have DIFFERENT column children (different IDs)
+    let owned_by_first: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Ownership && e.from == table_nodes[0].id)
+        .map(|e| &e.to)
+        .collect();
+    let owned_by_second: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Ownership && e.from == table_nodes[1].id)
+        .map(|e| &e.to)
+        .collect();
+    assert!(
+        owned_by_first.is_disjoint(&owned_by_second),
+        "self-join instances should own disjoint column sets"
+    );
+}
+
+#[test]
+fn self_join_global_lineage_merges_by_canonical() {
+    let sql = r#"
+        SELECT e1.name, e2.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+
+    // Statement-level: 2 distinct nodes
+    let stmt = first_statement(&result);
+    let stmt_table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(stmt_table_nodes.len(), 2);
+
+    // Global lineage should still have a single "employees" entry
+    let global = &result.global_lineage;
+    let global_employees: Vec<_> = global
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.canonical_name.name == "employees"
+        })
+        .collect();
+    assert_eq!(
+        global_employees.len(),
+        1,
+        "global lineage should merge self-join instances into one canonical node"
+    );
+}
+
+#[test]
 fn complex_pattern_star_schema_joins() {
     let sql = r#"
         SELECT

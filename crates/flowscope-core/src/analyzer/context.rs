@@ -105,9 +105,11 @@ pub(crate) struct StatementContext {
     /// Stack of scopes for proper column resolution
     /// The top of the stack (last element) is the current scope
     pub(crate) scope_stack: Vec<Scope>,
-    /// Pending filter predicates to attach to table nodes
-    /// Maps table canonical name -> list of filter predicates
+    /// Pending filter predicates to attach to table nodes.
+    /// Maps table canonical name -> list of filter predicates.
     pub(crate) pending_filters: HashMap<String, Vec<FilterPredicate>>,
+    /// Instance-aware pending filters keyed by node ID (for self-join disambiguation).
+    pub(crate) pending_instance_filters: HashMap<Arc<str>, Vec<FilterPredicate>>,
     /// Grouping columns for the current SELECT (normalized expression strings)
     /// Used to detect aggregation vs grouping key columns
     pub(crate) grouping_columns: HashSet<String>,
@@ -165,6 +167,7 @@ impl StatementContext {
             aliased_subquery_columns: HashMap::new(),
             scope_stack: Vec::new(),
             pending_filters: HashMap::new(),
+            pending_instance_filters: HashMap::new(),
             grouping_columns: HashSet::new(),
             has_group_by: false,
             source_table_columns: HashMap::new(),
@@ -262,6 +265,26 @@ impl StatementContext {
     ) {
         self.pending_filters
             .entry(canonical.to_string())
+            .or_default()
+            .push(FilterPredicate {
+                expression,
+                clause_type,
+            });
+    }
+
+    /// Add a filter predicate targeted at a specific node by ID.
+    ///
+    /// Used when instance-aware resolution is available (e.g., qualified
+    /// column references in self-joins) to attach filters to the correct
+    /// alias instance rather than an ambiguous canonical match.
+    pub(crate) fn add_filter_for_instance(
+        &mut self,
+        node_id: &Arc<str>,
+        expression: String,
+        clause_type: FilterClauseType,
+    ) {
+        self.pending_instance_filters
+            .entry(node_id.clone())
             .or_default()
             .push(FilterPredicate {
                 expression,

@@ -544,9 +544,21 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             // Extract column references from this specific predicate
             let column_refs = self.extract_column_refs_with_warning(predicate);
 
-            // Find unique tables referenced in this predicate
+            // Find unique tables referenced in this predicate.
+            // Track both canonical names (fallback) and instance node IDs (precise).
             let mut affected_tables: HashSet<String> = HashSet::new();
+            let mut affected_instances: HashSet<std::sync::Arc<str>> = HashSet::new();
             for col_ref in &column_refs {
+                // Try instance-aware resolution when a qualifier is present
+                if let Some(qualifier) = col_ref.table.as_deref() {
+                    if let Some(node_id) =
+                        self.analyzer.resolve_instance_node_id(self.ctx, qualifier)
+                    {
+                        affected_instances.insert(node_id);
+                        continue;
+                    }
+                }
+                // Fallback: resolve to canonical name
                 if let Some(table_canonical) = self.analyzer.resolve_column_table(
                     self.ctx,
                     col_ref.table.as_deref(),
@@ -561,7 +573,8 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             // apply the filter to all tables in the current scope as a conservative
             // fallback. This may be imprecise for complex multi-table expressions,
             // but ensures the filter is captured rather than lost.
-            if affected_tables.is_empty() && !column_refs.is_empty() {
+            if affected_tables.is_empty() && affected_instances.is_empty() && !column_refs.is_empty()
+            {
                 for table in self.ctx.tables_in_current_scope() {
                     affected_tables.insert(table);
                 }
@@ -569,6 +582,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
 
             // Add this specific predicate to affected table nodes
             let filter_text = predicate.to_string();
+            for node_id in &affected_instances {
+                self.ctx
+                    .add_filter_for_instance(node_id, filter_text.clone(), clause_type);
+            }
             for table_canonical in &affected_tables {
                 self.ctx
                     .add_filter_for_table(table_canonical, filter_text.clone(), clause_type);

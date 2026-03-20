@@ -89,14 +89,25 @@ impl<'a> Analyzer<'a> {
         let mut global_nodes: HashMap<Arc<str>, GlobalNode> = HashMap::new();
         let mut global_edges: Vec<GlobalEdge> = Vec::new();
 
-        // Collect all nodes from all statements
+        // Collect all nodes from all statements.
+        // For table-like nodes, merge by qualified_name (canonical) so that
+        // self-join instances (same canonical, different node IDs) collapse
+        // into a single global node.
         for lineage in statements {
             for node in &lineage.nodes {
                 let canonical = node.qualified_name.clone().unwrap_or(node.label.clone());
                 let canonical_name = parse_canonical_name(&canonical);
 
+                // For tables/views, use canonical name as the merge key so
+                // self-join instances are grouped. Other node types use node ID.
+                let merge_key = if node.node_type.is_table_like() {
+                    canonical.clone()
+                } else {
+                    node.id.clone()
+                };
+
                 global_nodes
-                    .entry(node.id.clone())
+                    .entry(merge_key)
                     .and_modify(|existing| {
                         existing.statement_refs.push(StatementRef {
                             statement_index: lineage.statement_index,

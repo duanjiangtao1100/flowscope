@@ -365,15 +365,17 @@ impl<'a> Analyzer<'a> {
         table_qualifier: Option<&str>,
         target_node: Option<&str>,
     ) {
-        // Resolve table qualifier to canonical name
-        let tables_to_expand: Vec<String> = if let Some(qualifier) = table_qualifier {
-            let resolved = self.resolve_table_alias(ctx, Some(qualifier));
-            resolved.into_iter().collect()
-        } else {
-            // Expand all tables in current scope (not global table_node_ids)
-            // This ensures SELECT * only expands tables from the current query's FROM clause
-            ctx.tables_in_current_scope()
-        };
+        // Resolve table qualifier to canonical name.
+        // Track the original qualifier for instance-aware column resolution.
+        let (tables_to_expand, qualifier_alias): (Vec<String>, Option<String>) =
+            if let Some(qualifier) = table_qualifier {
+                let resolved = self.resolve_table_alias(ctx, Some(qualifier));
+                (resolved.into_iter().collect(), Some(qualifier.to_string()))
+            } else {
+                // Expand all tables in current scope (not global table_node_ids)
+                // This ensures SELECT * only expands tables from the current query's FROM clause
+                (ctx.tables_in_current_scope(), None)
+            };
 
         for table_canonical in tables_to_expand {
             // First collect column info to avoid borrow conflict
@@ -423,10 +425,13 @@ impl<'a> Analyzer<'a> {
                 });
 
             if let Some(columns) = columns_to_add {
-                // Expand from schema - NOT approximate
+                // Expand from schema - NOT approximate.
+                // Use the original alias as the table qualifier when available so that
+                // downstream instance-aware resolution can resolve to the correct node.
+                let source_qualifier = qualifier_alias.clone().unwrap_or(table_canonical.clone());
                 for col_info in columns {
                     let sources = vec![ColumnRef {
-                        table: Some(col_info.table_canonical),
+                        table: Some(source_qualifier.clone()),
                         column: col_info.name.clone(),
                     }];
                     self.add_output_column(
@@ -455,7 +460,12 @@ impl<'a> Analyzer<'a> {
                 // If there's a target node, create an approximate edge from source table to target
                 // and record the pending wildcard for backward inference
                 if let Some(target) = target_node {
-                    if let Some(source_node_id) = ctx.table_node_ids.get(&table_canonical).cloned()
+                    // Use instance-aware lookup when a qualifier is available
+                    let source_node_id = qualifier_alias
+                        .as_deref()
+                        .and_then(|q| self.resolve_instance_node_id(ctx, q))
+                        .or_else(|| ctx.table_node_ids.get(&table_canonical).cloned());
+                    if let Some(source_node_id) = source_node_id
                     {
                         let edge_id = generate_edge_id(&source_node_id, target);
                         if !ctx.edge_ids.contains(&edge_id) {
@@ -915,12 +925,25 @@ impl<'a> Analyzer<'a> {
 
     /// Apply pending filters to table nodes before finalizing the statement.
     pub(super) fn apply_pending_filters(&self, ctx: &mut StatementContext) {
-        // Collect pending filters to avoid borrow issues
+        // Apply instance-targeted filters first (these are precise, keyed by node ID)
+        let instance_pending: Vec<(std::sync::Arc<str>, Vec<crate::types::FilterPredicate>)> =
+            ctx.pending_instance_filters.drain().collect();
+
+        for (node_id, filters) in instance_pending {
+            if let Some(node) = ctx
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == node_id)
+            {
+                node.filters.extend(filters);
+            }
+        }
+
+        // Apply canonical-keyed filters (fallback for non-instance-aware paths)
         let pending: Vec<(String, Vec<crate::types::FilterPredicate>)> =
             ctx.pending_filters.drain().collect();
 
         for (table_canonical, filters) in pending {
-            // Find the node for this table
             if let Some(node) = ctx
                 .nodes
                 .iter_mut()
