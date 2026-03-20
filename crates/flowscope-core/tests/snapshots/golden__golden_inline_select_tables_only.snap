@@ -95,21 +95,22 @@ expression: cleaned
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_5f1cb9854f55ab15",
+        "id": "column_1fafa75822fcf49b",
         "type": "column",
-        "label": "total_amount",
+        "label": "id",
         "canonicalName": {
-          "name": "total_amount"
+          "schema": "users",
+          "name": "id"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_5f1cb9854f55ab15"
+            "nodeId": "column_f6b363282306de23"
           }
         ]
       },
       {
-        "id": "column_cd29f390cdda5f9c",
+        "id": "column_46d6a4af3105be79",
         "type": "column",
         "label": "total_amount",
         "canonicalName": {
@@ -124,6 +125,20 @@ expression: cleaned
         ]
       },
       {
+        "id": "column_5f1cb9854f55ab15",
+        "type": "column",
+        "label": "total_amount",
+        "canonicalName": {
+          "name": "total_amount"
+        },
+        "statementRefs": [
+          {
+            "statementIndex": 0,
+            "nodeId": "column_5f1cb9854f55ab15"
+          }
+        ]
+      },
+      {
         "id": "column_d8bba385e09d94a9",
         "type": "column",
         "label": "id",
@@ -134,21 +149,6 @@ expression: cleaned
           {
             "statementIndex": 0,
             "nodeId": "column_d8bba385e09d94a9"
-          }
-        ]
-      },
-      {
-        "id": "column_f6b363282306de23",
-        "type": "column",
-        "label": "id",
-        "canonicalName": {
-          "schema": "users",
-          "name": "id"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_f6b363282306de23"
           }
         ]
       },
@@ -207,7 +207,7 @@ expression: cleaned
       },
       {
         "id": "edge_00352050e7c56142",
-        "from": "column_f6b363282306de23",
+        "from": "column_1fafa75822fcf49b",
         "to": "column_d8bba385e09d94a9",
         "type": "data_flow",
         "producerStatement": {
@@ -217,7 +217,7 @@ expression: cleaned
       {
         "id": "edge_a12016fed9425216",
         "from": "table_eaa6ebb8f158751f",
-        "to": "column_cd29f390cdda5f9c",
+        "to": "column_46d6a4af3105be79",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -226,7 +226,7 @@ expression: cleaned
       {
         "id": "edge_a92e0d09881d5676",
         "from": "table_10a0682dff76cdbc",
-        "to": "column_f6b363282306de23",
+        "to": "column_1fafa75822fcf49b",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -243,7 +243,7 @@ expression: cleaned
       },
       {
         "id": "edge_b88d4f17e7312bee",
-        "from": "column_cd29f390cdda5f9c",
+        "from": "column_46d6a4af3105be79",
         "to": "column_5f1cb9854f55ab15",
         "type": "data_flow",
         "producerStatement": {

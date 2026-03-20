@@ -1,10 +1,10 @@
-use super::helpers::parse_canonical_name;
+use super::helpers::{generate_node_id, parse_canonical_name};
 use super::Analyzer;
 use crate::types::{
-    GlobalEdge, GlobalLineage, GlobalNode, IssueCount, NodeType, ResolvedColumnSchema,
+    GlobalEdge, GlobalLineage, GlobalNode, IssueCount, Node, NodeType, ResolvedColumnSchema,
     ResolvedSchemaMetadata, ResolvedSchemaTable, StatementRef, Summary,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 impl<'a> Analyzer<'a> {
@@ -88,6 +88,8 @@ impl<'a> Analyzer<'a> {
     ) -> GlobalLineage {
         let mut global_nodes: HashMap<Arc<str>, GlobalNode> = HashMap::new();
         let mut global_edges: Vec<GlobalEdge> = Vec::new();
+        let mut local_to_global_id: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+        let mut seen_global_edges: HashSet<(Arc<str>, Arc<str>, &'static str)> = HashSet::new();
 
         // Collect all nodes from all statements.
         // For table-like nodes, merge by qualified_name (canonical) so that
@@ -98,16 +100,11 @@ impl<'a> Analyzer<'a> {
                 let canonical = node.qualified_name.clone().unwrap_or(node.label.clone());
                 let canonical_name = parse_canonical_name(&canonical);
 
-                // For tables/views, use canonical name as the merge key so
-                // self-join instances are grouped. Other node types use node ID.
-                let merge_key = if node.node_type.is_table_like() {
-                    canonical.clone()
-                } else {
-                    node.id.clone()
-                };
+                let global_id = self.global_node_id(node, &canonical);
+                local_to_global_id.insert(node.id.clone(), global_id.clone());
 
                 global_nodes
-                    .entry(merge_key)
+                    .entry(global_id.clone())
                     .and_modify(|existing| {
                         existing.statement_refs.push(StatementRef {
                             statement_index: lineage.statement_index,
@@ -115,7 +112,7 @@ impl<'a> Analyzer<'a> {
                         });
                     })
                     .or_insert_with(|| GlobalNode {
-                        id: node.id.clone(),
+                        id: global_id,
                         node_type: node.node_type,
                         label: node.label.clone(),
                         canonical_name,
@@ -130,18 +127,33 @@ impl<'a> Analyzer<'a> {
 
             // Collect edges
             for edge in &lineage.edges {
-                global_edges.push(GlobalEdge {
-                    id: edge.id.clone(),
-                    from: edge.from.clone(),
-                    to: edge.to.clone(),
-                    edge_type: edge.edge_type,
-                    producer_statement: Some(StatementRef {
-                        statement_index: lineage.statement_index,
-                        node_id: None,
-                    }),
-                    consumer_statement: None,
-                    metadata: None,
-                });
+                let from = local_to_global_id
+                    .get(&edge.from)
+                    .cloned()
+                    .unwrap_or_else(|| edge.from.clone());
+                let to = local_to_global_id
+                    .get(&edge.to)
+                    .cloned()
+                    .unwrap_or_else(|| edge.to.clone());
+
+                if seen_global_edges.insert((
+                    from.clone(),
+                    to.clone(),
+                    Self::global_edge_kind(edge.edge_type),
+                )) {
+                    global_edges.push(GlobalEdge {
+                        id: edge.id.clone(),
+                        from,
+                        to,
+                        edge_type: edge.edge_type,
+                        producer_statement: Some(StatementRef {
+                            statement_index: lineage.statement_index,
+                            node_id: None,
+                        }),
+                        consumer_statement: None,
+                        metadata: None,
+                    });
+                }
             }
         }
 
@@ -151,6 +163,34 @@ impl<'a> Analyzer<'a> {
         GlobalLineage {
             nodes: global_nodes.into_values().collect(),
             edges: global_edges,
+        }
+    }
+
+    fn global_edge_kind(edge_type: crate::types::EdgeType) -> &'static str {
+        match edge_type {
+            crate::types::EdgeType::Ownership => "ownership",
+            crate::types::EdgeType::DataFlow => "data_flow",
+            crate::types::EdgeType::Derivation => "derivation",
+            crate::types::EdgeType::JoinDependency => "join_dependency",
+            crate::types::EdgeType::CrossStatement => "cross_statement",
+        }
+    }
+
+    fn global_node_id(&self, node: &Node, canonical: &Arc<str>) -> Arc<str> {
+        match node.node_type {
+            NodeType::Table | NodeType::View => self.tracker.relation_identity(canonical).0,
+            NodeType::Cte => {
+                let definition_id = generate_node_id("cte", canonical);
+                if node.id == definition_id {
+                    definition_id
+                } else {
+                    node.id.clone()
+                }
+            }
+            NodeType::Column if node.qualified_name.is_some() => {
+                generate_node_id("column", canonical)
+            }
+            _ => node.id.clone(),
         }
     }
 

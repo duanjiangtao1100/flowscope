@@ -231,10 +231,11 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     );
                 }
                 SelectItem::QualifiedWildcard(name, _) => {
-                    let table_name = name.to_string();
+                    let qualifier = name.to_string();
+                    let qualifier = qualifier.strip_suffix(".*").unwrap_or(&qualifier);
                     self.analyzer.expand_wildcard(
                         self.ctx,
-                        Some(&table_name),
+                        Some(qualifier),
                         self.target_node.as_deref(),
                     );
                 }

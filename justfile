@@ -228,6 +228,10 @@ _mysql-stop:
 build-wasm:
     ./scripts/build-rust.sh
 
+# Build WASM module without wasm-opt (faster for development)
+build-wasm-dev:
+    ./scripts/build-rust.sh --no-opt
+
 # Build TypeScript packages
 build-ts:
     yarn build:ts
@@ -366,8 +370,8 @@ watch-lineage:
 test-rust-release:
     cargo test --workspace --release
 
-# Build and run the app
-run: build dev
+# Build and run the app (skips wasm-opt for fast iteration)
+run: build-wasm-dev build-ts dev
 
 # Check everything is working (quick validation)
 check: fmt-check-rust fmt-check-ts lint typecheck test-rust check-schema

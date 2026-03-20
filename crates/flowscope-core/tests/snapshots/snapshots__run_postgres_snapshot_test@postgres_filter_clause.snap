@@ -151,21 +151,6 @@ expression: clean_result
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_1f727b33e31ee9ef",
-        "type": "column",
-        "label": "salary",
-        "canonicalName": {
-          "schema": "employees",
-          "name": "salary"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_1f727b33e31ee9ef"
-          }
-        ]
-      },
-      {
         "id": "column_3dbe5d7f79d39de9",
         "type": "column",
         "label": "department_id",
@@ -194,21 +179,6 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_ab345f1f9b966d24",
-        "type": "column",
-        "label": "department_id",
-        "canonicalName": {
-          "schema": "employees",
-          "name": "department_id"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_ab345f1f9b966d24"
-          }
-        ]
-      },
-      {
         "id": "column_b488345e5fc75ccd",
         "type": "column",
         "label": "high_performer_avg",
@@ -223,6 +193,21 @@ expression: clean_result
         ]
       },
       {
+        "id": "column_da4cb22277640373",
+        "type": "column",
+        "label": "department_id",
+        "canonicalName": {
+          "schema": "employees",
+          "name": "department_id"
+        },
+        "statementRefs": [
+          {
+            "statementIndex": 0,
+            "nodeId": "column_ab345f1f9b966d24"
+          }
+        ]
+      },
+      {
         "id": "column_f9efe8fec9c6e348",
         "type": "column",
         "label": "total_salary",
@@ -233,6 +218,21 @@ expression: clean_result
           {
             "statementIndex": 0,
             "nodeId": "column_f9efe8fec9c6e348"
+          }
+        ]
+      },
+      {
+        "id": "column_fc7fc7c46a855c0c",
+        "type": "column",
+        "label": "salary",
+        "canonicalName": {
+          "schema": "employees",
+          "name": "salary"
+        },
+        "statementRefs": [
+          {
+            "statementIndex": 0,
+            "nodeId": "column_1f727b33e31ee9ef"
           }
         ]
       },
@@ -268,7 +268,7 @@ expression: clean_result
     "edges": [
       {
         "id": "edge_0f1579e514cd775e",
-        "from": "column_1f727b33e31ee9ef",
+        "from": "column_fc7fc7c46a855c0c",
         "to": "column_b488345e5fc75ccd",
         "type": "derivation",
         "producerStatement": {
@@ -278,7 +278,7 @@ expression: clean_result
       {
         "id": "edge_4942f2cbce2e9856",
         "from": "table_1d63721b3610a67f",
-        "to": "column_1f727b33e31ee9ef",
+        "to": "column_fc7fc7c46a855c0c",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -304,7 +304,7 @@ expression: clean_result
       },
       {
         "id": "edge_ae501bea30ceeefa",
-        "from": "column_1f727b33e31ee9ef",
+        "from": "column_fc7fc7c46a855c0c",
         "to": "column_f9efe8fec9c6e348",
         "type": "derivation",
         "producerStatement": {
@@ -313,7 +313,7 @@ expression: clean_result
       },
       {
         "id": "edge_af027a44ef3482ee",
-        "from": "column_ab345f1f9b966d24",
+        "from": "column_da4cb22277640373",
         "to": "column_3dbe5d7f79d39de9",
         "type": "data_flow",
         "producerStatement": {
@@ -323,7 +323,7 @@ expression: clean_result
       {
         "id": "edge_b766e8cbcb82abde",
         "from": "table_1d63721b3610a67f",
-        "to": "column_ab345f1f9b966d24",
+        "to": "column_da4cb22277640373",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -331,7 +331,7 @@ expression: clean_result
       },
       {
         "id": "edge_d566c80cafe06d40",
-        "from": "column_1f727b33e31ee9ef",
+        "from": "column_fc7fc7c46a855c0c",
         "to": "column_98dbbb0048c7ef08",
         "type": "derivation",
         "producerStatement": {

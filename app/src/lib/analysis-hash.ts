@@ -1,7 +1,9 @@
 import type { Dialect } from './project-store';
 import type { TemplateMode } from '@/types';
 
-const HASH_VERSION = 'v2';
+// Bump when analyzer semantics change so persisted IndexedDB results
+// do not replay stale graphs across app reloads.
+const HASH_VERSION = 'v3';
 const FNV_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV_PRIME = 0x100000001b3n;
 const FNV_MASK = 0xffffffffffffffffn;

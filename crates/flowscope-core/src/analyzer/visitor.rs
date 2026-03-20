@@ -316,7 +316,9 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
         table_name: &str,
         alias: Option<&TableAlias>,
     ) -> Option<(String, Arc<str>)> {
-        let canonical_res = self.analyzer.add_source_table(self.ctx, table_name, None, None);
+        let canonical_res = self
+            .analyzer
+            .add_source_table(self.ctx, table_name, None, None);
         let canonical = canonical_res
             .clone()
             .unwrap_or_else(|| self.analyzer.normalize_table_name(table_name));
@@ -669,10 +671,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
             TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
                 let alias_str = alias.as_ref().map(|a| a.name.to_string());
-                let canonical = self.add_source_table_with_alias(
-                    &table_name,
-                    alias_str.as_deref(),
-                );
+                let canonical = self.add_source_table_with_alias(&table_name, alias_str.as_deref());
                 if let (Some(a), Some(canonical_name)) = (&alias_str, &canonical) {
                     self.ctx
                         .register_alias_in_scope(a.clone(), canonical_name.clone());

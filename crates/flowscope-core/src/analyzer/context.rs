@@ -26,7 +26,6 @@ pub(crate) struct PendingWildcard {
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInstance {
     /// Canonical (fully-qualified) table name used for schema lookup
-    #[allow(dead_code)]
     pub(crate) canonical: String,
     /// Node ID in the lineage graph (unique per instance)
     pub(crate) node_id: Arc<str>,
@@ -43,7 +42,9 @@ pub(crate) struct Scope {
     /// Aliases defined in this scope (alias -> canonical name)
     pub(crate) aliases: HashMap<String, String>,
     /// Alias -> relation instance (node_id + canonical) for instance-aware lookups.
-    /// Keys are the alias name (or canonical if no alias).
+    /// Keys are the alias name when aliased; for unaliased tables, both the simple
+    /// name (e.g., `"employees"`) and the fully-qualified canonical name
+    /// (e.g., `"public.employees"`) are registered so that either form resolves.
     pub(crate) alias_instances: HashMap<String, RelationInstance>,
     /// Subquery aliases in this scope
     pub(crate) subquery_aliases: HashSet<String>,
@@ -382,14 +383,29 @@ impl StatementContext {
         }
     }
 
-    /// Register an alias in the current scope, including instance tracking.
+    /// Register an alias in the current scope.
+    ///
+    /// Also populates `alias_instances` when a node ID for the canonical name
+    /// is already known (via `table_node_ids`), keeping the two maps in sync.
+    /// Uses `or_insert` so that a previously registered instance-specific ID
+    /// (from `register_alias_instance`) is not overwritten.
     pub(crate) fn register_alias_in_scope(&mut self, alias: String, canonical: String) {
         // Register in global aliases for backwards compatibility
         self.table_aliases.insert(alias.clone(), canonical.clone());
 
+        // Look up node_id to keep alias_instances in sync
+        let node_id = self.table_node_ids.get(&canonical).cloned();
+
         // Also register in current scope
         if let Some(scope) = self.current_scope_mut() {
-            scope.aliases.insert(alias, canonical);
+            scope.aliases.insert(alias.clone(), canonical.clone());
+            // Populate alias_instances if we have a node_id and no entry exists yet
+            if let Some(node_id) = node_id {
+                scope
+                    .alias_instances
+                    .entry(alias)
+                    .or_insert(RelationInstance { canonical, node_id });
+            }
         }
     }
 
@@ -401,13 +417,9 @@ impl StatementContext {
         node_id: Arc<str>,
     ) {
         if let Some(scope) = self.current_scope_mut() {
-            scope.alias_instances.insert(
-                alias,
-                RelationInstance {
-                    canonical,
-                    node_id,
-                },
-            );
+            scope
+                .alias_instances
+                .insert(alias, RelationInstance { canonical, node_id });
         }
     }
 
@@ -422,6 +434,32 @@ impl StatementContext {
             }
         }
         None
+    }
+
+    /// Get distinct relation instances in the current scope.
+    ///
+    /// Unlike `tables_in_current_scope`, this preserves multiple aliases that
+    /// refer to the same canonical relation.
+    pub(crate) fn relation_instances_in_current_scope(&self) -> Vec<RelationInstance> {
+        let Some(scope) = self.current_scope() else {
+            return Vec::new();
+        };
+
+        let mut seen = HashSet::new();
+        scope
+            .alias_instances
+            .values()
+            .filter(|instance| seen.insert(instance.node_id.clone()))
+            .cloned()
+            .collect()
+    }
+
+    /// Count distinct relation instances for a canonical name in the current scope.
+    pub(crate) fn relation_instance_count_in_current_scope(&self, canonical: &str) -> usize {
+        self.relation_instances_in_current_scope()
+            .into_iter()
+            .filter(|instance| instance.canonical == canonical)
+            .count()
     }
 
     /// Register a subquery alias in the current scope

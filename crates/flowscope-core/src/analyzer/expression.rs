@@ -20,6 +20,7 @@ use crate::types::{AggregationInfo, FilterClauseType};
 use crate::Dialect;
 use sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr};
 use std::collections::HashSet;
+use std::sync::Arc;
 #[cfg(feature = "tracing")]
 use tracing::debug;
 
@@ -547,7 +548,7 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             // Find unique tables referenced in this predicate.
             // Track both canonical names (fallback) and instance node IDs (precise).
             let mut affected_tables: HashSet<String> = HashSet::new();
-            let mut affected_instances: HashSet<std::sync::Arc<str>> = HashSet::new();
+            let mut affected_instances: HashSet<Arc<str>> = HashSet::new();
             for col_ref in &column_refs {
                 // Try instance-aware resolution when a qualifier is present
                 if let Some(qualifier) = col_ref.table.as_deref() {
@@ -558,7 +559,10 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
                         continue;
                     }
                 }
-                // Fallback: resolve to canonical name
+                // Fallback: resolve to canonical name. In self-joins, canonical-keyed
+                // filters are applied to ALL nodes sharing that canonical name (see
+                // apply_pending_filters), so an unqualified predicate correctly
+                // propagates to every instance.
                 if let Some(table_canonical) = self.analyzer.resolve_column_table(
                     self.ctx,
                     col_ref.table.as_deref(),
@@ -573,7 +577,9 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             // apply the filter to all tables in the current scope as a conservative
             // fallback. This may be imprecise for complex multi-table expressions,
             // but ensures the filter is captured rather than lost.
-            if affected_tables.is_empty() && affected_instances.is_empty() && !column_refs.is_empty()
+            if affected_tables.is_empty()
+                && affected_instances.is_empty()
+                && !column_refs.is_empty()
             {
                 for table in self.ctx.tables_in_current_scope() {
                     affected_tables.insert(table);

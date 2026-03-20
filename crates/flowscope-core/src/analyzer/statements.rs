@@ -252,6 +252,13 @@ impl<'a> Analyzer<'a> {
             .filter(|edge| edge.edge_type == EdgeType::Ownership && edge.from == output_node_id)
             .map(|edge| edge.to.clone())
             .collect();
+        let has_direct_output_lineage = ctx.edges.iter().any(|edge| {
+            matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+                && edge.to == output_node_id
+        });
+        if output_column_ids.is_empty() && !has_direct_output_lineage {
+            return;
+        }
 
         let mut table_columns: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
         for edge in &ctx.edges {

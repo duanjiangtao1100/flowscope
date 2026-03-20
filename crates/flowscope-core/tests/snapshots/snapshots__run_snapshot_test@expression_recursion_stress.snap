@@ -122,7 +122,7 @@ expression: clean_result
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_26ff2069a4a4ecea",
+        "id": "column_2ef9551111d8842c",
         "type": "column",
         "label": "id",
         "canonicalName": {
@@ -165,7 +165,7 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_7c34a6214f1a3e24",
+        "id": "column_7039ab623f118fbb",
         "type": "column",
         "label": "name",
         "canonicalName": {
@@ -180,7 +180,7 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_9152ce8e79d43b79",
+        "id": "column_c095de271d35a1af",
         "type": "column",
         "label": "status",
         "canonicalName": {
@@ -241,7 +241,7 @@ expression: clean_result
       {
         "id": "edge_0390765de4d1ae1c",
         "from": "table_7ae83469200f360a",
-        "to": "column_9152ce8e79d43b79",
+        "to": "column_c095de271d35a1af",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -249,7 +249,7 @@ expression: clean_result
       },
       {
         "id": "edge_2066157ef32be8fc",
-        "from": "column_9152ce8e79d43b79",
+        "from": "column_c095de271d35a1af",
         "to": "column_6d3e215856921290",
         "type": "data_flow",
         "producerStatement": {
@@ -259,7 +259,7 @@ expression: clean_result
       {
         "id": "edge_2e5f868669b24f75",
         "from": "table_7ae83469200f360a",
-        "to": "column_26ff2069a4a4ecea",
+        "to": "column_2ef9551111d8842c",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -267,7 +267,7 @@ expression: clean_result
       },
       {
         "id": "edge_7fc03a3a502427eb",
-        "from": "column_26ff2069a4a4ecea",
+        "from": "column_2ef9551111d8842c",
         "to": "column_d8bba385e09d94a9",
         "type": "data_flow",
         "producerStatement": {
@@ -276,7 +276,7 @@ expression: clean_result
       },
       {
         "id": "edge_af19f27b3f4753c9",
-        "from": "column_7c34a6214f1a3e24",
+        "from": "column_7039ab623f118fbb",
         "to": "column_629d7cf5d2e3562d",
         "type": "data_flow",
         "producerStatement": {
@@ -304,7 +304,7 @@ expression: clean_result
       {
         "id": "edge_d4a322cc1a33a67e",
         "from": "table_7ae83469200f360a",
-        "to": "column_7c34a6214f1a3e24",
+        "to": "column_7039ab623f118fbb",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0

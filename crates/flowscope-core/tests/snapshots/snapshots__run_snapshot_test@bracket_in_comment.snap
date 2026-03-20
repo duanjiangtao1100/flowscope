@@ -58,21 +58,7 @@ expression: clean_result
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_b0a93676e4fd73eb",
-        "type": "column",
-        "label": "a",
-        "canonicalName": {
-          "name": "a"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_b0a93676e4fd73eb"
-          }
-        ]
-      },
-      {
-        "id": "column_b88eb99e57967cf9",
+        "id": "column_2e3bf849170d9e5a",
         "type": "column",
         "label": "a",
         "canonicalName": {
@@ -83,6 +69,20 @@ expression: clean_result
           {
             "statementIndex": 0,
             "nodeId": "column_b88eb99e57967cf9"
+          }
+        ]
+      },
+      {
+        "id": "column_b0a93676e4fd73eb",
+        "type": "column",
+        "label": "a",
+        "canonicalName": {
+          "name": "a"
+        },
+        "statementRefs": [
+          {
+            "statementIndex": 0,
+            "nodeId": "column_b0a93676e4fd73eb"
           }
         ]
       },
@@ -127,7 +127,7 @@ expression: clean_result
       },
       {
         "id": "edge_b328209e9d27b744",
-        "from": "column_b88eb99e57967cf9",
+        "from": "column_2e3bf849170d9e5a",
         "to": "column_b0a93676e4fd73eb",
         "type": "data_flow",
         "producerStatement": {
@@ -137,7 +137,7 @@ expression: clean_result
       {
         "id": "edge_e6380314c992d57f",
         "from": "table_36d2446b5916819d",
-        "to": "column_b88eb99e57967cf9",
+        "to": "column_2e3bf849170d9e5a",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
