@@ -8,7 +8,7 @@ import {
   useLineage,
 } from '@pondpilot/flowscope-react';
 import type { AnalyzeResult, SchemaTable } from '@pondpilot/flowscope-core';
-import { Settings } from 'lucide-react';
+import { Loader2, Settings } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { useGlobalShortcuts } from '@/hooks';
@@ -31,6 +31,7 @@ import { SchemaEditor } from './SchemaEditor';
 
 interface AnalysisViewProps {
   graphContainerRef?: React.RefObject<HTMLDivElement | null>;
+  isAnalyzing?: boolean;
 }
 
 /**
@@ -52,7 +53,10 @@ function extractSchemaFromResult(result: AnalyzeResult): SchemaTable[] {
 /**
  * Main analysis view component showing lineage graph, schema, and details.
  */
-export function AnalysisView({ graphContainerRef: externalGraphRef }: AnalysisViewProps) {
+export function AnalysisView({
+  graphContainerRef: externalGraphRef,
+  isAnalyzing = false,
+}: AnalysisViewProps) {
   const { state, actions } = useLineage();
   const { result } = state;
   const internalGraphRef = useRef<HTMLDivElement>(null);
@@ -334,10 +338,22 @@ export function AnalysisView({ graphContainerRef: externalGraphRef }: AnalysisVi
     return (
       <div className="flex flex-col items-center justify-center h-full text-muted-foreground bg-muted/5">
         <div className="p-6 text-center">
-          <h3 className="font-semibold mb-2">No Analysis Results</h3>
-          <p className="text-sm max-w-xs mx-auto">
-            Run analysis on your SQL script to see lineage and schema details here.
-          </p>
+          {isAnalyzing ? (
+            <>
+              <Loader2 className="h-6 w-6 animate-spin mx-auto mb-3 opacity-70" />
+              <h3 className="font-semibold mb-2">Analyzing SQL</h3>
+              <p className="text-sm max-w-xs mx-auto">
+                Building lineage, schema, and issue details for the current analysis run.
+              </p>
+            </>
+          ) : (
+            <>
+              <h3 className="font-semibold mb-2">No Analysis Results</h3>
+              <p className="text-sm max-w-xs mx-auto">
+                Run analysis on your SQL script to see lineage and schema details here.
+              </p>
+            </>
+          )}
         </div>
       </div>
     );

@@ -5,14 +5,20 @@ import { SqlView, useLineageState } from '@pondpilot/flowscope-react';
 import { cn } from '@/lib/utils';
 import { useProject } from '@/lib/project-store';
 import { useThemeStore, resolveTheme } from '@/lib/theme-store';
-import { useBackend } from '@/lib/backend-context';
-import { useAnalysis, useDebounce, useFileNavigation, useGlobalShortcuts } from '@/hooks';
+import { useDebounce, useFileNavigation, useGlobalShortcuts } from '@/hooks';
 import type { GlobalShortcut } from '@/hooks';
 import { EditorToolbar } from './EditorToolbar';
 import type { SqlViewMode } from './EditorToolbar';
 import { ErrorBoundary } from './ErrorBoundary';
 import { DEFAULT_FILE_NAMES } from '@/lib/constants';
 import type { RunMode } from '@/lib/project-store';
+
+interface EditorAnalysisState {
+  isAnalyzing: boolean;
+  error: string | null;
+  runAnalysis: (activeFileContent?: string, activeFilePath?: string) => Promise<void>;
+  setError: (error: string | null) => void;
+}
 
 // Fallback component shown when SqlView encounters an error
 function SqlViewFallback() {
@@ -30,6 +36,7 @@ interface EditorAreaProps {
   className?: string;
   fileSelectorOpen: boolean;
   onFileSelectorOpenChange: (open: boolean) => void;
+  analysis: EditorAnalysisState;
 }
 
 export function EditorArea({
@@ -37,6 +44,7 @@ export function EditorArea({
   className,
   fileSelectorOpen,
   onFileSelectorOpenChange,
+  analysis,
 }: EditorAreaProps) {
   const { currentProject, updateFile, createFile, setRunMode, isReadOnly } = useProject();
 
@@ -60,9 +68,7 @@ export function EditorArea({
     setSqlViewMode('template');
   }, [currentProject?.activeFileId]);
 
-  // Use backend adapter for analysis when available
-  const { adapter } = useBackend();
-  const { isAnalyzing, error, runAnalysis, setError } = useAnalysis(backendReady, { adapter });
+  const { isAnalyzing, error, runAnalysis, setError } = analysis;
 
   // Show error toast when error occurs
   useEffect(() => {

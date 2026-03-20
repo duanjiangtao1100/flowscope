@@ -19,11 +19,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/t
 import { useProject } from '@/lib/project-store';
 import { NavigationProvider } from '@/lib/navigation-context';
 import { FocusRegistryProvider } from '@/lib/focus-registry';
-import { useGlobalShortcuts } from '@/hooks';
+import { useGlobalShortcuts, useAnalysis } from '@/hooks';
 import type { GlobalShortcut } from '@/hooks';
 import { useThemeStore, type Theme } from '@/lib/theme-store';
 import { useViewStateStore } from '@/lib/view-state-store';
 import { getShortcutDisplay } from '@/lib/shortcuts';
+import { useBackend } from '@/lib/backend-context';
 
 interface WorkspaceProps {
   backendReady: boolean;
@@ -41,6 +42,8 @@ const EDITOR_PANEL_DEFAULT_SIZE = 33;
 
 export function Workspace({ backendReady, error, onRetry, isRetrying }: WorkspaceProps) {
   const { currentProject, selectFile, activeProjectId, isBackendMode } = useProject();
+  const { adapter } = useBackend();
+  const analysis = useAnalysis(backendReady, { adapter });
   const lineageActions = useLineageActions();
   const {
     highlightSpan,
@@ -446,6 +449,7 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
                   backendReady={backendReady}
                   fileSelectorOpen={fileSelectorOpen}
                   onFileSelectorOpenChange={setFileSelectorOpen}
+                  analysis={analysis}
                 />
               </ResizablePanel>
 
@@ -459,7 +463,10 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
                 collapsedSize={0}
                 data-testid="analysis-panel"
               >
-                <AnalysisView graphContainerRef={graphContainerRef} />
+                <AnalysisView
+                  graphContainerRef={graphContainerRef}
+                  isAnalyzing={analysis.isAnalyzing}
+                />
               </ResizablePanel>
             </ResizablePanelGroup>
           </div>
