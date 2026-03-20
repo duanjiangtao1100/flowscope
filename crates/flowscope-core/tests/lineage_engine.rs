@@ -2110,6 +2110,47 @@ fn ambiguous_self_join_projection_does_not_emit_dangling_column_or_join_dependen
 }
 
 #[test]
+fn unresolved_bare_join_projection_remains_in_output_schema() {
+    let sql = r#"
+        SELECT name
+        FROM customers
+        JOIN orders ON customers.id = orders.customer_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::UNRESOLVED_REFERENCE),
+        "best-effort multi-table analysis should still surface the unresolved reference"
+    );
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+
+    let visible_output_column = stmt.nodes.iter().find(|node| {
+        node.node_type == NodeType::Column
+            && &*node.label == "name"
+            && stmt.edges.iter().any(|edge| {
+                edge.edge_type == EdgeType::Ownership
+                    && edge.from == output_node.id
+                    && edge.to == node.id
+            })
+    });
+
+    assert!(
+        visible_output_column.is_some(),
+        "unresolved bare projections should remain visible in the output schema"
+    );
+}
+
+#[test]
 fn repeated_cte_aliases_create_distinct_reference_nodes() {
     let sql = r#"
         WITH org AS (
@@ -2143,6 +2184,83 @@ fn repeated_cte_aliases_create_distinct_reference_nodes() {
         unique_ids.len(),
         2,
         "CTE self-join aliases should have distinct node IDs"
+    );
+}
+
+#[test]
+fn cte_self_join_alias_columns_do_not_leak_across_union_scopes() {
+    let sql = r#"
+        WITH emp AS (
+            SELECT id, name
+            FROM employees
+        ),
+        dept AS (
+            SELECT id, name
+            FROM departments
+        )
+        SELECT b.name AS emp_name
+        FROM emp a
+        JOIN emp b ON a.id = b.id
+        UNION ALL
+        SELECT b.name AS dept_name
+        FROM dept a
+        JOIN dept b ON a.id = b.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    assert!(
+        !result.summary.has_errors,
+        "CTE alias reuse across UNION branches should analyze cleanly: {:?}",
+        result.issues
+    );
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let dept_output = stmt
+        .nodes
+        .iter()
+        .find(|node| {
+            node.node_type == NodeType::Column
+                && &*node.label == "dept_name"
+                && stmt.edges.iter().any(|edge| {
+                    edge.edge_type == EdgeType::Ownership
+                        && edge.from == output_node.id
+                        && edge.to == node.id
+                })
+        })
+        .expect("dept_name output column should exist");
+
+    let dept_source_ids: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::DataFlow && edge.to == dept_output.id)
+        .map(|edge| edge.from.clone())
+        .collect();
+    assert!(
+        !dept_source_ids.is_empty(),
+        "dept_name should receive a direct data-flow edge from the dept branch source column"
+    );
+
+    let source_owner_labels: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::Ownership && dept_source_ids.contains(&edge.to))
+        .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.from))
+        .map(|node| node.label.to_string())
+        .collect();
+
+    assert!(
+        source_owner_labels.contains("dept"),
+        "dept_name should be sourced from a dept CTE instance, saw owners {source_owner_labels:?}"
+    );
+    assert!(
+        !source_owner_labels.contains("emp"),
+        "dept_name should not reuse emp columns when aliases are reused across UNION branches, saw owners {source_owner_labels:?}"
     );
 }
 

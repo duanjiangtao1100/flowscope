@@ -180,11 +180,14 @@ impl<'a> Analyzer<'a> {
         alias: &str,
         instance_node_id: &Arc<str>,
     ) {
-        if ctx.aliased_subquery_columns.contains_key(alias) {
+        if ctx.has_subquery_columns_in_current_scope(alias) {
             return;
         }
 
-        let Some(source_columns) = ctx.aliased_subquery_columns.get(cte_name).cloned() else {
+        let Some(source_columns) = ctx
+            .resolve_subquery_columns(cte_name)
+            .map(|cols| cols.to_vec())
+        else {
             return;
         };
 
@@ -252,8 +255,7 @@ impl<'a> Analyzer<'a> {
             });
         }
 
-        ctx.aliased_subquery_columns
-            .insert(alias.to_string(), instance_columns);
+        ctx.register_subquery_columns_in_scope(alias.to_string(), instance_columns);
     }
 
     fn apply_join_metadata_to_existing_node(&self, ctx: &mut StatementContext, node_id: &Arc<str>) {
@@ -579,8 +581,7 @@ impl<'a> Analyzer<'a> {
                         .collect()
                 })
                 .or_else(|| {
-                    ctx.aliased_subquery_columns
-                        .get(&table_canonical)
+                    ctx.resolve_subquery_columns(&table_canonical)
                         .and_then(|cte_cols| {
                             // Only return Some if there are actual columns.
                             // An empty column list means the CTE used SELECT * without schema,
@@ -776,7 +777,7 @@ impl<'a> Analyzer<'a> {
         let mut candidate_tables: Vec<String> = Vec::new();
         for table_canonical in &tables_in_scope {
             // Check aliased subquery columns (CTEs and derived tables)
-            if let Some(cte_cols) = ctx.aliased_subquery_columns.get(table_canonical) {
+            if let Some(cte_cols) = ctx.resolve_subquery_columns(table_canonical) {
                 if cte_cols.iter().any(|c| c.name == normalized_col) {
                     candidate_tables.push(table_canonical.clone());
                     continue;
@@ -965,8 +966,8 @@ impl<'a> Analyzer<'a> {
                 if let Some(cte_cols) = source
                     .table
                     .as_deref()
-                    .and_then(|qualifier| ctx.aliased_subquery_columns.get(qualifier))
-                    .or_else(|| ctx.aliased_subquery_columns.get(table_canonical))
+                    .and_then(|qualifier| ctx.resolve_subquery_columns(qualifier))
+                    .or_else(|| ctx.resolve_subquery_columns(table_canonical))
                 {
                     let normalized_source_col = self.normalize_identifier(&source.column);
                     if let Some(col) = cte_cols.iter().find(|c| c.name == normalized_source_col) {
@@ -1068,16 +1069,16 @@ impl<'a> Analyzer<'a> {
             }
         }
 
-        // Drop only bare unresolved source-mirror projections (for example,
-        // `SELECT id FROM t1 JOIN t2`) so we avoid fabricating dangling lineage
-        // for ambiguous references. Aliased or transformed outputs still belong
-        // in the visible schema even when lineage extraction is partial.
+        // Drop only bare unresolved source-mirror projections when the
+        // reference is provably ambiguous. If schema metadata is incomplete we
+        // still keep the visible output column and return partial lineage.
         let should_drop_unresolved_projection = resolved_sources == 0
             && !params.sources.is_empty()
             && params.expression.is_none()
             && params.sources.len() == 1
             && params.sources[0].table.is_none()
-            && self.normalize_identifier(&params.sources[0].column) == normalized_name;
+            && self.normalize_identifier(&params.sources[0].column) == normalized_name
+            && self.is_definitely_ambiguous_unqualified_column(ctx, &params.sources[0].column);
         if should_drop_unresolved_projection {
             ctx.nodes.retain(|node| node.id != node_id);
             ctx.node_ids.remove(&node_id);
@@ -1095,6 +1096,58 @@ impl<'a> Analyzer<'a> {
             data_type: params.data_type,
             node_id,
         });
+    }
+
+    fn is_definitely_ambiguous_unqualified_column(
+        &self,
+        ctx: &StatementContext,
+        column: &str,
+    ) -> bool {
+        let relation_instances = ctx.relation_instances_in_current_scope();
+        if relation_instances.len() <= 1 {
+            return false;
+        }
+
+        let normalized_col = self.normalize_identifier(column);
+        let mut candidate_tables = HashSet::new();
+        for table_canonical in ctx.tables_in_current_scope() {
+            if ctx
+                .resolve_subquery_columns(&table_canonical)
+                .is_some_and(|cte_cols| cte_cols.iter().any(|c| c.name == normalized_col))
+            {
+                candidate_tables.insert(table_canonical.clone());
+                continue;
+            }
+
+            if self
+                .schema
+                .get(&table_canonical)
+                .is_some_and(|schema_entry| {
+                    schema_entry
+                        .table
+                        .columns
+                        .iter()
+                        .any(|c| self.normalize_identifier(&c.name) == normalized_col)
+                })
+            {
+                candidate_tables.insert(table_canonical);
+            }
+        }
+
+        if candidate_tables.len() > 1 {
+            return true;
+        }
+
+        if let Some(canonical) = candidate_tables.into_iter().next() {
+            return ctx.relation_instance_count_in_current_scope(&canonical) > 1;
+        }
+
+        relation_instances
+            .iter()
+            .map(|instance| instance.canonical.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            == 1
     }
 
     /// Convert an AST JoinOperator to JoinType enum, also extracting the join condition.

@@ -576,8 +576,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                 cte_visitor.visit_query(&cte.query);
                 let columns = self.ctx.take_output_columns_since(projection_checkpoint);
                 self.ctx
-                    .aliased_subquery_columns
-                    .insert(cte.alias.name.to_string(), columns);
+                    .register_cte_output_columns(cte.alias.name.to_string(), columns);
             }
         }
         self.visit_set_expr(&query.body);
@@ -731,7 +730,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     self.ctx
                         .register_table_in_scope(name.clone(), node_id.clone());
                     self.ctx.register_alias_in_scope(name.clone(), name.clone());
-                    self.ctx.aliased_subquery_columns.insert(name, columns);
+                    self.ctx.register_subquery_columns_in_scope(name, columns);
                 }
             }
             TableFactor::NestedJoin {

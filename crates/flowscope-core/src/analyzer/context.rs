@@ -48,6 +48,9 @@ pub(crate) struct Scope {
     pub(crate) alias_instances: HashMap<String, RelationInstance>,
     /// Subquery aliases in this scope
     pub(crate) subquery_aliases: HashSet<String>,
+    /// Scope-local output columns for subquery/CTE aliases materialized in this scope.
+    /// These shadow statement-global CTE definitions when alias names are reused.
+    pub(crate) subquery_columns: HashMap<String, Vec<OutputColumn>>,
 }
 
 impl Scope {
@@ -100,9 +103,9 @@ pub(crate) struct StatementContext {
     pub(crate) output_columns: Vec<OutputColumn>,
     /// Output node ID for SELECT statements
     pub(crate) output_node_id: Option<Arc<str>>,
-    /// Output columns for aliased subqueries (CTEs and derived tables).
-    /// Maps the alias name to its output columns for schema resolution during wildcard
-    /// expansion and column reference lookups.
+    /// Statement-global output columns for named CTE definitions.
+    /// Scope-local alias materialization lives on [`Scope::subquery_columns`] so reused
+    /// aliases do not leak across sibling branches or nested scopes.
     pub(crate) aliased_subquery_columns: HashMap<String, Vec<OutputColumn>>,
     /// Stack of scopes for proper column resolution
     /// The top of the stack (last element) is the current scope
@@ -471,6 +474,43 @@ impl StatementContext {
         if let Some(scope) = self.current_scope_mut() {
             scope.subquery_aliases.insert(alias);
         }
+    }
+
+    /// Register statement-global output columns for a named CTE definition.
+    pub(crate) fn register_cte_output_columns(&mut self, name: String, columns: Vec<OutputColumn>) {
+        self.aliased_subquery_columns.insert(name, columns);
+    }
+
+    /// Register scope-local output columns for a derived table or aliased CTE instance.
+    pub(crate) fn register_subquery_columns_in_scope(
+        &mut self,
+        name: String,
+        columns: Vec<OutputColumn>,
+    ) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.subquery_columns.insert(name, columns);
+        } else {
+            self.aliased_subquery_columns.insert(name, columns);
+        }
+    }
+
+    /// Returns true when the current scope already materialized columns for `name`.
+    pub(crate) fn has_subquery_columns_in_current_scope(&self, name: &str) -> bool {
+        self.current_scope()
+            .is_some_and(|scope| scope.subquery_columns.contains_key(name))
+    }
+
+    /// Resolve subquery/CTE output columns with lexical scoping.
+    ///
+    /// Scope-local aliases shadow statement-global CTE definition columns.
+    pub(crate) fn resolve_subquery_columns(&self, name: &str) -> Option<&[OutputColumn]> {
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(columns) = scope.subquery_columns.get(name) {
+                return Some(columns.as_slice());
+            }
+        }
+
+        self.aliased_subquery_columns.get(name).map(Vec::as_slice)
     }
 
     /// Get tables that are in scope for column resolution.
