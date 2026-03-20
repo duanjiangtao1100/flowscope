@@ -81,9 +81,10 @@ impl<'a> Analyzer<'a> {
         ctx: &mut StatementContext,
         table_name: &str,
         target_node: Option<&str>,
+        alias: Option<&str>,
     ) -> Option<String> {
         // Resolve the table reference (CTE or regular table)
-        let (canonical, node_id) = self.resolve_table_reference(ctx, table_name)?;
+        let (canonical, node_id) = self.resolve_table_reference(ctx, table_name, alias)?;
 
         // Create edge to target if specified
         self.create_source_edge(ctx, &node_id, target_node);
@@ -98,6 +99,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         ctx: &mut StatementContext,
         table_name: &str,
+        alias: Option<&str>,
     ) -> Option<(String, std::sync::Arc<str>)> {
         // Check if this is a CTE reference
         if ctx.cte_definitions.contains_key(table_name) {
@@ -105,7 +107,7 @@ impl<'a> Analyzer<'a> {
         }
 
         // Regular table or view
-        self.resolve_regular_table(ctx, table_name)
+        self.resolve_regular_table(ctx, table_name, alias)
     }
 
     /// Resolves a CTE reference and registers it in scope.
@@ -145,15 +147,34 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Resolves a regular table or view reference.
+    ///
+    /// When a table with the same canonical name already exists in the current scope
+    /// (self-join), a new node with an alias-specific ID is created. Otherwise the
+    /// standard canonical-based node ID is used for backward compatibility.
     fn resolve_regular_table(
         &mut self,
         ctx: &mut StatementContext,
         table_name: &str,
+        alias: Option<&str>,
     ) -> Option<(String, std::sync::Arc<str>)> {
         let resolution = self.canonicalize_table_reference(table_name);
         let canonical = resolution.canonical.clone();
 
-        let (id, node_type) = self.relation_identity(&canonical);
+        // Check if this canonical table already has a node in the current scope.
+        // If so, this is a self-join and we need a separate instance node.
+        let is_self_join = ctx
+            .current_scope()
+            .map_or(false, |scope| scope.tables.contains_key(&canonical));
+
+        let (id, node_type) = if is_self_join {
+            // Self-join: generate alias-specific node ID
+            let alias_key = alias.unwrap_or(table_name);
+            self.tracker
+                .relation_instance_identity(&canonical, alias_key)
+        } else {
+            self.relation_identity(&canonical)
+        };
+
         let is_known = self.is_table_known(&canonical, resolution.matched_schema);
         let resolution_source = self.determine_resolution_source(&canonical, is_known);
 
@@ -165,6 +186,14 @@ impl<'a> Analyzer<'a> {
         self.tracker
             .record_consumed(&canonical, ctx.statement_index);
         ctx.register_table_in_scope(canonical.clone(), id.clone());
+
+        // Register instance for alias-aware resolution
+        let instance_key = alias
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| {
+                crate::analyzer::helpers::extract_simple_name(&canonical).to_string()
+            });
+        ctx.register_alias_instance(instance_key, canonical.clone(), id.clone());
 
         Some((canonical, id))
     }
@@ -495,6 +524,25 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Resolve a qualifier to its instance node ID.
+    ///
+    /// Unlike `resolve_table_alias` which returns the canonical name, this
+    /// returns the node ID for the specific alias instance. Essential for
+    /// self-joins where `e1` and `e2` map to different nodes.
+    pub(super) fn resolve_instance_node_id(
+        &self,
+        ctx: &StatementContext,
+        qualifier: &str,
+    ) -> Option<Arc<str>> {
+        // Try instance-aware lookup first
+        if let Some(instance) = ctx.resolve_alias_instance(qualifier) {
+            return Some(instance.node_id.clone());
+        }
+        // Fallback: resolve alias to canonical, then look up in table_node_ids
+        let canonical = self.resolve_table_alias(ctx, Some(qualifier))?;
+        ctx.table_node_ids.get(&canonical).cloned()
+    }
+
     pub(crate) fn resolve_column_table(
         &mut self,
         ctx: &StatementContext,
@@ -692,11 +740,14 @@ impl<'a> Analyzer<'a> {
                     }
                 }
 
-                // Determine the node ID for the owning table/CTE
-                let table_node_id = ctx
-                    .table_node_ids
-                    .get(table_canonical)
-                    .cloned()
+                // Determine the node ID for the owning table/CTE.
+                // Use instance-aware lookup when a qualifier (alias) is available
+                // so that self-join aliases resolve to their own graph node.
+                let table_node_id = source
+                    .table
+                    .as_deref()
+                    .and_then(|q| self.resolve_instance_node_id(ctx, q))
+                    .or_else(|| ctx.table_node_ids.get(table_canonical).cloned())
                     .or_else(|| ctx.cte_definitions.get(table_canonical).cloned())
                     .unwrap_or_else(|| self.relation_node_id(table_canonical));
 

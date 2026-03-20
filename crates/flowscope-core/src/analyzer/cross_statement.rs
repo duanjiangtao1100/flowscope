@@ -185,6 +185,32 @@ impl CrossStatementTracker {
         }
     }
 
+    /// Returns a unique node ID and type for a specific alias of a relation.
+    ///
+    /// When a table is self-joined (`FROM t e1 JOIN t e2`), each alias gets a
+    /// distinct node ID by hashing `canonical + alias`. When the alias matches
+    /// the canonical name (no alias or same name), falls back to the standard
+    /// `relation_identity` for backward compatibility.
+    pub(crate) fn relation_instance_identity(
+        &self,
+        canonical: &str,
+        alias: &str,
+    ) -> (Arc<str>, NodeType) {
+        // If alias is the same as canonical (or the simple name extracted from canonical),
+        // fall back to the standard identity to avoid changing IDs for non-self-join cases.
+        let simple_name = crate::analyzer::helpers::extract_simple_name(canonical);
+        if alias == canonical || alias == simple_name {
+            return self.relation_identity(canonical);
+        }
+
+        let instance_key = format!("{canonical}::{alias}");
+        if self.produced_views.contains(canonical) {
+            (generate_node_id("view", &instance_key), NodeType::View)
+        } else {
+            (generate_node_id("table", &instance_key), NodeType::Table)
+        }
+    }
+
     /// Returns the node ID for a relation.
     ///
     /// Convenience method that calls `relation_identity` and returns just the ID.

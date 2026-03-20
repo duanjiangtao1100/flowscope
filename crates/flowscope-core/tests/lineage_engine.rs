@@ -1517,19 +1517,35 @@ fn self_join_multi_level_hierarchy() {
     "#;
 
     let result = run_analysis(sql, Dialect::Generic, None);
-    let tables = collect_table_names(&result);
+    let stmt = first_statement(&result);
 
+    // Each alias should produce its own table node in statement lineage
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
     assert_eq!(
-        tables.len(),
-        1,
-        "self-join should deduplicate table references"
-    );
-    assert!(
-        tables.contains("employees"),
-        "self-join should track employees table"
+        table_nodes.len(),
+        4,
+        "self-join with 4 aliases should produce 4 distinct table nodes, got: {:?}",
+        table_nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
     );
 
-    let cols = column_labels(first_statement(&result));
+    // All nodes should reference the same canonical table
+    for node in &table_nodes {
+        assert_eq!(
+            node.qualified_name.as_deref(),
+            Some("employees"),
+            "all self-join nodes should have canonical qualified_name"
+        );
+    }
+
+    // Each alias node should have a unique ID
+    let unique_ids: HashSet<_> = table_nodes.iter().map(|n| &n.id).collect();
+    assert_eq!(unique_ids.len(), 4, "each alias should have a unique node ID");
+
+    let cols = column_labels(stmt);
     for expected in ["employee", "manager", "director", "vp"] {
         assert!(
             cols.contains(&expected.to_string()),
@@ -1551,13 +1567,27 @@ fn self_join_with_aggregation() {
     "#;
 
     let result = run_analysis(sql, Dialect::Generic, None);
-    let tables = collect_table_names(&result);
+    let stmt = first_statement(&result);
 
+    // Two aliases should produce two distinct table nodes
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
     assert_eq!(
-        tables.len(),
-        1,
-        "self-join with aggregation should have single table"
+        table_nodes.len(),
+        2,
+        "self-join with 2 aliases should produce 2 distinct table nodes"
     );
+
+    // All nodes should reference the same canonical table
+    for node in &table_nodes {
+        assert_eq!(
+            node.qualified_name.as_deref(),
+            Some("employees"),
+        );
+    }
 }
 
 #[test]

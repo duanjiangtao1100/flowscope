@@ -18,15 +18,32 @@ pub(crate) struct PendingWildcard {
     pub(crate) source_node_id: Arc<str>,
 }
 
+/// A single table/view reference in a FROM or JOIN clause.
+///
+/// Each alias of the same canonical table gets its own instance with a unique
+/// `node_id`. This allows self-joins like `FROM employees e1 JOIN employees e2`
+/// to produce two distinct graph nodes.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationInstance {
+    /// Canonical (fully-qualified) table name used for schema lookup
+    pub(crate) canonical: String,
+    /// Node ID in the lineage graph (unique per instance)
+    pub(crate) node_id: Arc<str>,
+}
+
 /// Represents a single scope level for column resolution.
 /// Each SELECT/subquery/CTE body gets its own scope.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
-    /// Tables directly referenced in this scope's FROM/JOIN clauses
-    /// Maps canonical table name -> node ID
+    /// Tables directly referenced in this scope's FROM/JOIN clauses.
+    /// Maps canonical table name -> node ID.
+    /// For backwards compatibility, the last registered instance wins here.
     pub(crate) tables: HashMap<String, Arc<str>>,
     /// Aliases defined in this scope (alias -> canonical name)
     pub(crate) aliases: HashMap<String, String>,
+    /// Alias -> relation instance (node_id + canonical) for instance-aware lookups.
+    /// Keys are the alias name (or canonical if no alias).
+    pub(crate) alias_instances: HashMap<String, RelationInstance>,
     /// Subquery aliases in this scope
     pub(crate) subquery_aliases: HashSet<String>,
 }
@@ -341,7 +358,7 @@ impl StatementContext {
         }
     }
 
-    /// Register an alias in the current scope
+    /// Register an alias in the current scope, including instance tracking.
     pub(crate) fn register_alias_in_scope(&mut self, alias: String, canonical: String) {
         // Register in global aliases for backwards compatibility
         self.table_aliases.insert(alias.clone(), canonical.clone());
@@ -350,6 +367,37 @@ impl StatementContext {
         if let Some(scope) = self.current_scope_mut() {
             scope.aliases.insert(alias, canonical);
         }
+    }
+
+    /// Register an alias with its instance node ID for self-join-aware resolution.
+    pub(crate) fn register_alias_instance(
+        &mut self,
+        alias: String,
+        canonical: String,
+        node_id: Arc<str>,
+    ) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.alias_instances.insert(
+                alias,
+                RelationInstance {
+                    canonical,
+                    node_id,
+                },
+            );
+        }
+    }
+
+    /// Resolve an alias to its relation instance (canonical name + node_id).
+    ///
+    /// Searches the scope stack from innermost to outermost scope. Returns `None`
+    /// if the alias is not registered as an instance in any scope.
+    pub(crate) fn resolve_alias_instance(&self, alias: &str) -> Option<&RelationInstance> {
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(instance) = scope.alias_instances.get(alias) {
+                return Some(instance);
+            }
+        }
+        None
     }
 
     /// Register a subquery alias in the current scope
