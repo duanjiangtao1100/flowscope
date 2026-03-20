@@ -253,10 +253,6 @@ impl<'a> Analyzer<'a> {
             .map(|edge| edge.to.clone())
             .collect();
 
-        if output_column_ids.is_empty() {
-            return;
-        }
-
         let mut table_columns: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
         for edge in &ctx.edges {
             if edge.edge_type == EdgeType::Ownership {
@@ -286,18 +282,20 @@ impl<'a> Analyzer<'a> {
             } = join_info;
             let owned_columns = table_columns.get(&node_id).cloned().unwrap_or_default();
 
-            let contributes_to_output = !owned_columns.is_empty()
-                && ctx.edges.iter().any(|edge| {
-                    matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
-                        && owned_columns.iter().any(|col| col == &edge.from)
-                        && output_column_ids.contains(&edge.to)
-                });
+            let contributes_to_output = ctx.edges.iter().any(|edge| {
+                matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+                    && (edge.from == node_id || owned_columns.iter().any(|col| col == &edge.from))
+                    && (edge.to == output_node_id || output_column_ids.contains(&edge.to))
+            });
 
             if contributes_to_output {
                 continue;
             }
 
-            let edge_key = format!("join_dependency:{node_id}");
+            let edge_key = format!(
+                "join_dependency:{node_id}:{join_type:?}:{}",
+                join_condition.as_deref().unwrap_or("")
+            );
             let edge_id = generate_edge_id(&edge_key, output_node_id.as_ref());
             if ctx.edge_ids.contains(&edge_id) {
                 continue;

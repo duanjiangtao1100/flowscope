@@ -40,7 +40,7 @@ expression: clean_result
       ],
       "edges": [
         {
-          "id": "edge_165ceb322ec03db5",
+          "id": "edge_66e2160f7377e5b2",
           "from": "table_14fd3f715fc3ae74",
           "to": "output_b558dd754c71cfa6",
           "type": "join_dependency",
@@ -139,7 +139,7 @@ expression: clean_result
     ],
     "edges": [
       {
-        "id": "edge_165ceb322ec03db5",
+        "id": "edge_66e2160f7377e5b2",
         "from": "table_14fd3f715fc3ae74",
         "to": "output_b558dd754c71cfa6",
         "type": "join_dependency",

@@ -3813,6 +3813,122 @@ fn join_only_tables_emit_output_dependency() {
 }
 
 #[test]
+fn join_only_tables_emit_output_dependency_for_count_star() {
+    let sql = r#"
+        SELECT COUNT(*)
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table should connect to output for COUNT(*) queries"
+    );
+}
+
+#[test]
+fn join_only_tables_emit_output_dependency_for_distinct_projection() {
+    let sql = r#"
+        SELECT DISTINCT u.id
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table should connect to output for DISTINCT projections"
+    );
+}
+
+#[test]
+fn wildcard_join_contributors_do_not_emit_output_dependency_without_schema() {
+    let sql = r#"
+        SELECT *
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt
+        .edges
+        .iter()
+        .find(|edge| edge.edge_type == EdgeType::JoinDependency && edge.from == orders_node.id);
+
+    assert!(
+        join_dependency.is_none(),
+        "joined table should not emit join dependency when SELECT * creates a direct output edge"
+    );
+}
+
+#[test]
+fn qualified_wildcard_join_only_table_gets_dependency() {
+    // SELECT u.* only expands `users`, so `orders` is join-only and
+    // must still get a JoinDependency edge even though the wildcard
+    // creates an approximate DataFlow edge (only for `users`).
+    let sql = r#"
+        SELECT u.*
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table must get JoinDependency when only other table's wildcard is selected"
+    );
+}
+
+#[test]
 fn where_filters_attached_to_correct_tables() {
     let sql = r#"
         SELECT o.order_id, c.customer_name
