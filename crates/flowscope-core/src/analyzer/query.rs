@@ -22,6 +22,7 @@ use std::{
 /// Represents the information needed to add an expanded column during wildcard expansion.
 struct ExpandedColumnInfo {
     name: String,
+    #[allow(dead_code)]
     table_canonical: String,
     data_type: Option<String>,
 }

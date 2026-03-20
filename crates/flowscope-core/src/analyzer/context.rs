@@ -26,6 +26,7 @@ pub(crate) struct PendingWildcard {
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInstance {
     /// Canonical (fully-qualified) table name used for schema lookup
+    #[allow(dead_code)]
     pub(crate) canonical: String,
     /// Node ID in the lineage graph (unique per instance)
     pub(crate) node_id: Arc<str>,
