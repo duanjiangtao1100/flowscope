@@ -191,6 +191,15 @@ impl CrossStatementTracker {
     /// distinct node ID by hashing `canonical + alias`. When the alias matches
     /// the canonical name (no alias or same name), falls back to the standard
     /// `relation_identity` for backward compatibility.
+    ///
+    /// # Limitation
+    ///
+    /// When an alias explicitly matches the canonical (or simple) name — e.g.,
+    /// `FROM employees e1 JOIN employees employees` — both the unaliased side and
+    /// the explicitly-aliased-to-same-name side receive the same node ID. This is
+    /// a deliberate trade-off: backward compatibility for the common unaliased case
+    /// outweighs correctness for this rare edge case where a self-join alias
+    /// intentionally repeats the table name.
     pub(crate) fn relation_instance_identity(
         &self,
         canonical: &str,

@@ -1,5 +1,6 @@
 ---
 source: crates/flowscope-core/tests/snapshots.rs
+assertion_line: 278
 expression: clean_result
 ---
 {
@@ -8,11 +9,6 @@ expression: clean_result
       "statementIndex": 0,
       "statementType": "SELECT",
       "nodes": [
-        {
-          "id": "column_a83584022cfb39b9",
-          "type": "column",
-          "label": "NAME"
-        },
         {
           "id": "column_bc995241e95c3999",
           "type": "column",
@@ -48,12 +44,6 @@ expression: clean_result
           "joinCondition": "b.c_id = a.c_id"
         },
         {
-          "id": "edge_7c5cfa7376b1a3ab",
-          "from": "output_b558dd754c71cfa6",
-          "to": "column_a83584022cfb39b9",
-          "type": "ownership"
-        },
-        {
           "id": "edge_ddae51c9373aba5e",
           "from": "output_b558dd754c71cfa6",
           "to": "column_bc995241e95c3999",
@@ -66,20 +56,6 @@ expression: clean_result
   ],
   "globalLineage": {
     "nodes": [
-      {
-        "id": "column_a83584022cfb39b9",
-        "type": "column",
-        "label": "NAME",
-        "canonicalName": {
-          "name": "NAME"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_a83584022cfb39b9"
-          }
-        ]
-      },
       {
         "id": "column_bc995241e95c3999",
         "type": "column",
@@ -148,15 +124,6 @@ expression: clean_result
         }
       },
       {
-        "id": "edge_7c5cfa7376b1a3ab",
-        "from": "output_b558dd754c71cfa6",
-        "to": "column_a83584022cfb39b9",
-        "type": "ownership",
-        "producerStatement": {
-          "statementIndex": 0
-        }
-      },
-      {
         "id": "edge_ddae51c9373aba5e",
         "from": "output_b558dd754c71cfa6",
         "to": "column_bc995241e95c3999",
@@ -184,7 +151,7 @@ expression: clean_result
   "summary": {
     "statementCount": 1,
     "tableCount": 2,
-    "columnCount": 2,
+    "columnCount": 1,
     "joinCount": 1,
     "complexityScore": 20,
     "issueCount": {

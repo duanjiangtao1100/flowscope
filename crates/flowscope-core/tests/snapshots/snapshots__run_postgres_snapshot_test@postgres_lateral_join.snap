@@ -1,5 +1,6 @@
 ---
 source: crates/flowscope-core/tests/snapshots.rs
+assertion_line: 50
 expression: clean_result
 ---
 {
@@ -236,17 +237,17 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_1f727b33e31ee9ef",
+        "id": "column_1e11ec7c6d834a7a",
         "type": "column",
-        "label": "salary",
+        "label": "name",
         "canonicalName": {
           "schema": "employees",
-          "name": "salary"
+          "name": "name"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_1f727b33e31ee9ef"
+            "nodeId": "column_e651a7d1449a8c25"
           }
         ]
       },
@@ -265,7 +266,7 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_39d45884eeb4b716",
+        "id": "column_3b46d21660610a35",
         "type": "column",
         "label": "department_id",
         "canonicalName": {
@@ -294,7 +295,7 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_5aefcec4597f6680",
+        "id": "column_90c05de28c901542",
         "type": "column",
         "label": "name",
         "canonicalName": {
@@ -351,17 +352,17 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_e651a7d1449a8c25",
+        "id": "column_fc7fc7c46a855c0c",
         "type": "column",
-        "label": "name",
+        "label": "salary",
         "canonicalName": {
           "schema": "employees",
-          "name": "name"
+          "name": "salary"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_e651a7d1449a8c25"
+            "nodeId": "column_1f727b33e31ee9ef"
           }
         ]
       },
@@ -435,7 +436,7 @@ expression: clean_result
       {
         "id": "edge_3d7f94e1cb11e28c",
         "from": "table_1d63721b3610a67f",
-        "to": "column_e651a7d1449a8c25",
+        "to": "column_1e11ec7c6d834a7a",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -462,7 +463,7 @@ expression: clean_result
       {
         "id": "edge_4942f2cbce2e9856",
         "from": "table_1d63721b3610a67f",
-        "to": "column_1f727b33e31ee9ef",
+        "to": "column_fc7fc7c46a855c0c",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -488,7 +489,7 @@ expression: clean_result
       },
       {
         "id": "edge_703626513036dd1f",
-        "from": "column_39d45884eeb4b716",
+        "from": "column_3b46d21660610a35",
         "to": "column_3dbe5d7f79d39de9",
         "type": "data_flow",
         "producerStatement": {
@@ -515,7 +516,7 @@ expression: clean_result
       },
       {
         "id": "edge_a2dad43ee9d070f5",
-        "from": "column_5aefcec4597f6680",
+        "from": "column_90c05de28c901542",
         "to": "column_9cee539008461d80",
         "type": "data_flow",
         "producerStatement": {
@@ -552,7 +553,7 @@ expression: clean_result
       {
         "id": "edge_ee5e952c11ad87c2",
         "from": "table_e3d59f407f4557b4",
-        "to": "column_5aefcec4597f6680",
+        "to": "column_90c05de28c901542",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -560,7 +561,7 @@ expression: clean_result
       },
       {
         "id": "edge_f22ee78cb7dba437",
-        "from": "column_1f727b33e31ee9ef",
+        "from": "column_fc7fc7c46a855c0c",
         "to": "column_9a274df9ea201cac",
         "type": "data_flow",
         "producerStatement": {
@@ -569,7 +570,7 @@ expression: clean_result
       },
       {
         "id": "edge_f52d941fe785b2ae",
-        "from": "column_e651a7d1449a8c25",
+        "from": "column_1e11ec7c6d834a7a",
         "to": "column_e2744ee33fe5dacd",
         "type": "data_flow",
         "producerStatement": {
@@ -579,7 +580,7 @@ expression: clean_result
       {
         "id": "edge_fd47ea96a810fba1",
         "from": "table_e3d59f407f4557b4",
-        "to": "column_39d45884eeb4b716",
+        "to": "column_3b46d21660610a35",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
