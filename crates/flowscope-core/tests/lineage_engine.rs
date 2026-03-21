@@ -5333,6 +5333,118 @@ fn join_only_tables_emit_output_dependency_for_count_star() {
 }
 
 #[test]
+fn count_star_keeps_base_table_connected_to_output() {
+    let sql = r#"
+        SELECT COUNT(*)
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let users_node = find_table_node(stmt, "users").expect("users not found");
+    let count_node = find_column_node(stmt, "count").expect("count output column not found");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+
+    let users_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::Derivation
+            && edge.from == users_node.id
+            && edge.to == count_node.id
+    });
+    assert!(
+        users_dependency.is_some(),
+        "base table should connect to COUNT(*) output column"
+    );
+
+    let orders_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+    assert!(
+        orders_dependency.is_some(),
+        "joined table should still connect to output via join dependency"
+    );
+}
+
+#[test]
+fn select_literal_keeps_base_table_connected_to_output() {
+    let sql = r#"
+        SELECT 1
+        FROM users
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let users_node = find_table_node(stmt, "users").expect("users not found");
+    let literal_col = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Column)
+        .expect("literal output column not found");
+
+    let dependency = stmt
+        .edges
+        .iter()
+        .find(|edge| edge.from == users_node.id && edge.to == literal_col.id);
+    assert!(
+        dependency.is_some(),
+        "base table should connect to literal output column"
+    );
+}
+
+#[test]
+fn count_star_self_join_creates_multiple_dependencies() {
+    let sql = r#"
+        SELECT COUNT(*)
+        FROM employees e1
+        LEFT JOIN employees e2 ON e1.manager_id = e2.id
+        LEFT JOIN employees e3 ON e2.manager_id = e3.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+
+    let joined_aliases: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == NodeType::Table && node.join_type == Some(JoinType::Left))
+        .collect();
+    assert_eq!(
+        joined_aliases.len(),
+        2,
+        "expected two joined employee aliases in self-join aggregate query"
+    );
+
+    for alias_node in joined_aliases {
+        let join_dependency = stmt.edges.iter().find(|edge| {
+            edge.edge_type == EdgeType::JoinDependency
+                && edge.from == alias_node.id
+                && edge.to == output_node.id
+        });
+
+        assert!(
+            join_dependency.is_some(),
+            "joined self-join alias {} should connect to output for COUNT(*) queries",
+            alias_node.id
+        );
+    }
+}
+
+#[test]
 fn join_only_tables_emit_output_dependency_for_distinct_projection() {
     let sql = r#"
         SELECT DISTINCT u.id

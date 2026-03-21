@@ -564,6 +564,62 @@ describe('graphBuilders DML handling', () => {
     expect(outputNode, 'virtual Output node should exist for SELECT projections').toBeDefined();
   });
 
+  it('renders relation-to-output-column lineage as a table-to-output edge', () => {
+    const statement: StatementLineage = {
+      statementIndex: 0,
+      statementType: 'SELECT',
+      joinCount: 1,
+      complexityScore: 20,
+      nodes: [
+        { id: 'output:1', type: 'output', label: 'Output' },
+        { id: 'table:users', type: 'table', label: 'users', qualifiedName: 'users' },
+        {
+          id: 'table:orders',
+          type: 'table',
+          label: 'orders',
+          qualifiedName: 'orders',
+          joinType: 'LEFT',
+          joinCondition: 'u.id = o.user_id',
+        },
+        { id: 'column:count', type: 'column', label: 'count', expression: 'COUNT(*)' },
+      ],
+      edges: [
+        { id: 'own:output:count', from: 'output:1', to: 'column:count', type: 'ownership' },
+        {
+          id: 'der:users:count',
+          from: 'table:users',
+          to: 'column:count',
+          type: 'derivation',
+          expression: 'COUNT(*)',
+        },
+        {
+          id: 'join:orders:output',
+          from: 'table:orders',
+          to: 'output:1',
+          type: 'join_dependency',
+          joinType: 'LEFT',
+          joinCondition: 'u.id = o.user_id',
+        },
+      ],
+    };
+
+    const tableEdges = buildFlowEdges(statement, false);
+    const columnEdges = buildFlowEdges(statement, true);
+
+    expect(
+      tableEdges.find((edge) => edge.source === 'table:users' && edge.target === 'output:1'),
+      'table mode should surface the base table edge'
+    ).toBeDefined();
+    expect(
+      columnEdges.find((edge) => edge.source === 'table:users' && edge.target === 'output:1'),
+      'column mode should surface the base table edge'
+    ).toBeDefined();
+    expect(
+      tableEdges.find((edge) => edge.source === 'table:orders' && edge.target === 'output:1'),
+      'join-only dependency should still be preserved'
+    ).toBeDefined();
+  });
+
   it('only marks physical tables as base tables when joins exist', () => {
     const statement: StatementLineage = {
       statementIndex: 0,

@@ -87,6 +87,13 @@ expression: clean_result
           "type": "ownership"
         },
         {
+          "id": "edge_85f3b7216b522e25",
+          "from": "table_ee2c0bd87d9925df",
+          "to": "column_c7dd058668975e4c",
+          "type": "derivation",
+          "expression": "COUNT(*)"
+        },
+        {
           "id": "edge_878534d1053c90a2",
           "from": "output_b558dd754c71cfa6",
           "to": "column_c7dd058668975e4c",
@@ -248,6 +255,15 @@ expression: clean_result
         "from": "table_ee2c0bd87d9925df",
         "to": "column_854f1a8964602bc6",
         "type": "ownership",
+        "producerStatement": {
+          "statementIndex": 0
+        }
+      },
+      {
+        "id": "edge_85f3b7216b522e25",
+        "from": "table_ee2c0bd87d9925df",
+        "to": "column_c7dd058668975e4c",
+        "type": "derivation",
         "producerStatement": {
           "statementIndex": 0
         }

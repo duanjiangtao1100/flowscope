@@ -64,6 +64,13 @@ expression: cleaned
           "from": "table_1d63721b3610a67f",
           "to": "column_208687717881053c",
           "type": "ownership"
+        },
+        {
+          "id": "edge_e5c5015d505b28f8",
+          "from": "table_1d63721b3610a67f",
+          "to": "column_a4be1b20b5f604d9",
+          "type": "derivation",
+          "expression": "ROW_NUMBER() OVER (PARTITION BY dept)"
         }
       ],
       "joinCount": 0,
@@ -177,6 +184,15 @@ expression: cleaned
         "from": "table_1d63721b3610a67f",
         "to": "column_8d19bd6c3446f90a",
         "type": "ownership",
+        "producerStatement": {
+          "statementIndex": 0
+        }
+      },
+      {
+        "id": "edge_e5c5015d505b28f8",
+        "from": "table_1d63721b3610a67f",
+        "to": "column_a4be1b20b5f604d9",
+        "type": "derivation",
         "producerStatement": {
           "statementIndex": 0
         }

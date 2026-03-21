@@ -17,6 +17,7 @@ import type {
 import { GRAPH_CONFIG, UI_CONSTANTS, JOIN_TYPE_LABELS } from '../constants';
 import {
   getCreatedRelationNodeIds,
+  getOutputColumnIds,
   OUTPUT_NODE_TYPE,
   JOIN_DEPENDENCY_EDGE_TYPE,
   buildColumnOwnershipMap,
@@ -495,6 +496,16 @@ export function buildFlowEdges(
     });
   }
 
+  // Identify output columns for SELECT-like statements. Used by both column-
+  // and table-level edge builders to detect edges feeding the Output node.
+  const outputColumnIds = getOutputColumnIds(
+    statement.edges,
+    outputNode,
+    columnNodes,
+    columnToTableMap,
+    isSelect
+  );
+
   // Column-level edges: one edge per column lineage connection
   if (showColumnEdges) {
     const flowEdges: FlowEdge[] = [];
@@ -550,6 +561,8 @@ export function buildFlowEdges(
       .forEach((edge) => {
         const sourceCol = columnNodeMap.get(edge.from);
         const targetCol = columnNodeMap.get(edge.to);
+        const sourceRelationId = tableNodeMap.has(edge.from) ? edge.from : undefined;
+        const targetRelationId = columnToTableMap.get(edge.to);
 
         if (sourceCol && targetCol) {
           const sourceTableId = columnToTableMap.get(edge.from);
@@ -589,6 +602,17 @@ export function buildFlowEdges(
               },
             });
           }
+        } else if (
+          sourceRelationId &&
+          targetRelationId &&
+          sourceRelationId !== targetRelationId
+        ) {
+          // Handle relation-to-column edges (e.g., base table → COUNT(*) output column)
+          // as table-level edges. Self-referential edges (same relation) are excluded
+          // since they don't represent cross-table data flow.
+          const tablePairKey = `${sourceRelationId}_to_${targetRelationId}`;
+          tablePairsFromColumns.add(tablePairKey);
+          pushTableEdge(sourceRelationId, targetRelationId, edge.type);
         }
       });
 
@@ -623,25 +647,15 @@ export function buildFlowEdges(
   // Table-level edges: one edge per table pair (deduplicated)
   const flowEdges: FlowEdge[] = [];
   const seenEdges = new Set<string>();
-  const outputColumnIds = new Set<string>();
-  if (isSelect && outputNode) {
-    statement.edges
-      .filter((edge) => edge.type === 'ownership' && edge.from === outputNode.id)
-      .forEach((edge) => outputColumnIds.add(edge.to));
-  }
-  if (isSelect && outputColumnIds.size === 0) {
-    columnNodes.forEach((col) => {
-      if (!columnToTableMap.has(col.id)) {
-        outputColumnIds.add(col.id);
-      }
-    });
-  }
   const selectSourceTableIds = new Set<string>();
 
   for (const edge of statement.edges) {
     if (edge.type === 'data_flow' || edge.type === 'derivation') {
       if (isSelect && outputColumnIds.has(edge.to)) {
-        const sourceTableId = columnToTableMap.get(edge.from);
+        // Resolve source table: either the column's owning table, or the relation
+        // itself when a table node directly feeds an output column (e.g., COUNT(*)).
+        const sourceTableId =
+          columnToTableMap.get(edge.from) || (tableNodeMap.has(edge.from) ? edge.from : undefined);
         if (sourceTableId) {
           selectSourceTableIds.add(sourceTableId);
         }

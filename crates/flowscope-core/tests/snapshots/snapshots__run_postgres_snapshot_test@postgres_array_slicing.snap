@@ -1,6 +1,5 @@
 ---
 source: crates/flowscope-core/tests/snapshots.rs
-assertion_line: 50
 expression: clean_result
 ---
 {
@@ -53,10 +52,31 @@ expression: clean_result
           "type": "ownership"
         },
         {
+          "id": "edge_291be8ab38e4f58e",
+          "from": "table_eb6f82b7323d024e",
+          "to": "column_72f850d7dba6250a",
+          "type": "derivation",
+          "expression": "c[2:]"
+        },
+        {
           "id": "edge_445b1ea15d20468b",
           "from": "output_b558dd754c71cfa6",
           "to": "column_4be704ab7757e136",
           "type": "ownership"
+        },
+        {
+          "id": "edge_8a051484c3386a04",
+          "from": "table_eb6f82b7323d024e",
+          "to": "column_74afe1a40e295390",
+          "type": "derivation",
+          "expression": "a[:]"
+        },
+        {
+          "id": "edge_bb7ec18ded7c5861",
+          "from": "table_eb6f82b7323d024e",
+          "to": "column_5448d894ac69aeb6",
+          "type": "derivation",
+          "expression": "b[:1]"
         },
         {
           "id": "edge_cb2b6e95c8f3389d",
@@ -69,6 +89,13 @@ expression: clean_result
           "from": "output_b558dd754c71cfa6",
           "to": "column_74afe1a40e295390",
           "type": "ownership"
+        },
+        {
+          "id": "edge_fff54af0cc7fc686",
+          "from": "table_eb6f82b7323d024e",
+          "to": "column_4be704ab7757e136",
+          "type": "derivation",
+          "expression": "d[2:3]"
         }
       ],
       "joinCount": 0,
@@ -173,10 +200,37 @@ expression: clean_result
         }
       },
       {
+        "id": "edge_291be8ab38e4f58e",
+        "from": "table_eb6f82b7323d024e",
+        "to": "column_72f850d7dba6250a",
+        "type": "derivation",
+        "producerStatement": {
+          "statementIndex": 0
+        }
+      },
+      {
         "id": "edge_445b1ea15d20468b",
         "from": "output_b558dd754c71cfa6",
         "to": "column_4be704ab7757e136",
         "type": "ownership",
+        "producerStatement": {
+          "statementIndex": 0
+        }
+      },
+      {
+        "id": "edge_8a051484c3386a04",
+        "from": "table_eb6f82b7323d024e",
+        "to": "column_74afe1a40e295390",
+        "type": "derivation",
+        "producerStatement": {
+          "statementIndex": 0
+        }
+      },
+      {
+        "id": "edge_bb7ec18ded7c5861",
+        "from": "table_eb6f82b7323d024e",
+        "to": "column_5448d894ac69aeb6",
+        "type": "derivation",
         "producerStatement": {
           "statementIndex": 0
         }
@@ -195,6 +249,15 @@ expression: clean_result
         "from": "output_b558dd754c71cfa6",
         "to": "column_74afe1a40e295390",
         "type": "ownership",
+        "producerStatement": {
+          "statementIndex": 0
+        }
+      },
+      {
+        "id": "edge_fff54af0cc7fc686",
+        "from": "table_eb6f82b7323d024e",
+        "to": "column_4be704ab7757e136",
+        "type": "derivation",
         "producerStatement": {
           "statementIndex": 0
         }

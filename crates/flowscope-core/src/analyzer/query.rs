@@ -1087,7 +1087,55 @@ impl<'a> Analyzer<'a> {
                         join_type: None,
                         join_condition: None,
                         metadata: None,
-                        approximate: if params.approximate { Some(true) } else { None },
+                        approximate: params.approximate.then_some(true),
+                    });
+                }
+            }
+        }
+
+        // Source-less projections like COUNT(*) or SELECT 1 still depend on the
+        // row set produced by the base relations in the current scope. Record a
+        // relation-level dependency to the output column so the base tables are
+        // connected in statement lineage and downstream graph rendering.
+        if resolved_sources == 0 && params.sources.is_empty() {
+            // Base relations are those without a join_type (i.e., the driving
+            // table in the FROM clause, not tables introduced via JOIN).
+            let base_node_ids: HashSet<&Arc<str>> = ctx
+                .nodes
+                .iter()
+                .filter(|node| node.join_type.is_none())
+                .map(|node| &node.id)
+                .collect();
+
+            let base_relation_ids: Vec<_> = ctx
+                .relation_instances_in_current_scope()
+                .into_iter()
+                .filter(|instance| base_node_ids.contains(&instance.node_id))
+                .map(|instance| instance.node_id)
+                .collect();
+
+            // Derivation when the projection computes a value (COUNT(*), 1 + 1);
+            // DataFlow when it merely forwards rows without transformation.
+            let edge_type = if params.expression.is_some() {
+                EdgeType::Derivation
+            } else {
+                EdgeType::DataFlow
+            };
+
+            for relation_id in base_relation_ids {
+                let flow_edge_id = generate_edge_id(&relation_id, &node_id);
+                if !ctx.edge_ids.contains(&flow_edge_id) {
+                    ctx.add_edge(Edge {
+                        id: flow_edge_id,
+                        from: relation_id,
+                        to: node_id.clone(),
+                        edge_type,
+                        expression: params.expression.as_deref().map(Into::into),
+                        operation: None,
+                        join_type: None,
+                        join_condition: None,
+                        metadata: None,
+                        approximate: params.approximate.then_some(true),
                     });
                 }
             }

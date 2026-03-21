@@ -49,6 +49,37 @@ export function getCreatedRelationNodeIds(stmt: StatementLineage): Set<string> {
 }
 
 /**
+ * Identify output column IDs for SELECT-like statements.
+ *
+ * Primary source: columns owned by the output node (via ownership edges).
+ * Fallback: columns not owned by any table in the column-to-table map.
+ */
+export function getOutputColumnIds(
+  edges: Edge[],
+  outputNode: Node | undefined,
+  columnNodes: Node[],
+  columnToTableMap: Map<string, string>,
+  isSelect: boolean
+): Set<string> {
+  const ids = new Set<string>();
+  if (isSelect && outputNode) {
+    for (const edge of edges) {
+      if (edge.type === 'ownership' && edge.from === outputNode.id) {
+        ids.add(edge.to);
+      }
+    }
+  }
+  if (isSelect && ids.size === 0) {
+    for (const col of columnNodes) {
+      if (!columnToTableMap.has(col.id)) {
+        ids.add(col.id);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
  * Build a map from column IDs to their owning table info.
  * @param edges - The edges to search for ownership relationships
  * @param tableNodes - The table/relation nodes to look up

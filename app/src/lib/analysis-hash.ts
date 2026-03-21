@@ -3,7 +3,8 @@ import type { TemplateMode } from '@/types';
 
 // Bump when analyzer semantics change so persisted IndexedDB results
 // do not replay stale graphs across app reloads.
-const HASH_VERSION = 'v3';
+// v4: relation-to-column edges for source-less projections (COUNT(*), SELECT 1)
+const HASH_VERSION = 'v4';
 const FNV_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV_PRIME = 0x100000001b3n;
 const FNV_MASK = 0xffffffffffffffffn;
