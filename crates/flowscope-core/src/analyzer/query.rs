@@ -531,18 +531,28 @@ impl<'a> Analyzer<'a> {
         sources_by_node_id.into_values().collect()
     }
 
+    /// Decide which qualifier to keep when two alias keys map to the same node ID.
+    ///
+    /// For unaliased tables, `alias_instances` contains entries under both the
+    /// simple name (`"employees"`) and the canonical name (`"public.employees"`).
+    /// When expanding wildcards we only want one entry per node. This heuristic
+    /// picks the canonical (fully-qualified) name when available, falling back to
+    /// the longer qualifier when both are user-defined aliases (longer names tend
+    /// to be more descriptive and stable across refactors).
     fn should_prefer_instance_qualifier(
         &self,
         existing_qualifier: &str,
         candidate_qualifier: &str,
         canonical: &str,
     ) -> bool {
+        // Prefer the canonical (fully-qualified) form when one matches
         if existing_qualifier == canonical {
             return false;
         }
         if candidate_qualifier == canonical {
             return true;
         }
+        // Between two user-defined aliases, keep the longer (more descriptive) one
         candidate_qualifier.len() > existing_qualifier.len()
     }
 
@@ -1071,9 +1081,19 @@ impl<'a> Analyzer<'a> {
             }
         }
 
-        // Drop only bare unresolved source-mirror projections when the
-        // reference is provably ambiguous. If schema metadata is incomplete we
-        // still keep the visible output column and return partial lineage.
+        // Drop bare unresolved projections when the column is provably ambiguous
+        // in a self-join context (e.g., `SELECT id FROM employees e1 JOIN employees e2`).
+        //
+        // Conditions (all must hold):
+        //   1. No source was resolved (resolved_sources == 0)
+        //   2. There are declared sources (the column isn't purely computed)
+        //   3. No expression wrapper (it mirrors the source column directly)
+        //   4. Exactly one source, unqualified, with a name matching the output
+        //   5. Not inside a table-function scope (those have dialect-provided columns)
+        //   6. The column is provably ambiguous across relation instances
+        //
+        // When schema metadata is incomplete we keep the output column and return
+        // partial lineage rather than silently dropping it.
         let should_drop_unresolved_projection = resolved_sources == 0
             && !params.sources.is_empty()
             && params.expression.is_none()

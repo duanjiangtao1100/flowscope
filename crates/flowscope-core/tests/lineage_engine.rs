@@ -2774,6 +2774,66 @@ fn cte_self_join_filters_attach_to_correct_instance() {
 }
 
 #[test]
+fn cte_self_join_filters_are_isolated_per_instance() {
+    // Verify that CTE self-join filters are routed to the correct instance,
+    // not duplicated across instances. This is the CTE counterpart of
+    // `triple_self_join_each_alias_gets_distinct_filter`.
+    let sql = r#"
+        WITH org AS (
+            SELECT id, name, manager_id, department FROM employees
+        )
+        SELECT a.name AS eng_name, b.name AS mgr_name
+        FROM org a
+        JOIN org b ON a.manager_id = b.id
+        WHERE a.department = 'eng' AND b.department = 'sales'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    // Collect CTE nodes that have filters
+    let filtered_cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte && !n.filters.is_empty())
+        .collect();
+    assert_eq!(
+        filtered_cte_nodes.len(),
+        2,
+        "each CTE instance should receive its own filter"
+    );
+
+    // Verify filter isolation: each instance should have exactly one filter,
+    // and the two filters should reference different departments.
+    let all_filter_texts: Vec<String> = filtered_cte_nodes
+        .iter()
+        .flat_map(|n| n.filters.iter().map(|f| f.expression.clone()))
+        .collect();
+    assert!(
+        all_filter_texts.iter().any(|f| f.contains("eng")),
+        "one instance should have the 'eng' filter, got: {:?}",
+        all_filter_texts
+    );
+    assert!(
+        all_filter_texts.iter().any(|f| f.contains("sales")),
+        "one instance should have the 'sales' filter, got: {:?}",
+        all_filter_texts
+    );
+
+    // Verify no single node received both filters
+    for node in &filtered_cte_nodes {
+        let filter_texts: Vec<_> = node.filters.iter().map(|f| &f.expression).collect();
+        let has_both = filter_texts.iter().any(|f| f.contains("eng"))
+            && filter_texts.iter().any(|f| f.contains("sales"));
+        assert!(
+            !has_both,
+            "CTE node {} should not have both filters, got: {:?}",
+            node.id, filter_texts
+        );
+    }
+}
+
+#[test]
 fn self_join_with_subquery_alias_conflict() {
     // A subquery aliased as the same table name that also appears in
     // a regular join should not conflict.

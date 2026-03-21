@@ -128,10 +128,10 @@ impl<'a> Analyzer<'a> {
             }
 
             // Collect edges, remapping local node IDs to their global equivalents.
-            // If a local ID is missing from the mapping (e.g., the node was filtered
-            // or never added), the original local ID is used as a fallback. This can
-            // produce dangling references in the global graph but is preferable to
-            // silently dropping edges.
+            // If a local ID is missing from the mapping (e.g., the node was pruned
+            // during ambiguous column resolution, or belongs to a table function with
+            // dialect-provided columns), the original local ID is used as fallback.
+            // The post-build validation step below removes any resulting orphaned edges.
             for edge in &lineage.edges {
                 let from = local_to_global_id
                     .get(&edge.from)
@@ -182,8 +182,30 @@ impl<'a> Analyzer<'a> {
         // Detect cross-statement edges using the tracker
         global_edges.extend(self.tracker.build_cross_statement_edges());
 
+        let nodes: Vec<GlobalNode> = global_nodes.into_values().collect();
+
+        // Remove edges that reference nodes not present in the global graph.
+        // This can happen when statement-level analysis removes a node (e.g.,
+        // ambiguous column pruning) without cleaning up all referencing edges.
+        let global_node_ids: HashSet<&Arc<str>> = nodes.iter().map(|n| &n.id).collect();
+
+        #[cfg(feature = "tracing")]
+        let edges_before = global_edges.len();
+
+        global_edges.retain(|edge| {
+            global_node_ids.contains(&edge.from) && global_node_ids.contains(&edge.to)
+        });
+
+        #[cfg(feature = "tracing")]
+        if global_edges.len() < edges_before {
+            debug!(
+                removed = edges_before - global_edges.len(),
+                "removed orphaned edges from global lineage"
+            );
+        }
+
         GlobalLineage {
-            nodes: global_nodes.into_values().collect(),
+            nodes,
             edges: global_edges,
         }
     }

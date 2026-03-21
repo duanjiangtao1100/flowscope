@@ -71,7 +71,30 @@ pub(crate) struct JoinInfo {
     pub(crate) join_condition: Option<String>,
 }
 
-/// Context for analyzing a single statement
+/// Context for analyzing a single statement.
+///
+/// # Instance-Aware Resolution
+///
+/// When the same table appears multiple times with different aliases (self-join),
+/// each alias gets a unique [`RelationInstance`] with its own node ID. This enables:
+/// - Per-instance filter attachment (e.g., `WHERE e1.active = true`)
+/// - Distinct column ownership edges per alias
+/// - Accurate lineage for `SELECT e1.col, e2.col FROM t e1 JOIN t e2`
+///
+/// ## Lookup Order
+///
+/// 1. `alias_instances` (via [`resolve_alias_instance`](Self::resolve_alias_instance)) —
+///    instance-specific node ID for a given alias.
+/// 2. `aliases` → `tables` / `table_node_ids` — canonical fallback when no alias
+///    instance is registered (single-reference or unaliased tables).
+/// 3. `cte_definitions` — statement-global CTE definition nodes.
+///
+/// ## Limitations
+///
+/// - Unaliased self-joins (e.g., `FROM t JOIN t`) collapse to a single node because
+///   there is no alias to differentiate instances.
+/// - The first CTE reference in a scope reuses the definition node; only subsequent
+///   references get distinct instance nodes (see `resolve_cte_reference`).
 pub(crate) struct StatementContext {
     pub(crate) statement_index: usize,
     pub(crate) nodes: Vec<Node>,
@@ -421,12 +444,34 @@ impl StatementContext {
     }
 
     /// Register an alias with its instance node ID for self-join-aware resolution.
+    ///
+    /// Applies a defensive limit to prevent excessive memory use in pathological
+    /// queries (e.g., 100-way self-joins where each alias creates a full column set).
     pub(crate) fn register_alias_instance(
         &mut self,
         alias: String,
         canonical: String,
         node_id: Arc<str>,
     ) {
+        /// Maximum number of alias instances across all scopes in a single statement.
+        /// This is a safety limit, not expected to be hit in real queries.
+        const MAX_INSTANCES_PER_STATEMENT: usize = 500;
+
+        let total_instances: usize = self
+            .scope_stack
+            .iter()
+            .map(|s| s.alias_instances.len())
+            .sum();
+        if total_instances >= MAX_INSTANCES_PER_STATEMENT {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                alias = %alias,
+                canonical = %canonical,
+                "alias instance limit ({MAX_INSTANCES_PER_STATEMENT}) reached, skipping registration"
+            );
+            return;
+        }
+
         if let Some(scope) = self.current_scope_mut() {
             scope
                 .alias_instances
