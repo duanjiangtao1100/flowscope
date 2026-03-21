@@ -123,15 +123,21 @@ impl<'a> Analyzer<'a> {
         let cte_id = ctx.cte_definitions.get(cte_name)?.clone();
 
         // Only create a separate instance node for CTE self-joins (when the
-        // CTE is already present in the current scope).
+        // CTE is already present in any enclosing scope, not just the current one,
+        // so that nested subqueries like `FROM (SELECT ... FROM cte a JOIN cte b)`
+        // are handled correctly).
         let is_self_join = ctx
-            .current_scope()
-            .is_some_and(|scope| scope.tables.contains_key(cte_name));
+            .scope_stack
+            .iter()
+            .any(|scope| scope.tables.contains_key(cte_name));
 
         let node_id = if is_self_join {
             let alias_key = alias.unwrap_or(cte_name);
-            let instance_key =
-                format!("statement_{}::{cte_name}::{alias_key}", ctx.statement_index);
+            let scope_id = ctx.current_scope_id().unwrap_or_default();
+            let instance_key = format!(
+                "statement_{}::scope_{}::{cte_name}::{alias_key}",
+                ctx.statement_index, scope_id
+            );
             let instance_id = generate_node_id("cte", &instance_key);
             if !ctx.node_ids.contains(&instance_id) {
                 ctx.add_node(Node {
@@ -307,8 +313,9 @@ impl<'a> Analyzer<'a> {
         let (id, node_type) = if is_self_join {
             // Self-join: generate alias-specific node ID
             let alias_key = alias.unwrap_or(table_name);
+            let scope_id = ctx.current_scope_id().unwrap_or_default();
             self.tracker
-                .relation_instance_identity(&canonical, alias_key)
+                .relation_instance_identity(&canonical, alias_key, scope_id)
         } else {
             self.relation_identity(&canonical)
         };
@@ -552,8 +559,13 @@ impl<'a> Analyzer<'a> {
         if candidate_qualifier == canonical {
             return true;
         }
-        // Between two user-defined aliases, keep the longer (more descriptive) one
-        candidate_qualifier.len() > existing_qualifier.len()
+        // Between two user-defined aliases, prefer the longer (more descriptive) one.
+        // When lengths are equal, use lexicographic order for deterministic output.
+        match candidate_qualifier.len().cmp(&existing_qualifier.len()) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => candidate_qualifier < existing_qualifier,
+        }
     }
 
     pub(crate) fn expand_wildcard(

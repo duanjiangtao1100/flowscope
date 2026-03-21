@@ -188,9 +188,9 @@ impl CrossStatementTracker {
     /// Returns a unique node ID and type for a specific alias of a relation.
     ///
     /// When a table is self-joined (`FROM t e1 JOIN t e2`), each alias gets a
-    /// distinct node ID by hashing `canonical + alias`. When the alias matches
-    /// the canonical name (no alias or same name), falls back to the standard
-    /// `relation_identity` for backward compatibility.
+    /// distinct node ID by hashing `canonical + alias + scope_id`. When the alias
+    /// matches the canonical name (no alias or same name), falls back to the
+    /// standard `relation_identity` for backward compatibility.
     ///
     /// # Limitation
     ///
@@ -204,6 +204,7 @@ impl CrossStatementTracker {
         &self,
         canonical: &str,
         alias: &str,
+        scope_id: usize,
     ) -> (Arc<str>, NodeType) {
         // If alias is the same as canonical (or the simple name extracted from canonical),
         // fall back to the standard identity to avoid changing IDs for non-self-join cases.
@@ -212,7 +213,7 @@ impl CrossStatementTracker {
             return self.relation_identity(canonical);
         }
 
-        let instance_key = format!("{canonical}::{alias}");
+        let instance_key = format!("{canonical}::{alias}::scope_{scope_id}");
         if self.produced_views.contains(canonical) {
             (generate_node_id("view", &instance_key), NodeType::View)
         } else {

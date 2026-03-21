@@ -2360,6 +2360,58 @@ fn self_join_in_subquery_produces_distinct_nodes() {
 }
 
 #[test]
+fn nested_self_join_aliases_keep_filters_isolated_per_scope() {
+    let sql = r#"
+        SELECT e2.name, sub.inner_mgr
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        JOIN (
+            SELECT e2.id, e2.name AS inner_mgr
+            FROM employees e1
+            JOIN employees e2 ON e1.manager_id = e2.id
+            WHERE e2.department = 'sales'
+        ) sub ON sub.id = e2.id
+        WHERE e2.department = 'eng'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let filtered_employee_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table
+                && n.qualified_name.as_deref() == Some("employees")
+                && !n.filters.is_empty()
+        })
+        .collect();
+    assert_eq!(
+        filtered_employee_nodes.len(),
+        2,
+        "outer and inner self-join aliases should keep separate filtered nodes"
+    );
+
+    let filter_sets: HashSet<Vec<String>> = filtered_employee_nodes
+        .iter()
+        .map(|node| {
+            let mut filters: Vec<String> =
+                node.filters.iter().map(|f| f.expression.clone()).collect();
+            filters.sort();
+            filters
+        })
+        .collect();
+    assert!(
+        filter_sets.contains(&vec!["e2.department = 'eng'".to_string()]),
+        "expected one filtered node for the outer e2 alias, got {filter_sets:?}"
+    );
+    assert!(
+        filter_sets.contains(&vec!["e2.department = 'sales'".to_string()]),
+        "expected one filtered node for the inner e2 alias, got {filter_sets:?}"
+    );
+}
+
+#[test]
 fn self_join_alias_matching_another_table_name() {
     // Alias "orders" collides with the canonical name of the other table
     let sql = r#"
@@ -2831,6 +2883,62 @@ fn cte_self_join_filters_are_isolated_per_instance() {
             node.id, filter_texts
         );
     }
+}
+
+#[test]
+fn nested_cte_self_join_aliases_keep_filters_isolated_per_scope() {
+    let sql = r#"
+        WITH org AS (
+            SELECT id, name, manager_id, department
+            FROM employees
+        )
+        SELECT b.name, sub.inner_mgr
+        FROM org a
+        JOIN org b ON a.manager_id = b.id
+        JOIN (
+            SELECT b.id, b.name AS inner_mgr
+            FROM org a
+            JOIN org b ON a.manager_id = b.id
+            WHERE b.department = 'sales'
+        ) sub ON sub.id = b.id
+        WHERE b.department = 'eng'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let filtered_cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Cte
+                && n.qualified_name.as_deref() == Some("org")
+                && !n.filters.is_empty()
+        })
+        .collect();
+    assert_eq!(
+        filtered_cte_nodes.len(),
+        2,
+        "outer and inner CTE self-join aliases should keep separate filtered nodes"
+    );
+
+    let filter_sets: HashSet<Vec<String>> = filtered_cte_nodes
+        .iter()
+        .map(|node| {
+            let mut filters: Vec<String> =
+                node.filters.iter().map(|f| f.expression.clone()).collect();
+            filters.sort();
+            filters
+        })
+        .collect();
+    assert!(
+        filter_sets.contains(&vec!["b.department = 'eng'".to_string()]),
+        "expected one filtered node for the outer b alias, got {filter_sets:?}"
+    );
+    assert!(
+        filter_sets.contains(&vec!["b.department = 'sales'".to_string()]),
+        "expected one filtered node for the inner b alias, got {filter_sets:?}"
+    );
 }
 
 #[test]

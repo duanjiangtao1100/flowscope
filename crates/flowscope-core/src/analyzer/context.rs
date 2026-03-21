@@ -35,6 +35,8 @@ pub(crate) struct RelationInstance {
 /// Each SELECT/subquery/CTE body gets its own scope.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
+    /// Deterministic ID for this lexical scope within a statement.
+    pub(crate) scope_id: usize,
     /// Tables directly referenced in this scope's FROM/JOIN clauses.
     /// Maps canonical table name -> node ID.
     /// For backwards compatibility, the last registered instance wins here.
@@ -57,8 +59,11 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(scope_id: usize) -> Self {
+        Self {
+            scope_id,
+            ..Self::default()
+        }
     }
 }
 
@@ -141,6 +146,8 @@ pub(crate) struct StatementContext {
     /// Stack of scopes for proper column resolution
     /// The top of the stack (last element) is the current scope
     pub(crate) scope_stack: Vec<Scope>,
+    /// Monotonic counter used to assign stable lexical scope IDs per statement.
+    pub(crate) next_scope_id: usize,
     /// Pending filter predicates to attach to table nodes.
     /// Maps table canonical name -> list of filter predicates.
     pub(crate) pending_filters: HashMap<String, Vec<FilterPredicate>>,
@@ -160,6 +167,9 @@ pub(crate) struct StatementContext {
     /// Pending wildcards that couldn't be expanded due to missing schema.
     /// Used for backward column inference from downstream references.
     pub(crate) pending_wildcards: Vec<PendingWildcard>,
+    /// Set when alias instance registration is skipped due to the safety limit.
+    /// Checked once after statement analysis to emit a user-visible warning.
+    pub(crate) instance_limit_reached: bool,
 }
 
 /// Represents an output column in the SELECT list
@@ -202,6 +212,7 @@ impl StatementContext {
             output_node_id: None,
             aliased_subquery_columns: HashMap::new(),
             scope_stack: Vec::new(),
+            next_scope_id: 0,
             pending_filters: HashMap::new(),
             pending_instance_filters: HashMap::new(),
             grouping_columns: HashSet::new(),
@@ -209,6 +220,7 @@ impl StatementContext {
             source_table_columns: HashMap::new(),
             implied_foreign_keys: HashMap::new(),
             pending_wildcards: Vec::new(),
+            instance_limit_reached: false,
         }
     }
 
@@ -387,7 +399,9 @@ impl StatementContext {
 
     /// Push a new scope onto the stack (entering a SELECT/subquery)
     pub(crate) fn push_scope(&mut self) {
-        self.scope_stack.push(Scope::new());
+        let scope_id = self.next_scope_id;
+        self.next_scope_id += 1;
+        self.scope_stack.push(Scope::new(scope_id));
     }
 
     /// Pop the current scope (leaving a SELECT/subquery)
@@ -398,6 +412,11 @@ impl StatementContext {
     /// Get the current (topmost) scope, if any
     pub(crate) fn current_scope(&self) -> Option<&Scope> {
         self.scope_stack.last()
+    }
+
+    /// Returns the deterministic ID of the current lexical scope.
+    pub(crate) fn current_scope_id(&self) -> Option<usize> {
+        self.current_scope().map(|scope| scope.scope_id)
     }
 
     /// Get the current (topmost) scope mutably, if any
@@ -469,6 +488,7 @@ impl StatementContext {
                 canonical = %canonical,
                 "alias instance limit ({MAX_INSTANCES_PER_STATEMENT}) reached, skipping registration"
             );
+            self.instance_limit_reached = true;
             return;
         }
 

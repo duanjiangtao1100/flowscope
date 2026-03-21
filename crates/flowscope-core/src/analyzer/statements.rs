@@ -223,6 +223,17 @@ impl<'a> Analyzer<'a> {
         // Register implied schema for source tables referenced in the query
         self.register_source_tables_schema(&ctx);
 
+        // Emit a user-visible warning when the alias instance limit was hit.
+        // Lineage may be incomplete for the affected aliases.
+        if ctx.instance_limit_reached {
+            let mut issue = Issue::warning(
+                issue_codes::MEMORY_LIMIT_EXCEEDED,
+                "Alias instance limit reached; lineage for some self-join aliases may be incomplete",
+            );
+            issue.statement_index = Some(index);
+            self.issues.push(issue);
+        }
+
         // Calculate statement-level stats
         let join_count = complexity::count_joins(&ctx.nodes);
         let complexity_score = complexity::calculate_complexity(&ctx.nodes);
