@@ -87,16 +87,16 @@ expression: clean_result
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_003234a3331f8fc8",
+        "id": "column_5908707ce188a323",
         "type": "column",
-        "label": "name",
+        "label": "id",
         "canonicalName": {
-          "name": "project-a.dataset-b.users.name"
+          "name": "project-a.dataset-b.users.id"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_003234a3331f8fc8"
+            "nodeId": "column_a9c819f775685d7c"
           }
         ]
       },
@@ -115,16 +115,16 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_a9c819f775685d7c",
+        "id": "column_a63de932952af273",
         "type": "column",
-        "label": "id",
+        "label": "name",
         "canonicalName": {
-          "name": "project-a.dataset-b.users.id"
+          "name": "project-a.dataset-b.users.name"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_a9c819f775685d7c"
+            "nodeId": "column_003234a3331f8fc8"
           }
         ]
       },
@@ -177,7 +177,7 @@ expression: clean_result
       {
         "id": "edge_03f3c8d02729d078",
         "from": "table_2887bb8b48a3cf0e",
-        "to": "column_003234a3331f8fc8",
+        "to": "column_a63de932952af273",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -186,7 +186,7 @@ expression: clean_result
       {
         "id": "edge_2a0be04f1568814e",
         "from": "table_2887bb8b48a3cf0e",
-        "to": "column_a9c819f775685d7c",
+        "to": "column_5908707ce188a323",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -194,7 +194,7 @@ expression: clean_result
       },
       {
         "id": "edge_2acf7dab7e2a4477",
-        "from": "column_003234a3331f8fc8",
+        "from": "column_a63de932952af273",
         "to": "column_629d7cf5d2e3562d",
         "type": "data_flow",
         "producerStatement": {
@@ -203,7 +203,7 @@ expression: clean_result
       },
       {
         "id": "edge_414e1768e4a0ba81",
-        "from": "column_a9c819f775685d7c",
+        "from": "column_5908707ce188a323",
         "to": "column_d8bba385e09d94a9",
         "type": "data_flow",
         "producerStatement": {

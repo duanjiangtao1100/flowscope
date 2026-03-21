@@ -18,22 +18,52 @@ pub(crate) struct PendingWildcard {
     pub(crate) source_node_id: Arc<str>,
 }
 
+/// A single table/view reference in a FROM or JOIN clause.
+///
+/// Each alias of the same canonical table gets its own instance with a unique
+/// `node_id`. This allows self-joins like `FROM employees e1 JOIN employees e2`
+/// to produce two distinct graph nodes.
+#[derive(Debug, Clone)]
+pub(crate) struct RelationInstance {
+    /// Canonical (fully-qualified) table name used for schema lookup
+    pub(crate) canonical: String,
+    /// Node ID in the lineage graph (unique per instance)
+    pub(crate) node_id: Arc<str>,
+}
+
 /// Represents a single scope level for column resolution.
 /// Each SELECT/subquery/CTE body gets its own scope.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
-    /// Tables directly referenced in this scope's FROM/JOIN clauses
-    /// Maps canonical table name -> node ID
+    /// Deterministic ID for this lexical scope within a statement.
+    pub(crate) scope_id: usize,
+    /// Tables directly referenced in this scope's FROM/JOIN clauses.
+    /// Maps canonical table name -> node ID.
+    /// For backwards compatibility, the last registered instance wins here.
     pub(crate) tables: HashMap<String, Arc<str>>,
     /// Aliases defined in this scope (alias -> canonical name)
     pub(crate) aliases: HashMap<String, String>,
+    /// Alias -> relation instance (node_id + canonical) for instance-aware lookups.
+    /// Keys are the alias name when aliased; for unaliased tables, both the simple
+    /// name (e.g., `"employees"`) and the fully-qualified canonical name
+    /// (e.g., `"public.employees"`) are registered so that either form resolves.
+    pub(crate) alias_instances: HashMap<String, RelationInstance>,
     /// Subquery aliases in this scope
     pub(crate) subquery_aliases: HashSet<String>,
+    /// Scope-local output columns for subquery/CTE aliases materialized in this scope.
+    /// These shadow statement-global CTE definitions when alias names are reused.
+    pub(crate) subquery_columns: HashMap<String, Vec<OutputColumn>>,
+    /// True when the scope contains a table function relation whose output
+    /// columns may be dialect-provided rather than schema-backed.
+    pub(crate) has_table_function_relation: bool,
 }
 
 impl Scope {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(scope_id: usize) -> Self {
+        Self {
+            scope_id,
+            ..Self::default()
+        }
     }
 }
 
@@ -46,7 +76,30 @@ pub(crate) struct JoinInfo {
     pub(crate) join_condition: Option<String>,
 }
 
-/// Context for analyzing a single statement
+/// Context for analyzing a single statement.
+///
+/// # Instance-Aware Resolution
+///
+/// When the same table appears multiple times with different aliases (self-join),
+/// each alias gets a unique [`RelationInstance`] with its own node ID. This enables:
+/// - Per-instance filter attachment (e.g., `WHERE e1.active = true`)
+/// - Distinct column ownership edges per alias
+/// - Accurate lineage for `SELECT e1.col, e2.col FROM t e1 JOIN t e2`
+///
+/// ## Lookup Order
+///
+/// 1. `alias_instances` (via [`resolve_alias_instance`](Self::resolve_alias_instance)) —
+///    instance-specific node ID for a given alias.
+/// 2. `aliases` → `tables` / `table_node_ids` — canonical fallback when no alias
+///    instance is registered (single-reference or unaliased tables).
+/// 3. `cte_definitions` — statement-global CTE definition nodes.
+///
+/// ## Limitations
+///
+/// - Unaliased self-joins (e.g., `FROM t JOIN t`) collapse to a single node because
+///   there is no alias to differentiate instances.
+/// - The first CTE reference in a scope reuses the definition node; only subsequent
+///   references get distinct instance nodes (see `resolve_cte_reference`).
 pub(crate) struct StatementContext {
     pub(crate) statement_index: usize,
     pub(crate) nodes: Vec<Node>,
@@ -75,22 +128,31 @@ pub(crate) struct StatementContext {
     pub(crate) last_operation: Option<String>,
     /// Current join information (type + condition) for edge labeling
     pub(crate) current_join_info: JoinInfo,
-    /// Table canonical name -> node ID (for column ownership) - global registry
+    /// Table canonical name -> node ID (for column ownership) — global registry.
+    ///
+    /// In self-joins, the last registered instance overwrites the previous entry,
+    /// so this map points to an arbitrary instance for self-joined tables. Use
+    /// `resolve_alias_instance` (via `alias_instances` on `Scope`) for
+    /// instance-specific lookups when an alias is available.
     pub(crate) table_node_ids: HashMap<String, Arc<str>>,
     /// Output columns for this statement (for column lineage)
     pub(crate) output_columns: Vec<OutputColumn>,
     /// Output node ID for SELECT statements
     pub(crate) output_node_id: Option<Arc<str>>,
-    /// Output columns for aliased subqueries (CTEs and derived tables).
-    /// Maps the alias name to its output columns for schema resolution during wildcard
-    /// expansion and column reference lookups.
+    /// Statement-global output columns for named CTE definitions.
+    /// Scope-local alias materialization lives on [`Scope::subquery_columns`] so reused
+    /// aliases do not leak across sibling branches or nested scopes.
     pub(crate) aliased_subquery_columns: HashMap<String, Vec<OutputColumn>>,
     /// Stack of scopes for proper column resolution
     /// The top of the stack (last element) is the current scope
     pub(crate) scope_stack: Vec<Scope>,
-    /// Pending filter predicates to attach to table nodes
-    /// Maps table canonical name -> list of filter predicates
+    /// Monotonic counter used to assign stable lexical scope IDs per statement.
+    pub(crate) next_scope_id: usize,
+    /// Pending filter predicates to attach to table nodes.
+    /// Maps table canonical name -> list of filter predicates.
     pub(crate) pending_filters: HashMap<String, Vec<FilterPredicate>>,
+    /// Instance-aware pending filters keyed by node ID (for self-join disambiguation).
+    pub(crate) pending_instance_filters: HashMap<Arc<str>, Vec<FilterPredicate>>,
     /// Grouping columns for the current SELECT (normalized expression strings)
     /// Used to detect aggregation vs grouping key columns
     pub(crate) grouping_columns: HashSet<String>,
@@ -105,6 +167,9 @@ pub(crate) struct StatementContext {
     /// Pending wildcards that couldn't be expanded due to missing schema.
     /// Used for backward column inference from downstream references.
     pub(crate) pending_wildcards: Vec<PendingWildcard>,
+    /// Set when alias instance registration is skipped due to the safety limit.
+    /// Checked once after statement analysis to emit a user-visible warning.
+    pub(crate) instance_limit_reached: bool,
 }
 
 /// Represents an output column in the SELECT list
@@ -147,12 +212,15 @@ impl StatementContext {
             output_node_id: None,
             aliased_subquery_columns: HashMap::new(),
             scope_stack: Vec::new(),
+            next_scope_id: 0,
             pending_filters: HashMap::new(),
+            pending_instance_filters: HashMap::new(),
             grouping_columns: HashSet::new(),
             has_group_by: false,
             source_table_columns: HashMap::new(),
             implied_foreign_keys: HashMap::new(),
             pending_wildcards: Vec::new(),
+            instance_limit_reached: false,
         }
     }
 
@@ -252,6 +320,26 @@ impl StatementContext {
             });
     }
 
+    /// Add a filter predicate targeted at a specific node by ID.
+    ///
+    /// Used when instance-aware resolution is available (e.g., qualified
+    /// column references in self-joins) to attach filters to the correct
+    /// alias instance rather than an ambiguous canonical match.
+    pub(crate) fn add_filter_for_instance(
+        &mut self,
+        node_id: &Arc<str>,
+        expression: String,
+        clause_type: FilterClauseType,
+    ) {
+        self.pending_instance_filters
+            .entry(node_id.clone())
+            .or_default()
+            .push(FilterPredicate {
+                expression,
+                clause_type,
+            });
+    }
+
     pub(crate) fn add_node(&mut self, node: Node) -> Arc<str> {
         let id = node.id.clone();
         if self.node_ids.insert(id.clone()) {
@@ -311,7 +399,9 @@ impl StatementContext {
 
     /// Push a new scope onto the stack (entering a SELECT/subquery)
     pub(crate) fn push_scope(&mut self) {
-        self.scope_stack.push(Scope::new());
+        let scope_id = self.next_scope_id;
+        self.next_scope_id += 1;
+        self.scope_stack.push(Scope::new(scope_id));
     }
 
     /// Pop the current scope (leaving a SELECT/subquery)
@@ -322,6 +412,11 @@ impl StatementContext {
     /// Get the current (topmost) scope, if any
     pub(crate) fn current_scope(&self) -> Option<&Scope> {
         self.scope_stack.last()
+    }
+
+    /// Returns the deterministic ID of the current lexical scope.
+    pub(crate) fn current_scope_id(&self) -> Option<usize> {
+        self.current_scope().map(|scope| scope.scope_id)
     }
 
     /// Get the current (topmost) scope mutably, if any
@@ -341,15 +436,106 @@ impl StatementContext {
         }
     }
 
-    /// Register an alias in the current scope
+    /// Register an alias in the current scope.
+    ///
+    /// Also populates `alias_instances` when a node ID for the canonical name
+    /// is already known (via `table_node_ids`), keeping the two maps in sync.
+    /// Uses `or_insert` so that a previously registered instance-specific ID
+    /// (from `register_alias_instance`) is not overwritten.
     pub(crate) fn register_alias_in_scope(&mut self, alias: String, canonical: String) {
         // Register in global aliases for backwards compatibility
         self.table_aliases.insert(alias.clone(), canonical.clone());
 
+        // Look up node_id to keep alias_instances in sync
+        let node_id = self.table_node_ids.get(&canonical).cloned();
+
         // Also register in current scope
         if let Some(scope) = self.current_scope_mut() {
-            scope.aliases.insert(alias, canonical);
+            scope.aliases.insert(alias.clone(), canonical.clone());
+            // Populate alias_instances if we have a node_id and no entry exists yet
+            if let Some(node_id) = node_id {
+                scope
+                    .alias_instances
+                    .entry(alias)
+                    .or_insert(RelationInstance { canonical, node_id });
+            }
         }
+    }
+
+    /// Register an alias with its instance node ID for self-join-aware resolution.
+    ///
+    /// Applies a defensive limit to prevent excessive memory use in pathological
+    /// queries (e.g., 100-way self-joins where each alias creates a full column set).
+    pub(crate) fn register_alias_instance(
+        &mut self,
+        alias: String,
+        canonical: String,
+        node_id: Arc<str>,
+    ) {
+        /// Maximum number of alias instances across all scopes in a single statement.
+        /// This is a safety limit, not expected to be hit in real queries.
+        const MAX_INSTANCES_PER_STATEMENT: usize = 500;
+
+        let total_instances: usize = self
+            .scope_stack
+            .iter()
+            .map(|s| s.alias_instances.len())
+            .sum();
+        if total_instances >= MAX_INSTANCES_PER_STATEMENT {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                alias = %alias,
+                canonical = %canonical,
+                "alias instance limit ({MAX_INSTANCES_PER_STATEMENT}) reached, skipping registration"
+            );
+            self.instance_limit_reached = true;
+            return;
+        }
+
+        if let Some(scope) = self.current_scope_mut() {
+            scope
+                .alias_instances
+                .insert(alias, RelationInstance { canonical, node_id });
+        }
+    }
+
+    /// Resolve an alias to its relation instance (canonical name + node_id).
+    ///
+    /// Searches the scope stack from innermost to outermost scope. Returns `None`
+    /// if the alias is not registered as an instance in any scope.
+    pub(crate) fn resolve_alias_instance(&self, alias: &str) -> Option<&RelationInstance> {
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(instance) = scope.alias_instances.get(alias) {
+                return Some(instance);
+            }
+        }
+        None
+    }
+
+    /// Get distinct relation instances in the current scope.
+    ///
+    /// Unlike `tables_in_current_scope`, this preserves multiple aliases that
+    /// refer to the same canonical relation.
+    pub(crate) fn relation_instances_in_current_scope(&self) -> Vec<RelationInstance> {
+        let Some(scope) = self.current_scope() else {
+            return Vec::new();
+        };
+
+        let mut seen = HashSet::new();
+        scope
+            .alias_instances
+            .values()
+            .filter(|instance| seen.insert(instance.node_id.clone()))
+            .cloned()
+            .collect()
+    }
+
+    /// Count distinct relation instances for a canonical name in the current scope.
+    pub(crate) fn relation_instance_count_in_current_scope(&self, canonical: &str) -> usize {
+        self.relation_instances_in_current_scope()
+            .into_iter()
+            .filter(|instance| instance.canonical == canonical)
+            .count()
     }
 
     /// Register a subquery alias in the current scope
@@ -361,6 +547,56 @@ impl StatementContext {
         if let Some(scope) = self.current_scope_mut() {
             scope.subquery_aliases.insert(alias);
         }
+    }
+
+    /// Mark that the current scope contains a table function relation.
+    pub(crate) fn mark_table_function_in_scope(&mut self) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.has_table_function_relation = true;
+        }
+    }
+
+    /// Returns true when the current scope contains a table function relation.
+    pub(crate) fn current_scope_has_table_function_relation(&self) -> bool {
+        self.current_scope()
+            .is_some_and(|scope| scope.has_table_function_relation)
+    }
+
+    /// Register statement-global output columns for a named CTE definition.
+    pub(crate) fn register_cte_output_columns(&mut self, name: String, columns: Vec<OutputColumn>) {
+        self.aliased_subquery_columns.insert(name, columns);
+    }
+
+    /// Register scope-local output columns for a derived table or aliased CTE instance.
+    pub(crate) fn register_subquery_columns_in_scope(
+        &mut self,
+        name: String,
+        columns: Vec<OutputColumn>,
+    ) {
+        if let Some(scope) = self.current_scope_mut() {
+            scope.subquery_columns.insert(name, columns);
+        } else {
+            self.aliased_subquery_columns.insert(name, columns);
+        }
+    }
+
+    /// Returns true when the current scope already materialized columns for `name`.
+    pub(crate) fn has_subquery_columns_in_current_scope(&self, name: &str) -> bool {
+        self.current_scope()
+            .is_some_and(|scope| scope.subquery_columns.contains_key(name))
+    }
+
+    /// Resolve subquery/CTE output columns with lexical scoping.
+    ///
+    /// Scope-local aliases shadow statement-global CTE definition columns.
+    pub(crate) fn resolve_subquery_columns(&self, name: &str) -> Option<&[OutputColumn]> {
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(columns) = scope.subquery_columns.get(name) {
+                return Some(columns.as_slice());
+            }
+        }
+
+        self.aliased_subquery_columns.get(name).map(Vec::as_slice)
     }
 
     /// Get tables that are in scope for column resolution.

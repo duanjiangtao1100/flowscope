@@ -12,6 +12,7 @@ use super::helpers::{
 };
 use super::select_analyzer::SelectAnalyzer;
 use super::Analyzer;
+use crate::generated::is_value_table_function;
 use crate::types::{issue_codes, Issue, Node, NodeType, Span};
 use sqlparser::ast::{
     self, CreateView, Cte, Expr, Ident, Join, Query, Select, SetExpr, SetOperator, Statement,
@@ -299,7 +300,16 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
 
     pub fn add_source_table(&mut self, table_name: &str) -> Option<String> {
         self.analyzer
-            .add_source_table(self.ctx, table_name, self.target_node.as_deref())
+            .add_source_table(self.ctx, table_name, self.target_node.as_deref(), None)
+    }
+
+    pub fn add_source_table_with_alias(
+        &mut self,
+        table_name: &str,
+        alias: Option<&str>,
+    ) -> Option<String> {
+        self.analyzer
+            .add_source_table(self.ctx, table_name, self.target_node.as_deref(), alias)
     }
 
     pub fn analyze_dml_target(
@@ -307,7 +317,9 @@ impl<'a, 'b> LineageVisitor<'a, 'b> {
         table_name: &str,
         alias: Option<&TableAlias>,
     ) -> Option<(String, Arc<str>)> {
-        let canonical_res = self.analyzer.add_source_table(self.ctx, table_name, None);
+        let canonical_res = self
+            .analyzer
+            .add_source_table(self.ctx, table_name, None, None);
         let canonical = canonical_res
             .clone()
             .unwrap_or_else(|| self.analyzer.normalize_table_name(table_name));
@@ -565,8 +577,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                 cte_visitor.visit_query(&cte.query);
                 let columns = self.ctx.take_output_columns_since(projection_checkpoint);
                 self.ctx
-                    .aliased_subquery_columns
-                    .insert(cte.alias.name.to_string(), columns);
+                    .register_cte_output_columns(cte.alias.name.to_string(), columns);
             }
         }
         self.visit_set_expr(&query.body);
@@ -659,10 +670,11 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
         match table_factor {
             TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
-                let canonical = self.add_source_table(&table_name);
-                if let (Some(a), Some(canonical_name)) = (alias, canonical) {
+                let alias_str = alias.as_ref().map(|a| a.name.to_string());
+                let canonical = self.add_source_table_with_alias(&table_name, alias_str.as_deref());
+                if let (Some(a), Some(canonical_name)) = (&alias_str, &canonical) {
                     self.ctx
-                        .register_alias_in_scope(a.name.to_string(), canonical_name);
+                        .register_alias_in_scope(a.clone(), canonical_name.clone());
                 }
             }
             TableFactor::Derived {
@@ -719,7 +731,7 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     self.ctx
                         .register_table_in_scope(name.clone(), node_id.clone());
                     self.ctx.register_alias_in_scope(name.clone(), name.clone());
-                    self.ctx.aliased_subquery_columns.insert(name, columns);
+                    self.ctx.register_subquery_columns_in_scope(name, columns);
                 }
             }
             TableFactor::NestedJoin {
@@ -729,6 +741,13 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
             }
             TableFactor::TableFunction { expr, alias, .. } => {
                 self.extract_identifiers_from_expr(expr);
+                let is_value_table = matches!(expr, Expr::Function(func) if is_value_table_function(
+                    self.analyzer.request.dialect,
+                    &func.name.to_string(),
+                ));
+                if is_value_table {
+                    self.ctx.mark_table_function_in_scope();
+                }
                 if let Some(a) = alias {
                     self.ctx
                         .register_subquery_alias_in_scope(a.name.to_string());

@@ -5,7 +5,9 @@
 //! column-level lineage graph by tracking data flow from source columns to output columns.
 
 use super::context::{ColumnRef, OutputColumn, PendingWildcard, StatementContext};
-use super::helpers::{generate_column_node_id, generate_edge_id, normalize_schema_type};
+use super::helpers::{
+    generate_column_node_id, generate_edge_id, generate_node_id, normalize_schema_type,
+};
 use super::visitor::{LineageVisitor, Visitor};
 use super::Analyzer;
 use crate::types::{
@@ -18,22 +20,19 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+#[cfg(feature = "tracing")]
+use tracing::debug;
 
 /// Represents the information needed to add an expanded column during wildcard expansion.
 struct ExpandedColumnInfo {
     name: String,
-    table_canonical: String,
     data_type: Option<String>,
 }
 
 impl ExpandedColumnInfo {
     /// Creates column info from schema metadata or output columns.
-    fn new(name: String, table_canonical: String, data_type: Option<String>) -> Self {
-        Self {
-            name,
-            table_canonical,
-            data_type,
-        }
+    fn new(name: String, data_type: Option<String>) -> Self {
+        Self { name, data_type }
     }
 }
 
@@ -81,9 +80,10 @@ impl<'a> Analyzer<'a> {
         ctx: &mut StatementContext,
         table_name: &str,
         target_node: Option<&str>,
+        alias: Option<&str>,
     ) -> Option<String> {
         // Resolve the table reference (CTE or regular table)
-        let (canonical, node_id) = self.resolve_table_reference(ctx, table_name)?;
+        let (canonical, node_id) = self.resolve_table_reference(ctx, table_name, alias)?;
 
         // Create edge to target if specified
         self.create_source_edge(ctx, &node_id, target_node);
@@ -98,26 +98,172 @@ impl<'a> Analyzer<'a> {
         &mut self,
         ctx: &mut StatementContext,
         table_name: &str,
-    ) -> Option<(String, std::sync::Arc<str>)> {
+        alias: Option<&str>,
+    ) -> Option<(String, Arc<str>)> {
         // Check if this is a CTE reference
         if ctx.cte_definitions.contains_key(table_name) {
-            return self.resolve_cte_reference(ctx, table_name);
+            return self.resolve_cte_reference(ctx, table_name, alias);
         }
 
         // Regular table or view
-        self.resolve_regular_table(ctx, table_name)
+        self.resolve_regular_table(ctx, table_name, alias)
     }
 
     /// Resolves a CTE reference and registers it in scope.
+    ///
+    /// For CTE self-joins (`FROM cte a JOIN cte b`), each alias gets a distinct
+    /// instance node with its own column set. Non-self-join references reuse the
+    /// CTE definition node for simpler graphs and correct CTE bypass in hide_ctes.
     fn resolve_cte_reference(
         &mut self,
         ctx: &mut StatementContext,
         cte_name: &str,
-    ) -> Option<(String, std::sync::Arc<str>)> {
+        alias: Option<&str>,
+    ) -> Option<(String, Arc<str>)> {
         let cte_id = ctx.cte_definitions.get(cte_name)?.clone();
-        self.apply_join_metadata_to_existing_node(ctx, &cte_id);
-        ctx.register_table_in_scope(cte_name.to_string(), cte_id.clone());
-        Some((cte_name.to_string(), cte_id))
+
+        // Only create a separate instance node for CTE self-joins (when the
+        // CTE is already present in any enclosing scope, not just the current one,
+        // so that nested subqueries like `FROM (SELECT ... FROM cte a JOIN cte b)`
+        // are handled correctly).
+        let is_self_join = ctx
+            .scope_stack
+            .iter()
+            .any(|scope| scope.tables.contains_key(cte_name));
+
+        let node_id = if is_self_join {
+            let alias_key = alias.unwrap_or(cte_name);
+            let scope_id = ctx.current_scope_id().unwrap_or_default();
+            let instance_key = format!(
+                "statement_{}::scope_{}::{cte_name}::{alias_key}",
+                ctx.statement_index, scope_id
+            );
+            let instance_id = generate_node_id("cte", &instance_key);
+            if !ctx.node_ids.contains(&instance_id) {
+                ctx.add_node(Node {
+                    id: instance_id.clone(),
+                    node_type: NodeType::Cte,
+                    label: cte_name.to_string().into(),
+                    qualified_name: Some(cte_name.to_string().into()),
+                    expression: None,
+                    span: None,
+                    metadata: None,
+                    resolution_source: None,
+                    filters: Vec::new(),
+                    join_type: ctx.current_join_info.join_type,
+                    join_condition: ctx
+                        .current_join_info
+                        .join_condition
+                        .as_deref()
+                        .map(Into::into),
+                    aggregation: None,
+                });
+                // Connect CTE definition to its reference instance so that
+                // filter_cte_nodes can trace the full data flow chain.
+                let edge_id = generate_edge_id(&cte_id, &instance_id);
+                ctx.add_edge(Edge::data_flow(
+                    edge_id,
+                    cte_id.clone(),
+                    instance_id.clone(),
+                ));
+            }
+            self.materialize_cte_reference_columns(ctx, cte_name, alias_key, &instance_id);
+            instance_id
+        } else {
+            self.apply_join_metadata_to_existing_node(ctx, &cte_id);
+            cte_id
+        };
+
+        ctx.register_table_in_scope(cte_name.to_string(), node_id.clone());
+        let instance_key = alias.unwrap_or(cte_name).to_string();
+        ctx.register_alias_instance(instance_key, cte_name.to_string(), node_id.clone());
+
+        Some((cte_name.to_string(), node_id))
+    }
+
+    fn materialize_cte_reference_columns(
+        &mut self,
+        ctx: &mut StatementContext,
+        cte_name: &str,
+        alias: &str,
+        instance_node_id: &Arc<str>,
+    ) {
+        if ctx.has_subquery_columns_in_current_scope(alias) {
+            return;
+        }
+
+        let Some(source_columns) = ctx
+            .resolve_subquery_columns(cte_name)
+            .map(|cols| cols.to_vec())
+        else {
+            return;
+        };
+
+        let mut instance_columns = Vec::with_capacity(source_columns.len());
+        for source_col in source_columns {
+            let instance_col_id =
+                generate_column_node_id(Some(instance_node_id.as_ref()), &source_col.name);
+
+            let column_node = Node {
+                id: instance_col_id.clone(),
+                node_type: NodeType::Column,
+                label: source_col.name.clone().into(),
+                qualified_name: Some(format!("{cte_name}.{}", source_col.name).into()),
+                expression: None,
+                span: None,
+                metadata: source_col.data_type.as_ref().map(|dt| {
+                    let mut m = HashMap::new();
+                    m.insert("data_type".to_string(), json!(dt));
+                    m
+                }),
+                resolution_source: None,
+                filters: Vec::new(),
+                join_type: None,
+                join_condition: None,
+                aggregation: None,
+            };
+            ctx.add_node(column_node);
+
+            let ownership_edge_id = generate_edge_id(instance_node_id.as_ref(), &instance_col_id);
+            if !ctx.edge_ids.contains(&ownership_edge_id) {
+                ctx.add_edge(Edge {
+                    id: ownership_edge_id,
+                    from: instance_node_id.clone(),
+                    to: instance_col_id.clone(),
+                    edge_type: EdgeType::Ownership,
+                    expression: None,
+                    operation: None,
+                    join_type: None,
+                    join_condition: None,
+                    metadata: None,
+                    approximate: None,
+                });
+            }
+
+            let flow_edge_id = generate_edge_id(source_col.node_id.as_ref(), &instance_col_id);
+            if !ctx.edge_ids.contains(&flow_edge_id) {
+                ctx.add_edge(Edge {
+                    id: flow_edge_id,
+                    from: source_col.node_id.clone(),
+                    to: instance_col_id.clone(),
+                    edge_type: EdgeType::DataFlow,
+                    expression: None,
+                    operation: None,
+                    join_type: None,
+                    join_condition: None,
+                    metadata: None,
+                    approximate: None,
+                });
+            }
+
+            instance_columns.push(OutputColumn {
+                name: source_col.name,
+                data_type: source_col.data_type,
+                node_id: instance_col_id,
+            });
+        }
+
+        ctx.register_subquery_columns_in_scope(alias.to_string(), instance_columns);
     }
 
     fn apply_join_metadata_to_existing_node(&self, ctx: &mut StatementContext, node_id: &Arc<str>) {
@@ -145,15 +291,35 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Resolves a regular table or view reference.
+    ///
+    /// When a table with the same canonical name already exists in the current scope
+    /// (self-join), a new node with an alias-specific ID is created. Otherwise the
+    /// standard canonical-based node ID is used for backward compatibility.
     fn resolve_regular_table(
         &mut self,
         ctx: &mut StatementContext,
         table_name: &str,
-    ) -> Option<(String, std::sync::Arc<str>)> {
+        alias: Option<&str>,
+    ) -> Option<(String, Arc<str>)> {
         let resolution = self.canonicalize_table_reference(table_name);
         let canonical = resolution.canonical.clone();
 
-        let (id, node_type) = self.relation_identity(&canonical);
+        // Check if this canonical table already has a node in the current scope.
+        // If so, this is a self-join and we need a separate instance node.
+        let is_self_join = ctx
+            .current_scope()
+            .is_some_and(|scope| scope.tables.contains_key(&canonical));
+
+        let (id, node_type) = if is_self_join {
+            // Self-join: generate alias-specific node ID
+            let alias_key = alias.unwrap_or(table_name);
+            let scope_id = ctx.current_scope_id().unwrap_or_default();
+            self.tracker
+                .relation_instance_identity(&canonical, alias_key, scope_id)
+        } else {
+            self.relation_identity(&canonical)
+        };
+
         let is_known = self.is_table_known(&canonical, resolution.matched_schema);
         let resolution_source = self.determine_resolution_source(&canonical, is_known);
 
@@ -165,6 +331,19 @@ impl<'a> Analyzer<'a> {
         self.tracker
             .record_consumed(&canonical, ctx.statement_index);
         ctx.register_table_in_scope(canonical.clone(), id.clone());
+
+        // Register instance for alias-aware resolution.
+        // Unaliased tables are addressable by both their simple and fully-qualified
+        // name so `public.employees.id` resolves to the unaliased side of a self-join.
+        if let Some(alias) = alias {
+            ctx.register_alias_instance(alias.to_string(), canonical.clone(), id.clone());
+        } else {
+            let simple_name = crate::analyzer::helpers::extract_simple_name(&canonical);
+            ctx.register_alias_instance(simple_name.to_string(), canonical.clone(), id.clone());
+            if simple_name != canonical {
+                ctx.register_alias_instance(canonical.clone(), canonical.clone(), id.clone());
+            }
+        }
 
         Some((canonical, id))
     }
@@ -204,7 +383,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         ctx: &mut StatementContext,
         canonical: &str,
-        id: &std::sync::Arc<str>,
+        id: &Arc<str>,
         node_type: NodeType,
         is_known: bool,
         resolution_source: Option<ResolutionSource>,
@@ -253,7 +432,7 @@ impl<'a> Analyzer<'a> {
     fn create_source_edge(
         &mut self,
         ctx: &mut StatementContext,
-        source_id: &std::sync::Arc<str>,
+        source_id: &Arc<str>,
         target_node: Option<&str>,
     ) {
         let Some(target) = target_node else { return };
@@ -330,23 +509,84 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn wildcard_sources_in_current_scope(&self, ctx: &StatementContext) -> Vec<(String, String)> {
+        let Some(scope) = ctx.current_scope() else {
+            return Vec::new();
+        };
+
+        let mut sources_by_node_id: HashMap<Arc<str>, (String, String)> = HashMap::new();
+        for (qualifier, instance) in &scope.alias_instances {
+            let should_replace = sources_by_node_id
+                .get(&instance.node_id)
+                .map(|(_, existing_qualifier)| {
+                    self.should_prefer_instance_qualifier(
+                        existing_qualifier,
+                        qualifier,
+                        &instance.canonical,
+                    )
+                })
+                .unwrap_or(true);
+
+            if should_replace {
+                sources_by_node_id.insert(
+                    instance.node_id.clone(),
+                    (instance.canonical.clone(), qualifier.clone()),
+                );
+            }
+        }
+
+        sources_by_node_id.into_values().collect()
+    }
+
+    /// Decide which qualifier to keep when two alias keys map to the same node ID.
+    ///
+    /// For unaliased tables, `alias_instances` contains entries under both the
+    /// simple name (`"employees"`) and the canonical name (`"public.employees"`).
+    /// When expanding wildcards we only want one entry per node. This heuristic
+    /// picks the canonical (fully-qualified) name when available, falling back to
+    /// the longer qualifier when both are user-defined aliases (longer names tend
+    /// to be more descriptive and stable across refactors).
+    fn should_prefer_instance_qualifier(
+        &self,
+        existing_qualifier: &str,
+        candidate_qualifier: &str,
+        canonical: &str,
+    ) -> bool {
+        // Prefer the canonical (fully-qualified) form when one matches
+        if existing_qualifier == canonical {
+            return false;
+        }
+        if candidate_qualifier == canonical {
+            return true;
+        }
+        // Between two user-defined aliases, prefer the longer (more descriptive) one.
+        // When lengths are equal, use lexicographic order for deterministic output.
+        match candidate_qualifier.len().cmp(&existing_qualifier.len()) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => candidate_qualifier < existing_qualifier,
+        }
+    }
+
     pub(crate) fn expand_wildcard(
         &mut self,
         ctx: &mut StatementContext,
         table_qualifier: Option<&str>,
         target_node: Option<&str>,
     ) {
-        // Resolve table qualifier to canonical name
-        let tables_to_expand: Vec<String> = if let Some(qualifier) = table_qualifier {
+        // Resolve wildcard sources as (canonical, qualifier) pairs so repeated
+        // relation instances in self-joins are expanded independently.
+        let tables_to_expand: Vec<(String, String)> = if let Some(qualifier) = table_qualifier {
             let resolved = self.resolve_table_alias(ctx, Some(qualifier));
-            resolved.into_iter().collect()
+            resolved
+                .into_iter()
+                .map(|canonical| (canonical, qualifier.to_string()))
+                .collect()
         } else {
-            // Expand all tables in current scope (not global table_node_ids)
-            // This ensures SELECT * only expands tables from the current query's FROM clause
-            ctx.tables_in_current_scope()
+            self.wildcard_sources_in_current_scope(ctx)
         };
 
-        for table_canonical in tables_to_expand {
+        for (table_canonical, source_qualifier) in tables_to_expand {
             // First collect column info to avoid borrow conflict
             let columns_to_add: Option<Vec<ExpandedColumnInfo>> = self
                 .schema
@@ -359,15 +599,13 @@ impl<'a> Analyzer<'a> {
                         .map(|col| {
                             ExpandedColumnInfo::new(
                                 col.name.clone(),
-                                table_canonical.clone(),
                                 col.data_type.as_ref().map(|dt| normalize_schema_type(dt)),
                             )
                         })
                         .collect()
                 })
                 .or_else(|| {
-                    ctx.aliased_subquery_columns
-                        .get(&table_canonical)
+                    ctx.resolve_subquery_columns(&table_canonical)
                         .and_then(|cte_cols| {
                             // Only return Some if there are actual columns.
                             // An empty column list means the CTE used SELECT * without schema,
@@ -383,7 +621,6 @@ impl<'a> Analyzer<'a> {
                                         .map(|col| {
                                             ExpandedColumnInfo::new(
                                                 col.name.clone(),
-                                                table_canonical.clone(),
                                                 col.data_type.clone(),
                                             )
                                         })
@@ -394,10 +631,10 @@ impl<'a> Analyzer<'a> {
                 });
 
             if let Some(columns) = columns_to_add {
-                // Expand from schema - NOT approximate
+                // Expand from schema - NOT approximate.
                 for col_info in columns {
                     let sources = vec![ColumnRef {
-                        table: Some(col_info.table_canonical),
+                        table: Some(source_qualifier.clone()),
                         column: col_info.name.clone(),
                     }];
                     self.add_output_column(
@@ -426,8 +663,13 @@ impl<'a> Analyzer<'a> {
                 // If there's a target node, create an approximate edge from source table to target
                 // and record the pending wildcard for backward inference
                 if let Some(target) = target_node {
-                    if let Some(source_node_id) = ctx.table_node_ids.get(&table_canonical).cloned()
-                    {
+                    // Prefer instance-aware lookup for the qualifier used during expansion.
+                    // The canonical fallback covers edge cases where instance tracking is
+                    // unavailable (for example, some derived-table paths).
+                    let source_node_id = self
+                        .resolve_instance_node_id(ctx, &source_qualifier)
+                        .or_else(|| ctx.table_node_ids.get(&table_canonical).cloned());
+                    if let Some(source_node_id) = source_node_id {
                         let edge_id = generate_edge_id(&source_node_id, target);
                         if !ctx.edge_ids.contains(&edge_id) {
                             ctx.add_edge(Edge {
@@ -495,6 +737,28 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Resolve a qualifier to its instance node ID.
+    ///
+    /// Unlike `resolve_table_alias` which returns the canonical name, this
+    /// returns the node ID for the specific alias instance. Essential for
+    /// self-joins where `e1` and `e2` map to different nodes.
+    pub(super) fn resolve_instance_node_id(
+        &self,
+        ctx: &StatementContext,
+        qualifier: &str,
+    ) -> Option<Arc<str>> {
+        // Try instance-aware lookup first
+        if let Some(instance) = ctx.resolve_alias_instance(qualifier) {
+            return Some(instance.node_id.clone());
+        }
+        // Fallback: resolve alias to canonical, then look up in table_node_ids
+        let canonical = self.resolve_table_alias(ctx, Some(qualifier))?;
+        ctx.table_node_ids
+            .get(&canonical)
+            .cloned()
+            .or_else(|| ctx.cte_definitions.get(&canonical).cloned())
+    }
+
     pub(crate) fn resolve_column_table(
         &mut self,
         ctx: &StatementContext,
@@ -507,10 +771,12 @@ impl<'a> Analyzer<'a> {
         }
 
         // No qualifier - try to find which table owns this column
-        // Use scope-based resolution: only consider tables in the current scope
+        // Use scope-based resolution: only consider tables in the current scope.
+        // Instance-aware counting is required so self-joins remain ambiguous.
         let tables_in_scope = ctx.tables_in_current_scope();
+        let relation_instances = ctx.relation_instances_in_current_scope();
 
-        if tables_in_scope.is_empty() {
+        if relation_instances.is_empty() {
             let mut issue = Issue::warning(
                 issue_codes::UNRESOLVED_REFERENCE,
                 format!("Column '{column}' referenced but no tables are currently in scope"),
@@ -523,9 +789,9 @@ impl<'a> Analyzer<'a> {
             return None;
         }
 
-        // If only one table in scope, assume column belongs to it
-        if tables_in_scope.len() == 1 {
-            return Some(tables_in_scope[0].clone());
+        // If only one relation instance is in scope, assume column belongs to it.
+        if relation_instances.len() == 1 {
+            return Some(relation_instances[0].canonical.clone());
         }
 
         let normalized_col = self.normalize_identifier(column);
@@ -535,7 +801,7 @@ impl<'a> Analyzer<'a> {
         let mut candidate_tables: Vec<String> = Vec::new();
         for table_canonical in &tables_in_scope {
             // Check aliased subquery columns (CTEs and derived tables)
-            if let Some(cte_cols) = ctx.aliased_subquery_columns.get(table_canonical) {
+            if let Some(cte_cols) = ctx.resolve_subquery_columns(table_canonical) {
                 if cte_cols.iter().any(|c| c.name == normalized_col) {
                     candidate_tables.push(table_canonical.clone());
                     continue;
@@ -556,15 +822,43 @@ impl<'a> Analyzer<'a> {
         }
 
         match candidate_tables.len() {
-            1 => candidate_tables.first().cloned(),
+            1 => {
+                let canonical = candidate_tables.first().cloned().unwrap();
+                if ctx.relation_instance_count_in_current_scope(&canonical) == 1 {
+                    Some(canonical)
+                } else {
+                    let mut relation_names: Vec<_> = relation_instances
+                        .iter()
+                        .map(|instance| instance.canonical.clone())
+                        .collect();
+                    relation_names.sort();
+                    let mut issue = Issue::warning(
+                        issue_codes::UNRESOLVED_REFERENCE,
+                        format!(
+                            "Column '{}' exists in multiple tables in scope: {}. Qualify the column to disambiguate.",
+                            column,
+                            relation_names.join(", ")
+                        ),
+                    )
+                    .with_statement(ctx.statement_index);
+                    if let Some(span) = self.find_span(column) {
+                        issue = issue.with_span(span);
+                    }
+                    self.issues.push(issue);
+                    None
+                }
+            }
             0 => {
-                // No candidates found - if there's only one table in scope, use it
+                // No candidates found - if there's only one relation instance in scope, use it
                 // (the column might exist but not be in our schema)
-                if tables_in_scope.len() == 1 {
-                    return Some(tables_in_scope[0].clone());
+                if relation_instances.len() == 1 {
+                    return Some(relation_instances[0].canonical.clone());
                 }
                 // Multiple tables but column not found in any - ambiguous
-                let mut sorted_tables = tables_in_scope.clone();
+                let mut sorted_tables: Vec<_> = relation_instances
+                    .iter()
+                    .map(|instance| instance.canonical.clone())
+                    .collect();
                 sorted_tables.sort();
                 let mut issue = Issue::warning(
                     issue_codes::UNRESOLVED_REFERENCE,
@@ -636,6 +930,10 @@ impl<'a> Analyzer<'a> {
     ) {
         let normalized_name = self.normalize_identifier(&params.name);
         let node_id = generate_column_node_id(params.target_node.as_deref(), &normalized_name);
+        let ownership_edge_id = params
+            .target_node
+            .as_deref()
+            .map(|target| generate_edge_id(target, &node_id));
 
         // Create column node
         let col_node = Node {
@@ -660,7 +958,9 @@ impl<'a> Analyzer<'a> {
 
         // Create ownership edge if we have a target
         if let Some(target) = params.target_node {
-            let edge_id = generate_edge_id(&target, &node_id);
+            let edge_id = ownership_edge_id
+                .clone()
+                .expect("ownership edge ID should exist when target node exists");
             if !ctx.edge_ids.contains(&edge_id) {
                 ctx.add_edge(Edge {
                     id: edge_id,
@@ -678,27 +978,51 @@ impl<'a> Analyzer<'a> {
         }
 
         // Create data flow edges from source columns
+        let mut resolved_sources = 0usize;
         for source in &params.sources {
             let resolved_table =
                 self.resolve_column_table(ctx, source.table.as_deref(), &source.column);
             if let Some(ref table_canonical) = resolved_table {
+                resolved_sources += 1;
                 let mut source_col_id = None;
 
-                // Try to find existing node ID if it's a known aliased subquery (CTE or derived table)
-                if let Some(cte_cols) = ctx.aliased_subquery_columns.get(table_canonical) {
+                // Try alias-specific subquery columns first, then canonical CTE/derived columns.
+                if let Some(cte_cols) = source
+                    .table
+                    .as_deref()
+                    .and_then(|qualifier| ctx.resolve_subquery_columns(qualifier))
+                    .or_else(|| ctx.resolve_subquery_columns(table_canonical))
+                {
                     let normalized_source_col = self.normalize_identifier(&source.column);
                     if let Some(col) = cte_cols.iter().find(|c| c.name == normalized_source_col) {
                         source_col_id = Some(col.node_id.clone());
                     }
                 }
 
-                // Determine the node ID for the owning table/CTE
-                let table_node_id = ctx
-                    .table_node_ids
-                    .get(table_canonical)
-                    .cloned()
-                    .or_else(|| ctx.cte_definitions.get(table_canonical).cloned())
-                    .unwrap_or_else(|| self.relation_node_id(table_canonical));
+                // Determine the node ID for the owning table/CTE.
+                // Use instance-aware lookup when a qualifier (alias) is available
+                // so that self-join aliases resolve to their own graph node.
+                let table_node_id = if source_col_id.is_some() {
+                    source
+                        .table
+                        .as_deref()
+                        .and_then(|q| self.resolve_instance_node_id(ctx, q))
+                        .or_else(|| ctx.table_node_ids.get(table_canonical).cloned())
+                        .or_else(|| ctx.cte_definitions.get(table_canonical).cloned())
+                        .unwrap_or_else(|| self.relation_node_id(table_canonical))
+                } else {
+                    ctx.cte_definitions
+                        .get(table_canonical)
+                        .cloned()
+                        .or_else(|| {
+                            source
+                                .table
+                                .as_deref()
+                                .and_then(|q| self.resolve_instance_node_id(ctx, q))
+                        })
+                        .or_else(|| ctx.table_node_ids.get(table_canonical).cloned())
+                        .unwrap_or_else(|| self.relation_node_id(table_canonical))
+                };
 
                 // Fallback to generating a new ID
                 let source_col_id = source_col_id.unwrap_or_else(|| {
@@ -769,12 +1093,102 @@ impl<'a> Analyzer<'a> {
             }
         }
 
+        // Drop bare unresolved projections when the column is provably ambiguous
+        // in a self-join context (e.g., `SELECT id FROM employees e1 JOIN employees e2`).
+        //
+        // Conditions (all must hold):
+        //   1. No source was resolved (resolved_sources == 0)
+        //   2. There are declared sources (the column isn't purely computed)
+        //   3. No expression wrapper (it mirrors the source column directly)
+        //   4. Exactly one source, unqualified, with a name matching the output
+        //   5. Not inside a table-function scope (those have dialect-provided columns)
+        //   6. The column is provably ambiguous across relation instances
+        //
+        // When schema metadata is incomplete we keep the output column and return
+        // partial lineage rather than silently dropping it.
+        let should_drop_unresolved_projection = resolved_sources == 0
+            && !params.sources.is_empty()
+            && params.expression.is_none()
+            && params.sources.len() == 1
+            && params.sources[0].table.is_none()
+            && self.normalize_identifier(&params.sources[0].column) == normalized_name
+            && !ctx.current_scope_has_table_function_relation()
+            && self.is_definitely_ambiguous_unqualified_column(ctx, &params.sources[0].column);
+        if should_drop_unresolved_projection {
+            #[cfg(feature = "tracing")]
+            debug!(
+                column = %normalized_name,
+                node_id = %node_id,
+                "dropping ambiguous unqualified column from output (no resolved sources)"
+            );
+            ctx.nodes.retain(|node| node.id != node_id);
+            ctx.node_ids.remove(&node_id);
+
+            if let Some(edge_id) = ownership_edge_id {
+                ctx.edges.retain(|edge| edge.id != edge_id);
+                ctx.edge_ids.remove(&edge_id);
+            }
+            return;
+        }
+
         // Record output column
         ctx.output_columns.push(OutputColumn {
             name: normalized_name,
             data_type: params.data_type,
             node_id,
         });
+    }
+
+    fn is_definitely_ambiguous_unqualified_column(
+        &self,
+        ctx: &StatementContext,
+        column: &str,
+    ) -> bool {
+        let relation_instances = ctx.relation_instances_in_current_scope();
+        if relation_instances.len() <= 1 {
+            return false;
+        }
+
+        let normalized_col = self.normalize_identifier(column);
+        let mut candidate_tables = HashSet::new();
+        for table_canonical in ctx.tables_in_current_scope() {
+            if ctx
+                .resolve_subquery_columns(&table_canonical)
+                .is_some_and(|cte_cols| cte_cols.iter().any(|c| c.name == normalized_col))
+            {
+                candidate_tables.insert(table_canonical.clone());
+                continue;
+            }
+
+            if self
+                .schema
+                .get(&table_canonical)
+                .is_some_and(|schema_entry| {
+                    schema_entry
+                        .table
+                        .columns
+                        .iter()
+                        .any(|c| self.normalize_identifier(&c.name) == normalized_col)
+                })
+            {
+                candidate_tables.insert(table_canonical);
+            }
+        }
+
+        if candidate_tables.len() > 1 {
+            return true;
+        }
+
+        if let Some(canonical) = candidate_tables.into_iter().next() {
+            return ctx.relation_instance_count_in_current_scope(&canonical) > 1;
+        }
+
+        relation_instances
+            .iter()
+            .map(|instance| instance.canonical.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+            == 1
     }
 
     /// Convert an AST JoinOperator to JoinType enum, also extracting the join condition.
@@ -864,18 +1278,44 @@ impl<'a> Analyzer<'a> {
 
     /// Apply pending filters to table nodes before finalizing the statement.
     pub(super) fn apply_pending_filters(&self, ctx: &mut StatementContext) {
-        // Collect pending filters to avoid borrow issues
-        let pending: Vec<(String, Vec<crate::types::FilterPredicate>)> =
+        let instance_pending: Vec<(Arc<str>, Vec<crate::types::FilterPredicate>)> =
+            ctx.pending_instance_filters.drain().collect();
+        let canonical_pending: Vec<(String, Vec<crate::types::FilterPredicate>)> =
             ctx.pending_filters.drain().collect();
 
-        for (table_canonical, filters) in pending {
-            // Find the node for this table
-            if let Some(node) = ctx
-                .nodes
-                .iter_mut()
-                .find(|n| n.qualified_name.as_deref() == Some(&table_canonical))
-            {
-                node.filters.extend(filters);
+        // Build indexes for O(1) lookups instead of scanning nodes per filter
+        let mut id_index: HashMap<Arc<str>, usize> = HashMap::with_capacity(ctx.nodes.len());
+        let mut canonical_index: HashMap<Arc<str>, Vec<usize>> =
+            HashMap::with_capacity(ctx.nodes.len());
+        for (i, node) in ctx.nodes.iter().enumerate() {
+            id_index.insert(node.id.clone(), i);
+            if let Some(ref qn) = node.qualified_name {
+                canonical_index.entry(qn.clone()).or_default().push(i);
+            }
+        }
+
+        // Apply instance-targeted filters (precise, keyed by node ID)
+        for (node_id, filters) in instance_pending {
+            if let Some(&idx) = id_index.get(&node_id) {
+                ctx.nodes[idx].filters.extend(filters);
+            } else {
+                #[cfg(feature = "tracing")]
+                debug!(
+                    %node_id,
+                    filter_count = filters.len(),
+                    "instance filter target node not found, filters dropped"
+                );
+            }
+        }
+
+        // Apply canonical-keyed filters to ALL matching nodes (important for
+        // self-joins where unqualified predicates should apply to every instance
+        // of the same canonical table).
+        for (table_canonical, filters) in canonical_pending {
+            if let Some(indices) = canonical_index.get(table_canonical.as_str()) {
+                for &idx in indices {
+                    ctx.nodes[idx].filters.extend(filters.clone());
+                }
             }
         }
     }

@@ -73,7 +73,7 @@ expression: cleaned
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_208687717881053c",
+        "id": "column_8d19bd6c3446f90a",
         "type": "column",
         "label": "id",
         "canonicalName": {
@@ -147,7 +147,7 @@ expression: cleaned
     "edges": [
       {
         "id": "edge_0d4efff970b71ad2",
-        "from": "column_208687717881053c",
+        "from": "column_8d19bd6c3446f90a",
         "to": "column_d8bba385e09d94a9",
         "type": "data_flow",
         "producerStatement": {
@@ -175,7 +175,7 @@ expression: cleaned
       {
         "id": "edge_d0d8e0de8ab72937",
         "from": "table_1d63721b3610a67f",
-        "to": "column_208687717881053c",
+        "to": "column_8d19bd6c3446f90a",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0

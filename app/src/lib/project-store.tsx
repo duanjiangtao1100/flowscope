@@ -482,17 +482,32 @@ export function ProjectProvider({ children }: { children: React.ReactNode }) {
     (name: string, content: string = '', path?: string) => {
       if (!activeProjectId) return;
 
-      const newFile: ProjectFile = {
-        id: uuidv4(),
-        name,
-        path: path || name, // Default path to filename if not provided
-        content,
-        language: getFileLanguage(name),
-      };
-
       setProjects((prev) =>
         prev.map((p) => {
           if (p.id !== activeProjectId) return p;
+
+          // Generate a unique file name by appending an incrementing suffix
+          const existingNames = new Set(p.files.map((f) => f.name.toLowerCase()));
+          let uniqueName = name;
+          if (existingNames.has(uniqueName.toLowerCase())) {
+            const dotIndex = name.lastIndexOf('.');
+            const baseName = dotIndex > 0 ? name.slice(0, dotIndex) : name;
+            const ext = dotIndex > 0 ? name.slice(dotIndex) : '';
+            let counter = 2;
+            while (existingNames.has(`${baseName}_${counter}${ext}`.toLowerCase())) {
+              counter++;
+            }
+            uniqueName = `${baseName}_${counter}${ext}`;
+          }
+
+          const newFile: ProjectFile = {
+            id: uuidv4(),
+            name: uniqueName,
+            path: path || uniqueName,
+            content,
+            language: getFileLanguage(uniqueName),
+          };
+
           return {
             ...p,
             files: [...p.files, newFile],

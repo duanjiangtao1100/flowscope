@@ -231,10 +231,12 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
                     );
                 }
                 SelectItem::QualifiedWildcard(name, _) => {
-                    let table_name = name.to_string();
+                    let qualifier = name.to_string();
+                    // SelectItemQualifiedWildcardKind::Display appends ".*"
+                    let qualifier = qualifier.strip_suffix(".*").unwrap_or(&qualifier);
                     self.analyzer.expand_wildcard(
                         self.ctx,
-                        Some(&table_name),
+                        Some(qualifier),
                         self.target_node.as_deref(),
                     );
                 }
@@ -422,7 +424,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
             let canonical = self.analyzer.resolve_table_alias(self.ctx, Some(table))?;
 
             // Check aliased_subquery_columns (CTEs and derived tables) first
-            if let Some(cte_cols) = self.ctx.aliased_subquery_columns.get(&canonical) {
+            if let Some(cte_cols) = self.ctx.resolve_subquery_columns(&canonical) {
                 if let Some(col) = cte_cols.iter().find(|c| c.name == normalized_col) {
                     if col.data_type.is_some() {
                         return col.data_type.clone();
@@ -442,7 +444,7 @@ impl<'a, 'b> SelectAnalyzer<'a, 'b> {
             // No table qualifier - search all CTEs/subqueries in current scope
             for table_canonical in self.ctx.tables_in_current_scope() {
                 // Check CTE/subquery columns first
-                if let Some(cte_cols) = self.ctx.aliased_subquery_columns.get(&table_canonical) {
+                if let Some(cte_cols) = self.ctx.resolve_subquery_columns(&table_canonical) {
                     if let Some(col) = cte_cols.iter().find(|c| c.name == normalized_col) {
                         if col.data_type.is_some() {
                             return col.data_type.clone();

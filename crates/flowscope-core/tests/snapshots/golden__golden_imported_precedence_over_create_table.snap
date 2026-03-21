@@ -48,7 +48,7 @@ expression: cleaned
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_a60e9184e00ef36f",
+        "id": "column_0e392201e6a91e55",
         "type": "column",
         "label": "imported_col",
         "canonicalName": {
@@ -63,7 +63,7 @@ expression: cleaned
         ]
       },
       {
-        "id": "column_d2d29e8cbc95061a",
+        "id": "column_59f6b8bb067f6ec4",
         "type": "column",
         "label": "product_id",
         "canonicalName": {
@@ -96,7 +96,7 @@ expression: cleaned
       {
         "id": "edge_482576f33e20c7f7",
         "from": "table_7253befe2c400508",
-        "to": "column_a60e9184e00ef36f",
+        "to": "column_0e392201e6a91e55",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -105,7 +105,7 @@ expression: cleaned
       {
         "id": "edge_5c1c64b7a9ef59e5",
         "from": "table_7253befe2c400508",
-        "to": "column_d2d29e8cbc95061a",
+        "to": "column_59f6b8bb067f6ec4",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0

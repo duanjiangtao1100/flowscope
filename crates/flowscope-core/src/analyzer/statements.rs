@@ -223,6 +223,17 @@ impl<'a> Analyzer<'a> {
         // Register implied schema for source tables referenced in the query
         self.register_source_tables_schema(&ctx);
 
+        // Emit a user-visible warning when the alias instance limit was hit.
+        // Lineage may be incomplete for the affected aliases.
+        if ctx.instance_limit_reached {
+            let mut issue = Issue::warning(
+                issue_codes::MEMORY_LIMIT_EXCEEDED,
+                "Alias instance limit reached; lineage for some self-join aliases may be incomplete",
+            );
+            issue.statement_index = Some(index);
+            self.issues.push(issue);
+        }
+
         // Calculate statement-level stats
         let join_count = complexity::count_joins(&ctx.nodes);
         let complexity_score = complexity::calculate_complexity(&ctx.nodes);
@@ -252,8 +263,11 @@ impl<'a> Analyzer<'a> {
             .filter(|edge| edge.edge_type == EdgeType::Ownership && edge.from == output_node_id)
             .map(|edge| edge.to.clone())
             .collect();
-
-        if output_column_ids.is_empty() {
+        let has_direct_output_lineage = ctx.edges.iter().any(|edge| {
+            matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+                && edge.to == output_node_id
+        });
+        if output_column_ids.is_empty() && !has_direct_output_lineage {
             return;
         }
 
@@ -286,18 +300,20 @@ impl<'a> Analyzer<'a> {
             } = join_info;
             let owned_columns = table_columns.get(&node_id).cloned().unwrap_or_default();
 
-            let contributes_to_output = !owned_columns.is_empty()
-                && ctx.edges.iter().any(|edge| {
-                    matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
-                        && owned_columns.iter().any(|col| col == &edge.from)
-                        && output_column_ids.contains(&edge.to)
-                });
+            let contributes_to_output = ctx.edges.iter().any(|edge| {
+                matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+                    && (edge.from == node_id || owned_columns.iter().any(|col| col == &edge.from))
+                    && (edge.to == output_node_id || output_column_ids.contains(&edge.to))
+            });
 
             if contributes_to_output {
                 continue;
             }
 
-            let edge_key = format!("join_dependency:{node_id}");
+            let edge_key = format!(
+                "join_dependency:{node_id}:{join_type:?}:{}",
+                join_condition.as_deref().unwrap_or("")
+            );
             let edge_id = generate_edge_id(&edge_key, output_node_id.as_ref());
             if ctx.edge_ids.contains(&edge_id) {
                 continue;

@@ -1,6 +1,5 @@
 ---
 source: crates/flowscope-core/tests/golden.rs
-assertion_line: 94
 expression: cleaned
 ---
 {
@@ -114,7 +113,22 @@ expression: cleaned
         ]
       },
       {
-        "id": "column_17365cc1224ceac1",
+        "id": "column_1fafa75822fcf49b",
+        "type": "column",
+        "label": "id",
+        "canonicalName": {
+          "schema": "users",
+          "name": "id"
+        },
+        "statementRefs": [
+          {
+            "statementIndex": 0,
+            "nodeId": "column_f6b363282306de23"
+          }
+        ]
+      },
+      {
+        "id": "column_3cf9faa82a446690",
         "type": "column",
         "label": "name",
         "canonicalName": {
@@ -139,21 +153,6 @@ expression: cleaned
           {
             "statementIndex": 0,
             "nodeId": "column_8ebd316ab60e6446"
-          }
-        ]
-      },
-      {
-        "id": "column_f6b363282306de23",
-        "type": "column",
-        "label": "id",
-        "canonicalName": {
-          "schema": "users",
-          "name": "id"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_f6b363282306de23"
           }
         ]
       },
@@ -207,7 +206,7 @@ expression: cleaned
       },
       {
         "id": "edge_720f152947fb0bd4",
-        "from": "column_17365cc1224ceac1",
+        "from": "column_3cf9faa82a446690",
         "to": "column_073ed625e10d73f3",
         "type": "derivation",
         "producerStatement": {
@@ -217,7 +216,7 @@ expression: cleaned
       {
         "id": "edge_a92e0d09881d5676",
         "from": "table_10a0682dff76cdbc",
-        "to": "column_f6b363282306de23",
+        "to": "column_1fafa75822fcf49b",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -235,7 +234,7 @@ expression: cleaned
       {
         "id": "edge_ca4078f641aa8fdc",
         "from": "table_10a0682dff76cdbc",
-        "to": "column_17365cc1224ceac1",
+        "to": "column_3cf9faa82a446690",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -243,7 +242,7 @@ expression: cleaned
       },
       {
         "id": "edge_f6501889408ccbfc",
-        "from": "column_f6b363282306de23",
+        "from": "column_1fafa75822fcf49b",
         "to": "column_8ebd316ab60e6446",
         "type": "data_flow",
         "producerStatement": {

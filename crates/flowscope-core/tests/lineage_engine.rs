@@ -358,13 +358,19 @@ fn recursive_ctes_produce_lineage_without_warnings() {
         "recursive CTEs should not emit warnings when supported"
     );
 
-    // Verify the CTE node is present and self-references are tracked.
+    // Verify the CTE node is present and recursive references are tracked.
     let stmt = first_statement(&result);
-    let cte_node = stmt
+    let cte_nodes: Vec<_> = stmt
         .nodes
         .iter()
-        .find(|n| n.node_type == NodeType::Cte && &*n.label == "org_hierarchy")
-        .expect("cte node should be present");
+        .filter(|n| {
+            n.node_type == NodeType::Cte && n.qualified_name.as_deref() == Some("org_hierarchy")
+        })
+        .collect();
+    assert!(
+        !cte_nodes.is_empty(),
+        "recursive CTE should produce at least one CTE node"
+    );
 
     let employees_node = stmt
         .nodes
@@ -372,19 +378,20 @@ fn recursive_ctes_produce_lineage_without_warnings() {
         .find(|n| n.node_type == NodeType::Table && &*n.label == "employees")
         .expect("base table should be present");
 
-    let has_self_edge = stmt
+    let cte_ids: HashSet<_> = cte_nodes.iter().map(|n| n.id.clone()).collect();
+    let has_recursive_edge = stmt
         .edges
         .iter()
-        .any(|e| e.from == cte_node.id && e.to == cte_node.id);
+        .any(|e| cte_ids.contains(&e.from) && cte_ids.contains(&e.to));
     assert!(
-        has_self_edge,
-        "recursive CTE should have a self-referential edge to represent recursion"
+        has_recursive_edge,
+        "recursive CTE should have an edge connecting recursive CTE instances"
     );
 
     let has_base_edge = stmt
         .edges
         .iter()
-        .any(|e| e.from == employees_node.id && e.to == cte_node.id);
+        .any(|e| e.from == employees_node.id && cte_ids.contains(&e.to));
     assert!(
         has_base_edge,
         "recursive CTE anchor should link base table to the CTE node"
@@ -1517,19 +1524,39 @@ fn self_join_multi_level_hierarchy() {
     "#;
 
     let result = run_analysis(sql, Dialect::Generic, None);
-    let tables = collect_table_names(&result);
+    let stmt = first_statement(&result);
 
+    // Each alias should produce its own table node in statement lineage
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
     assert_eq!(
-        tables.len(),
-        1,
-        "self-join should deduplicate table references"
-    );
-    assert!(
-        tables.contains("employees"),
-        "self-join should track employees table"
+        table_nodes.len(),
+        4,
+        "self-join with 4 aliases should produce 4 distinct table nodes, got: {:?}",
+        table_nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
     );
 
-    let cols = column_labels(first_statement(&result));
+    // All nodes should reference the same canonical table
+    for node in &table_nodes {
+        assert_eq!(
+            node.qualified_name.as_deref(),
+            Some("employees"),
+            "all self-join nodes should have canonical qualified_name"
+        );
+    }
+
+    // Each alias node should have a unique ID
+    let unique_ids: HashSet<_> = table_nodes.iter().map(|n| &n.id).collect();
+    assert_eq!(
+        unique_ids.len(),
+        4,
+        "each alias should have a unique node ID"
+    );
+
+    let cols = column_labels(stmt);
     for expected in ["employee", "manager", "director", "vp"] {
         assert!(
             cols.contains(&expected.to_string()),
@@ -1551,12 +1578,1475 @@ fn self_join_with_aggregation() {
     "#;
 
     let result = run_analysis(sql, Dialect::Generic, None);
-    let tables = collect_table_names(&result);
+    let stmt = first_statement(&result);
+
+    // Two aliases should produce two distinct table nodes
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(
+        table_nodes.len(),
+        2,
+        "self-join with 2 aliases should produce 2 distinct table nodes"
+    );
+
+    // All nodes should reference the same canonical table
+    for node in &table_nodes {
+        assert_eq!(node.qualified_name.as_deref(), Some("employees"),);
+    }
+}
+
+#[test]
+fn self_join_filters_attach_to_correct_instance() {
+    let sql = r#"
+        SELECT e1.name, e2.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        WHERE e1.active = true
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(table_nodes.len(), 2, "self-join should have 2 table nodes");
+
+    // Exactly one node should have the WHERE filter
+    let nodes_with_filters: Vec<_> = table_nodes
+        .iter()
+        .filter(|n| !n.filters.is_empty())
+        .collect();
+    assert_eq!(
+        nodes_with_filters.len(),
+        1,
+        "only the e1 instance should have the filter, got filters on {} nodes",
+        nodes_with_filters.len()
+    );
+
+    let filtered_node = nodes_with_filters[0];
+    assert_eq!(filtered_node.filters.len(), 1);
+    assert!(
+        filtered_node.filters[0].expression.contains("active"),
+        "filter should reference 'active'"
+    );
+}
+
+#[test]
+fn self_join_column_ownership_is_instance_aware() {
+    // Verify that columns from different aliases attach to different table nodes
+    let sql = r#"
+        SELECT e1.name AS emp_name, e2.name AS mgr_name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(table_nodes.len(), 2);
+
+    // Each table node should own different source column nodes
+    // Check that both table nodes have ownership edges to column nodes
+    for table_node in &table_nodes {
+        let owned_columns: Vec<_> = stmt
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Ownership && e.from == table_node.id)
+            .collect();
+        assert!(
+            !owned_columns.is_empty(),
+            "each self-join instance should own at least one column, but node {} has none",
+            table_node.id
+        );
+    }
+
+    // The two table nodes should have DIFFERENT column children (different IDs)
+    let owned_by_first: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Ownership && e.from == table_nodes[0].id)
+        .map(|e| &e.to)
+        .collect();
+    let owned_by_second: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Ownership && e.from == table_nodes[1].id)
+        .map(|e| &e.to)
+        .collect();
+    assert!(
+        owned_by_first.is_disjoint(&owned_by_second),
+        "self-join instances should own disjoint column sets"
+    );
+}
+
+#[test]
+fn self_join_wildcard_expands_all_relation_instances() {
+    let sql = r#"
+        SELECT *
+        FROM public.employees e1
+        JOIN public.employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let schema = SchemaMetadata {
+        allow_implied: true,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![schema_table(
+            None,
+            Some("public"),
+            "employees",
+            &["id", "manager_id", "name"],
+        )],
+    };
+
+    let result = run_analysis(sql, Dialect::Postgres, Some(schema));
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == NodeType::Table
+                && node.qualified_name.as_deref() == Some("public.employees")
+        })
+        .collect();
+    assert_eq!(
+        table_nodes.len(),
+        2,
+        "self-join should create 2 table nodes"
+    );
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("output node should exist");
+
+    for column_name in ["id", "manager_id", "name"] {
+        let output_column_id = stmt
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == EdgeType::Ownership
+                    && edge.from == output_node.id
+                    && stmt.nodes.iter().any(|node| {
+                        node.id == edge.to
+                            && node.node_type == NodeType::Column
+                            && &*node.label == column_name
+                    })
+            })
+            .map(|edge| edge.to.clone())
+            .unwrap_or_else(|| panic!("output column {column_name} should exist"));
+
+        let source_owner_ids: HashSet<_> = stmt
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_type == EdgeType::DataFlow && edge.to == output_column_id)
+            .filter_map(|edge| {
+                stmt.edges
+                    .iter()
+                    .find(|ownership| {
+                        ownership.edge_type == EdgeType::Ownership && ownership.to == edge.from
+                    })
+                    .map(|ownership| ownership.from.clone())
+            })
+            .collect();
+
+        assert_eq!(
+            source_owner_ids.len(),
+            2,
+            "wildcard-expanded column {column_name} should receive lineage from both self-join instances"
+        );
+    }
+}
+
+#[test]
+fn schema_qualified_unaliased_self_join_reference_uses_distinct_instance() {
+    let sql = r#"
+        SELECT public.employees.id AS employee_id, e2.id AS manager_id
+        FROM public.employees
+        JOIN public.employees e2 ON public.employees.manager_id = e2.id
+    "#;
+
+    let schema = SchemaMetadata {
+        allow_implied: true,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![schema_table(
+            None,
+            Some("public"),
+            "employees",
+            &["id", "manager_id", "name"],
+        )],
+    };
+
+    let result = run_analysis(sql, Dialect::Postgres, Some(schema));
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("output node should exist");
+
+    let output_column_id = |label: &str| {
+        stmt.edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == EdgeType::Ownership
+                    && edge.from == output_node.id
+                    && stmt.nodes.iter().any(|node| {
+                        node.id == edge.to
+                            && node.node_type == NodeType::Column
+                            && &*node.label == label
+                    })
+            })
+            .map(|edge| edge.to.clone())
+            .unwrap_or_else(|| panic!("{label} should exist as an output column"))
+    };
+
+    let source_owner_id = |output_column_id: &std::sync::Arc<str>| {
+        let source_column_id = stmt
+            .edges
+            .iter()
+            .find(|edge| edge.edge_type == EdgeType::DataFlow && edge.to == *output_column_id)
+            .map(|edge| edge.from.clone())
+            .expect("output column should have a source column");
+
+        stmt.edges
+            .iter()
+            .find(|edge| edge.edge_type == EdgeType::Ownership && edge.to == source_column_id)
+            .map(|edge| edge.from.clone())
+            .expect("source column should be owned by a table")
+    };
+
+    let employee_owner_id = source_owner_id(&output_column_id("employee_id"));
+    let manager_owner_id = source_owner_id(&output_column_id("manager_id"));
+
+    assert_ne!(
+        employee_owner_id, manager_owner_id,
+        "schema-qualified reference to the unaliased side should not collapse onto the aliased self-join node"
+    );
+}
+
+#[test]
+fn self_join_global_lineage_merges_by_canonical() {
+    let sql = r#"
+        SELECT e1.name, e2.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+
+    // Statement-level: 2 distinct nodes
+    let stmt = first_statement(&result);
+    let stmt_table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(stmt_table_nodes.len(), 2);
+
+    // Global lineage should still have a single "employees" entry
+    let global = &result.global_lineage;
+    let global_employees: Vec<_> = global
+        .nodes
+        .iter()
+        .filter(|n| n.canonical_name.name == "employees")
+        .collect();
+    assert_eq!(
+        global_employees.len(),
+        1,
+        "global lineage should merge self-join instances into one canonical node"
+    );
+
+    let global_node_ids: HashSet<_> = global.nodes.iter().map(|n| n.id.clone()).collect();
+    for edge in &global.edges {
+        assert!(
+            global_node_ids.contains(&edge.from),
+            "global edge {} has missing source node {}",
+            edge.id,
+            edge.from
+        );
+        assert!(
+            global_node_ids.contains(&edge.to),
+            "global edge {} has missing target node {}",
+            edge.id,
+            edge.to
+        );
+    }
+}
+
+#[test]
+fn self_join_global_lineage_merges_source_columns_by_canonical() {
+    let sql = r#"
+        SELECT
+            e1.name AS employee_name,
+            e2.name AS manager_name,
+            e3.name AS director_name
+        FROM employees e1
+        LEFT JOIN employees e2 ON e1.manager_id = e2.id
+        LEFT JOIN employees e3 ON e2.manager_id = e3.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let global = &result.global_lineage;
+
+    let employees_node = global
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Table && node.canonical_name.name == "employees")
+        .expect("employees table should exist in global lineage");
+
+    let source_name_nodes: Vec<_> = global
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == NodeType::Column
+                && node.canonical_name.schema.as_deref() == Some("employees")
+                && node.canonical_name.name == "name"
+        })
+        .collect();
 
     assert_eq!(
-        tables.len(),
+        source_name_nodes.len(),
         1,
-        "self-join with aggregation should have single table"
+        "self-join source columns should collapse into one global canonical node"
+    );
+
+    let source_name_node = source_name_nodes[0];
+    assert_eq!(
+        source_name_node.statement_refs.len(),
+        3,
+        "merged source column should retain refs to all three statement-local instances"
+    );
+
+    let ownership_edges: Vec<_> = global
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.edge_type == EdgeType::Ownership
+                && edge.from == employees_node.id
+                && edge.to == source_name_node.id
+        })
+        .collect();
+    assert_eq!(
+        ownership_edges.len(),
+        1,
+        "merged global source column should have one ownership edge from employees"
+    );
+
+    let output_targets: HashSet<_> = global
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::DataFlow && edge.from == source_name_node.id)
+        .map(|edge| edge.to.clone())
+        .collect();
+    assert_eq!(
+        output_targets.len(),
+        3,
+        "merged source column should feed all three output aliases"
+    );
+}
+
+#[test]
+fn global_lineage_merges_qualified_columns_across_self_joins_and_cte_instances() {
+    let sql = r#"
+        SELECT
+            e1.name AS employee_name,
+            e2.name AS manager_name,
+            e3.name AS director_name
+        FROM employees e1
+        LEFT JOIN employees e2 ON e1.manager_id = e2.id
+        LEFT JOIN employees e3 ON e2.manager_id = e3.id
+        WHERE e1.active = true AND e3.region = 'NA';
+
+        WITH org AS (
+            SELECT
+                id AS employee_id,
+                manager_id,
+                department_id
+            FROM employees
+        )
+        SELECT
+            a.employee_id,
+            b.employee_id AS manager_employee_id
+        FROM org a
+        JOIN org b ON a.manager_id = b.employee_id
+        WHERE a.department_id = 10;
+    "#;
+
+    let schema = SchemaMetadata {
+        allow_implied: true,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![schema_table(
+            None,
+            None,
+            "employees",
+            &[
+                "id",
+                "manager_id",
+                "department_id",
+                "name",
+                "active",
+                "region",
+            ],
+        )],
+    };
+
+    let result = run_analysis(sql, Dialect::Generic, Some(schema));
+    let global = &result.global_lineage;
+
+    let employees_name_nodes: Vec<_> = global
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == NodeType::Column
+                && node.canonical_name.schema.as_deref() == Some("employees")
+                && node.canonical_name.name == "name"
+        })
+        .collect();
+    assert_eq!(
+        employees_name_nodes.len(),
+        1,
+        "global lineage should contain one canonical employees.name node"
+    );
+    assert_eq!(
+        employees_name_nodes[0].statement_refs.len(),
+        3,
+        "employees.name should retain all three self-join source refs"
+    );
+
+    let org_employee_id_nodes: Vec<_> = global
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.node_type == NodeType::Column
+                && node.canonical_name.schema.as_deref() == Some("org")
+                && node.canonical_name.name == "employee_id"
+        })
+        .collect();
+    assert_eq!(
+        org_employee_id_nodes.len(),
+        1,
+        "global lineage should contain one canonical org.employee_id node"
+    );
+}
+
+#[test]
+fn self_join_unqualified_column_reference_stays_ambiguous() {
+    let sql = r#"
+        SELECT id
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+
+    let ambiguity_issue = result.issues.iter().find(|issue| {
+        issue.code == issue_codes::UNRESOLVED_REFERENCE
+            && issue.message.to_lowercase().contains("ambiguous")
+    });
+
+    assert!(
+        ambiguity_issue.is_some(),
+        "unqualified self-join columns should still be ambiguous"
+    );
+}
+
+#[test]
+fn ambiguous_self_join_projection_does_not_emit_dangling_column_or_join_dependency() {
+    let sql = r#"
+        SELECT id
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id;
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    assert!(
+        result.issues.iter().any(|issue| {
+            issue.code == issue_codes::UNRESOLVED_REFERENCE
+                && issue.message.to_lowercase().contains("ambiguous")
+        }),
+        "ambiguous self-join projection should still emit an ambiguity warning"
+    );
+
+    assert!(
+        stmt.nodes
+            .iter()
+            .filter(|node| node.node_type == NodeType::Column && &*node.label == "id")
+            .count()
+            == 0,
+        "ambiguous projected column should not create a dangling output column node"
+    );
+
+    assert!(
+        stmt.edges
+            .iter()
+            .all(|edge| edge.edge_type != EdgeType::JoinDependency),
+        "invalid ambiguous projection should not synthesize join-dependency edges"
+    );
+}
+
+#[test]
+fn unresolved_bare_join_projection_remains_in_output_schema() {
+    let sql = r#"
+        SELECT name
+        FROM customers
+        JOIN orders ON customers.id = orders.customer_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    assert!(
+        result
+            .issues
+            .iter()
+            .any(|issue| issue.code == issue_codes::UNRESOLVED_REFERENCE),
+        "best-effort multi-table analysis should still surface the unresolved reference"
+    );
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+
+    let visible_output_column = stmt.nodes.iter().find(|node| {
+        node.node_type == NodeType::Column
+            && &*node.label == "name"
+            && stmt.edges.iter().any(|edge| {
+                edge.edge_type == EdgeType::Ownership
+                    && edge.from == output_node.id
+                    && edge.to == node.id
+            })
+    });
+
+    assert!(
+        visible_output_column.is_some(),
+        "unresolved bare projections should remain visible in the output schema"
+    );
+}
+
+#[test]
+fn repeated_cte_aliases_create_distinct_reference_nodes() {
+    let sql = r#"
+        WITH org AS (
+            SELECT id, manager_id
+            FROM employees
+        )
+        SELECT a.id
+        FROM org a
+        JOIN org b ON a.manager_id = b.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    // The first reference (`org a`) reuses the CTE definition node.
+    // Only the self-join reference (`org b`) gets a separate instance node.
+    let cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte && n.qualified_name.as_deref() == Some("org"))
+        .collect();
+
+    assert_eq!(
+        cte_nodes.len(),
+        2,
+        "expected CTE definition (reused by first alias) plus one self-join instance node"
+    );
+
+    let unique_ids: HashSet<_> = cte_nodes.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(
+        unique_ids.len(),
+        2,
+        "CTE self-join aliases should have distinct node IDs"
+    );
+}
+
+#[test]
+fn repeated_cte_aliases_across_statements_keep_distinct_global_instance_nodes() {
+    let sql = r#"
+        WITH org AS (
+            SELECT id, manager_id
+            FROM employees
+        )
+        SELECT a.id
+        FROM org a
+        JOIN org b ON a.manager_id = b.id;
+
+        WITH org AS (
+            SELECT id, parent_id AS manager_id
+            FROM departments
+        )
+        SELECT a.id
+        FROM org a
+        JOIN org b ON a.manager_id = b.id;
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+
+    let global_org_nodes: Vec<_> = result
+        .global_lineage
+        .nodes
+        .iter()
+        .filter(|node| node.node_type == NodeType::Cte && node.canonical_name.name == "org")
+        .collect();
+
+    assert_eq!(
+        global_org_nodes.len(),
+        3,
+        "global lineage should keep one shared org definition node plus one org b instance per statement"
+    );
+
+    let statement_scoped_instances = global_org_nodes
+        .iter()
+        .filter(|node| node.statement_refs.len() == 1)
+        .count();
+    assert_eq!(
+        statement_scoped_instances, 2,
+        "non-definition CTE self-join instances should remain statement-local in global lineage"
+    );
+}
+
+#[test]
+fn cte_self_join_alias_columns_do_not_leak_across_union_scopes() {
+    let sql = r#"
+        WITH emp AS (
+            SELECT id, name
+            FROM employees
+        ),
+        dept AS (
+            SELECT id, name
+            FROM departments
+        )
+        SELECT b.name AS emp_name
+        FROM emp a
+        JOIN emp b ON a.id = b.id
+        UNION ALL
+        SELECT b.name AS dept_name
+        FROM dept a
+        JOIN dept b ON a.id = b.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    assert!(
+        !result.summary.has_errors,
+        "CTE alias reuse across UNION branches should analyze cleanly: {:?}",
+        result.issues
+    );
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let dept_output = stmt
+        .nodes
+        .iter()
+        .find(|node| {
+            node.node_type == NodeType::Column
+                && &*node.label == "dept_name"
+                && stmt.edges.iter().any(|edge| {
+                    edge.edge_type == EdgeType::Ownership
+                        && edge.from == output_node.id
+                        && edge.to == node.id
+                })
+        })
+        .expect("dept_name output column should exist");
+
+    let dept_source_ids: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::DataFlow && edge.to == dept_output.id)
+        .map(|edge| edge.from.clone())
+        .collect();
+    assert!(
+        !dept_source_ids.is_empty(),
+        "dept_name should receive a direct data-flow edge from the dept branch source column"
+    );
+
+    let source_owner_labels: HashSet<_> = stmt
+        .edges
+        .iter()
+        .filter(|edge| edge.edge_type == EdgeType::Ownership && dept_source_ids.contains(&edge.to))
+        .filter_map(|edge| stmt.nodes.iter().find(|node| node.id == edge.from))
+        .map(|node| node.label.to_string())
+        .collect();
+
+    assert!(
+        source_owner_labels.contains("dept"),
+        "dept_name should be sourced from a dept CTE instance, saw owners {source_owner_labels:?}"
+    );
+    assert!(
+        !source_owner_labels.contains("emp"),
+        "dept_name should not reuse emp columns when aliases are reused across UNION branches, saw owners {source_owner_labels:?}"
+    );
+}
+
+#[test]
+fn self_join_in_subquery_produces_distinct_nodes() {
+    let sql = r#"
+        SELECT sub.emp_name, sub.mgr_name
+        FROM (
+            SELECT e1.name AS emp_name, e2.name AS mgr_name
+            FROM employees e1
+            JOIN employees e2 ON e1.manager_id = e2.id
+        ) sub
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    // The subquery should produce two distinct table nodes for the self-join
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(
+        table_nodes.len(),
+        2,
+        "self-join inside subquery should produce 2 distinct table nodes, got: {:?}",
+        table_nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+    );
+
+    // Both should reference the same canonical table
+    for node in &table_nodes {
+        assert_eq!(
+            node.qualified_name.as_deref(),
+            Some("employees"),
+            "subquery self-join nodes should have canonical qualified_name"
+        );
+    }
+
+    // Global lineage should merge them
+    let global_employees: Vec<_> = result
+        .global_lineage
+        .nodes
+        .iter()
+        .filter(|n| n.canonical_name.name == "employees")
+        .collect();
+    assert_eq!(
+        global_employees.len(),
+        1,
+        "global lineage should merge subquery self-join instances"
+    );
+}
+
+#[test]
+fn nested_self_join_aliases_keep_filters_isolated_per_scope() {
+    let sql = r#"
+        SELECT e2.name, sub.inner_mgr
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        JOIN (
+            SELECT e2.id, e2.name AS inner_mgr
+            FROM employees e1
+            JOIN employees e2 ON e1.manager_id = e2.id
+            WHERE e2.department = 'sales'
+        ) sub ON sub.id = e2.id
+        WHERE e2.department = 'eng'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let filtered_employee_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table
+                && n.qualified_name.as_deref() == Some("employees")
+                && !n.filters.is_empty()
+        })
+        .collect();
+    assert_eq!(
+        filtered_employee_nodes.len(),
+        2,
+        "outer and inner self-join aliases should keep separate filtered nodes"
+    );
+
+    let filter_sets: HashSet<Vec<String>> = filtered_employee_nodes
+        .iter()
+        .map(|node| {
+            let mut filters: Vec<String> =
+                node.filters.iter().map(|f| f.expression.clone()).collect();
+            filters.sort();
+            filters
+        })
+        .collect();
+    assert!(
+        filter_sets.contains(&vec!["e2.department = 'eng'".to_string()]),
+        "expected one filtered node for the outer e2 alias, got {filter_sets:?}"
+    );
+    assert!(
+        filter_sets.contains(&vec!["e2.department = 'sales'".to_string()]),
+        "expected one filtered node for the inner e2 alias, got {filter_sets:?}"
+    );
+}
+
+#[test]
+fn self_join_alias_matching_another_table_name() {
+    // Alias "orders" collides with the canonical name of the other table
+    let sql = r#"
+        SELECT c1.name, orders.total
+        FROM customers c1
+        JOIN customers orders ON c1.referrer_id = orders.id
+        JOIN orders real_orders ON orders.id = real_orders.customer_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let customer_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table && n.qualified_name.as_deref() == Some("customers")
+        })
+        .collect();
+    assert_eq!(
+        customer_nodes.len(),
+        2,
+        "customers self-join should produce 2 distinct nodes"
+    );
+
+    let order_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table && n.qualified_name.as_deref() == Some("orders"))
+        .collect();
+    assert_eq!(
+        order_nodes.len(),
+        1,
+        "the real 'orders' table should have exactly 1 node"
+    );
+}
+
+#[test]
+fn three_way_self_join_filters_isolated() {
+    let sql = r#"
+        SELECT e1.name, e2.name, e3.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        JOIN employees e3 ON e2.manager_id = e3.id
+        WHERE e1.active = true AND e3.level = 'director'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(
+        table_nodes.len(),
+        3,
+        "3-way self-join should produce 3 nodes"
+    );
+
+    // Exactly 2 nodes should have filters (e1 and e3)
+    let nodes_with_filters: Vec<_> = table_nodes
+        .iter()
+        .filter(|n| !n.filters.is_empty())
+        .collect();
+    assert_eq!(
+        nodes_with_filters.len(),
+        2,
+        "filters should attach to exactly 2 of the 3 self-join instances"
+    );
+
+    // e2 should have no filters
+    let nodes_without_filters: Vec<_> = table_nodes
+        .iter()
+        .filter(|n| n.filters.is_empty())
+        .collect();
+    assert_eq!(nodes_without_filters.len(), 1);
+}
+
+#[test]
+fn self_join_unqualified_filter_applies_to_all_instances() {
+    // An unqualified WHERE predicate should apply to all self-join instances
+    // because the column is ambiguous without a qualifier.
+    let sql = r#"
+        SELECT e1.name, e2.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        WHERE active = true
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(table_nodes.len(), 2, "self-join should produce 2 nodes");
+
+    // Both nodes should receive the unqualified filter
+    for node in &table_nodes {
+        assert!(
+            !node.filters.is_empty(),
+            "unqualified filter should apply to all instances, but node {} has no filters",
+            node.id
+        );
+    }
+}
+
+#[test]
+fn self_join_mixed_with_regular_join() {
+    let sql = r#"
+        SELECT e1.name, e2.name, d.dept_name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        JOIN departments d ON e1.dept_id = d.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let emp_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table && n.qualified_name.as_deref() == Some("employees")
+        })
+        .collect();
+    assert_eq!(
+        emp_nodes.len(),
+        2,
+        "self-join should produce 2 employee nodes"
+    );
+
+    let dept_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table && n.qualified_name.as_deref() == Some("departments")
+        })
+        .collect();
+    assert_eq!(
+        dept_nodes.len(),
+        1,
+        "regular join should produce 1 department node"
+    );
+
+    // All 3 node IDs must be distinct
+    let mut ids: Vec<_> = emp_nodes
+        .iter()
+        .chain(dept_nodes.iter())
+        .map(|n| &n.id)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "all node IDs should be distinct");
+}
+
+#[test]
+fn cte_self_join_produces_distinct_nodes() {
+    let sql = r#"
+        WITH emp AS (
+            SELECT id, name, manager_id FROM employees
+        )
+        SELECT e1.name AS employee, e2.name AS manager
+        FROM emp e1
+        JOIN emp e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte)
+        .collect();
+
+    // The CTE definition itself plus possibly two references. At minimum we
+    // expect the CTE definition node to exist.
+    assert!(
+        !cte_nodes.is_empty(),
+        "CTE self-join should produce at least 1 CTE node"
+    );
+
+    // Global lineage should preserve non-definition CTE reference instances so
+    // ordinary self-joins are not rendered as recursive self-loops.
+    let global_emp: Vec<_> = result
+        .global_lineage
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte && n.canonical_name.name == "emp")
+        .collect();
+    assert!(
+        global_emp.len() >= 2,
+        "global lineage should preserve non-recursive CTE instances"
+    );
+
+    assert!(
+        result.global_lineage.edges.iter().all(|edge| {
+            !(edge.edge_type == EdgeType::DataFlow
+                && edge.from == edge.to
+                && global_emp.iter().any(|node| node.id == edge.from))
+        }),
+        "non-recursive CTE self-joins should not become global data-flow self-loops"
+    );
+}
+
+#[test]
+fn self_join_mixed_qualified_and_unqualified_predicates() {
+    // Qualified predicates should attach to specific instances;
+    // unqualified predicates should apply to all instances of the canonical table.
+    let sql = r#"
+        SELECT e1.name, e2.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        WHERE e1.active = true AND department = 'sales'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(table_nodes.len(), 2, "self-join should produce 2 nodes");
+
+    // The node with the e1.active filter should have at least 2 filters
+    // (one instance-targeted, one canonical)
+    let max_filters = table_nodes.iter().map(|n| n.filters.len()).max().unwrap();
+    assert!(
+        max_filters >= 2,
+        "node with qualified + unqualified filters should have at least 2 filters"
+    );
+
+    // Both nodes should have the unqualified 'department' filter
+    for node in &table_nodes {
+        let has_dept_filter = node
+            .filters
+            .iter()
+            .any(|f| f.expression.contains("department"));
+        assert!(
+            has_dept_filter,
+            "unqualified filter should apply to all instances, but node {} is missing it",
+            node.id
+        );
+    }
+}
+
+#[test]
+fn self_join_without_aliases_produces_single_node() {
+    // When a table self-joins without distinct aliases, both references share
+    // the same node ID for backward compatibility. SQL self-joins without
+    // aliases are ambiguous by nature.
+    let sql = r#"
+        SELECT name
+        FROM employees
+        JOIN employees ON employees.manager_id = employees.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(
+        table_nodes.len(),
+        1,
+        "unaliased self-join should collapse to a single node for backward compatibility"
+    );
+    assert_eq!(table_nodes[0].qualified_name.as_deref(), Some("employees"));
+}
+
+#[test]
+fn triple_self_join_each_alias_gets_distinct_filter() {
+    // Each of the three self-join aliases gets its own qualified filter.
+    // Verifies that per-instance filter routing works across all aliases.
+    let sql = r#"
+        SELECT e1.name, e2.name, e3.name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        JOIN employees e3 ON e2.manager_id = e3.id
+        WHERE e1.active = true AND e2.department = 'eng' AND e3.level = 'director'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(
+        table_nodes.len(),
+        3,
+        "3-way self-join should produce 3 table nodes"
+    );
+
+    // All 3 nodes should have exactly 1 filter each
+    for node in &table_nodes {
+        assert_eq!(
+            node.filters.len(),
+            1,
+            "each self-join instance should have exactly 1 filter, but node {} has {}",
+            node.id,
+            node.filters.len()
+        );
+    }
+
+    // Collect all filter expressions
+    let mut filter_texts: Vec<String> = table_nodes
+        .iter()
+        .flat_map(|n| n.filters.iter().map(|f| f.expression.clone()))
+        .collect();
+    filter_texts.sort();
+
+    assert!(
+        filter_texts.iter().any(|f| f.contains("active")),
+        "one filter should reference 'active'"
+    );
+    assert!(
+        filter_texts.iter().any(|f| f.contains("department")),
+        "one filter should reference 'department'"
+    );
+    assert!(
+        filter_texts.iter().any(|f| f.contains("level")),
+        "one filter should reference 'level'"
+    );
+}
+
+#[test]
+fn self_join_alias_matches_canonical_name() {
+    // When one alias explicitly matches the canonical name, the alias-matching
+    // side shares the same node ID as the unaliased first occurrence. This is a
+    // known limitation: `relation_instance_identity` falls back to the standard
+    // `relation_identity` when alias == canonical/simple_name, so `e1` (distinct)
+    // gets a unique instance ID but the first (unaliased-equivalent) occurrence
+    // keeps the canonical ID that "employees" also maps to.
+    let sql = r#"
+        SELECT e1.name, employees.name
+        FROM employees e1
+        JOIN employees employees ON e1.manager_id = employees.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+
+    // Only 1 node: the first occurrence uses relation_identity("employees") and
+    // the second occurrence (alias "employees") falls back to the same ID.
+    // The `e1` alias on the FIRST occurrence doesn't help either because
+    // is_self_join is false for the first occurrence, so it also uses
+    // relation_identity("employees").
+    assert_eq!(
+        table_nodes.len(),
+        1,
+        "self-join where alias matches canonical collapses to 1 node (known limitation)"
+    );
+}
+
+#[test]
+fn cte_self_join_filters_attach_to_correct_instance() {
+    // CTE self-joins should support per-instance filter attachment,
+    // just like regular table self-joins.
+    let sql = r#"
+        WITH org AS (
+            SELECT id, name, manager_id, department FROM employees
+        )
+        SELECT a.name, b.name
+        FROM org a
+        JOIN org b ON a.manager_id = b.id
+        WHERE a.department = 'eng' AND b.department = 'sales'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let cte_ref_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte && n.qualified_name.as_deref() == Some("org"))
+        .collect();
+    assert!(
+        cte_ref_nodes.len() >= 2,
+        "CTE self-join should produce at least 2 CTE nodes (definition + instance), got {}",
+        cte_ref_nodes.len()
+    );
+
+    // At least 2 nodes should have filters
+    let nodes_with_filters: Vec<_> = cte_ref_nodes
+        .iter()
+        .filter(|n| !n.filters.is_empty())
+        .collect();
+    assert_eq!(
+        nodes_with_filters.len(),
+        2,
+        "each CTE self-join instance should receive its own filter"
+    );
+}
+
+#[test]
+fn cte_self_join_filters_are_isolated_per_instance() {
+    // Verify that CTE self-join filters are routed to the correct instance,
+    // not duplicated across instances. This is the CTE counterpart of
+    // `triple_self_join_each_alias_gets_distinct_filter`.
+    let sql = r#"
+        WITH org AS (
+            SELECT id, name, manager_id, department FROM employees
+        )
+        SELECT a.name AS eng_name, b.name AS mgr_name
+        FROM org a
+        JOIN org b ON a.manager_id = b.id
+        WHERE a.department = 'eng' AND b.department = 'sales'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    // Collect CTE nodes that have filters
+    let filtered_cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte && !n.filters.is_empty())
+        .collect();
+    assert_eq!(
+        filtered_cte_nodes.len(),
+        2,
+        "each CTE instance should receive its own filter"
+    );
+
+    // Verify filter isolation: each instance should have exactly one filter,
+    // and the two filters should reference different departments.
+    let all_filter_texts: Vec<String> = filtered_cte_nodes
+        .iter()
+        .flat_map(|n| n.filters.iter().map(|f| f.expression.clone()))
+        .collect();
+    assert!(
+        all_filter_texts.iter().any(|f| f.contains("eng")),
+        "one instance should have the 'eng' filter, got: {:?}",
+        all_filter_texts
+    );
+    assert!(
+        all_filter_texts.iter().any(|f| f.contains("sales")),
+        "one instance should have the 'sales' filter, got: {:?}",
+        all_filter_texts
+    );
+
+    // Verify no single node received both filters
+    for node in &filtered_cte_nodes {
+        let filter_texts: Vec<_> = node.filters.iter().map(|f| &f.expression).collect();
+        let has_both = filter_texts.iter().any(|f| f.contains("eng"))
+            && filter_texts.iter().any(|f| f.contains("sales"));
+        assert!(
+            !has_both,
+            "CTE node {} should not have both filters, got: {:?}",
+            node.id, filter_texts
+        );
+    }
+}
+
+#[test]
+fn nested_cte_self_join_aliases_keep_filters_isolated_per_scope() {
+    let sql = r#"
+        WITH org AS (
+            SELECT id, name, manager_id, department
+            FROM employees
+        )
+        SELECT b.name, sub.inner_mgr
+        FROM org a
+        JOIN org b ON a.manager_id = b.id
+        JOIN (
+            SELECT b.id, b.name AS inner_mgr
+            FROM org a
+            JOIN org b ON a.manager_id = b.id
+            WHERE b.department = 'sales'
+        ) sub ON sub.id = b.id
+        WHERE b.department = 'eng'
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let filtered_cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Cte
+                && n.qualified_name.as_deref() == Some("org")
+                && !n.filters.is_empty()
+        })
+        .collect();
+    assert_eq!(
+        filtered_cte_nodes.len(),
+        2,
+        "outer and inner CTE self-join aliases should keep separate filtered nodes"
+    );
+
+    let filter_sets: HashSet<Vec<String>> = filtered_cte_nodes
+        .iter()
+        .map(|node| {
+            let mut filters: Vec<String> =
+                node.filters.iter().map(|f| f.expression.clone()).collect();
+            filters.sort();
+            filters
+        })
+        .collect();
+    assert!(
+        filter_sets.contains(&vec!["b.department = 'eng'".to_string()]),
+        "expected one filtered node for the outer b alias, got {filter_sets:?}"
+    );
+    assert!(
+        filter_sets.contains(&vec!["b.department = 'sales'".to_string()]),
+        "expected one filtered node for the inner b alias, got {filter_sets:?}"
+    );
+}
+
+#[test]
+fn self_join_with_subquery_alias_conflict() {
+    // A subquery aliased as the same table name that also appears in
+    // a regular join should not conflict.
+    let sql = r#"
+        SELECT t1.name, t2.id
+        FROM (SELECT name, id FROM employees WHERE active = true) t1
+        JOIN employees t2 ON t1.id = t2.manager_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    // Should have at least 1 table node (employees) and 1 CTE/derived node (t1)
+    let table_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Table)
+        .collect();
+    assert!(
+        !table_nodes.is_empty(),
+        "should have table nodes for employees"
+    );
+
+    let derived_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte)
+        .collect();
+    assert!(
+        !derived_nodes.is_empty(),
+        "derived subquery should produce a CTE-like node"
+    );
+
+    // Verify no issues about missing nodes
+    let global_node_ids: HashSet<_> = result
+        .global_lineage
+        .nodes
+        .iter()
+        .map(|n| n.id.clone())
+        .collect();
+    for edge in &result.global_lineage.edges {
+        assert!(
+            global_node_ids.contains(&edge.from),
+            "global edge {} has missing source node {}",
+            edge.id,
+            edge.from
+        );
+        assert!(
+            global_node_ids.contains(&edge.to),
+            "global edge {} has missing target node {}",
+            edge.id,
+            edge.to
+        );
+    }
+}
+
+#[test]
+fn self_join_global_edges_resolve_correctly() {
+    // Verify that global lineage edges for self-join scenarios
+    // properly resolve through the local-to-global ID mapping.
+    let sql = r#"
+        SELECT e1.name AS emp_name, e2.name AS mgr_name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let global = &result.global_lineage;
+
+    // Global employees should be a single node
+    let global_employees: Vec<_> = global
+        .nodes
+        .iter()
+        .filter(|n| n.canonical_name.name == "employees" && n.node_type == NodeType::Table)
+        .collect();
+    assert_eq!(
+        global_employees.len(),
+        1,
+        "global lineage should have exactly 1 employees node"
+    );
+
+    // All global edges should reference existing global nodes
+    let global_node_ids: HashSet<_> = global.nodes.iter().map(|n| n.id.clone()).collect();
+    for edge in &global.edges {
+        assert!(
+            global_node_ids.contains(&edge.from),
+            "global edge from={} not found in global nodes",
+            edge.from
+        );
+        assert!(
+            global_node_ids.contains(&edge.to),
+            "global edge to={} not found in global nodes",
+            edge.to
+        );
+    }
+
+    // Ownership edges from employees should point to column nodes
+    let ownership_edges: Vec<_> = global
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Ownership && e.from == global_employees[0].id)
+        .collect();
+    assert!(
+        !ownership_edges.is_empty(),
+        "global employees node should own column nodes"
     );
 }
 
@@ -3813,6 +5303,152 @@ fn join_only_tables_emit_output_dependency() {
 }
 
 #[test]
+fn join_only_tables_emit_output_dependency_for_count_star() {
+    let sql = r#"
+        SELECT COUNT(*)
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table should connect to output for COUNT(*) queries"
+    );
+}
+
+#[test]
+fn join_only_tables_emit_output_dependency_for_distinct_projection() {
+    let sql = r#"
+        SELECT DISTINCT u.id
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table should connect to output for DISTINCT projections"
+    );
+}
+
+#[test]
+fn join_only_tables_emit_output_dependency_for_literal_projection() {
+    let sql = r#"
+        SELECT 1
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table should connect to output for literal projections"
+    );
+}
+
+#[test]
+fn wildcard_join_contributors_do_not_emit_output_dependency_without_schema() {
+    let sql = r#"
+        SELECT *
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt
+        .edges
+        .iter()
+        .find(|edge| edge.edge_type == EdgeType::JoinDependency && edge.from == orders_node.id);
+
+    assert!(
+        join_dependency.is_none(),
+        "joined table should not emit join dependency when SELECT * creates a direct output edge"
+    );
+}
+
+#[test]
+fn qualified_wildcard_join_only_table_gets_dependency() {
+    // SELECT u.* only expands `users`, so `orders` is join-only and
+    // must still get a JoinDependency edge even though the wildcard
+    // creates an approximate DataFlow edge (only for `users`).
+    let sql = r#"
+        SELECT u.*
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("Output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    assert!(
+        join_dependency.is_some(),
+        "join-only table must get JoinDependency when only other table's wildcard is selected"
+    );
+}
+
+#[test]
 fn where_filters_attached_to_correct_tables() {
     let sql = r#"
         SELECT o.order_id, c.customer_name
@@ -4029,18 +5665,22 @@ fn cte_join_metadata_captured() {
 
     let result = run_analysis(sql, Dialect::Generic, None);
     let stmt = first_statement(&result);
-    let cte_node = find_cte_node(stmt, "user_ltv").expect("user_ltv CTE not found");
+    let cte_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == NodeType::Cte && n.qualified_name.as_deref() == Some("user_ltv"))
+        .collect();
+    assert!(!cte_nodes.is_empty(), "user_ltv CTE nodes not found");
 
     use flowscope_core::JoinType;
+    let joined_cte = cte_nodes
+        .iter()
+        .find(|node| node.join_type == Some(JoinType::Left))
+        .expect("joined CTE instance should capture LEFT join metadata");
     assert_eq!(
-        cte_node.join_type,
-        Some(JoinType::Left),
-        "CTE should capture LEFT join metadata"
-    );
-    assert_eq!(
-        cte_node.join_condition.as_deref(),
+        joined_cte.join_condition.as_deref(),
         Some("u.user_id = ltv.user_id"),
-        "CTE should capture join condition"
+        "joined CTE instance should capture join condition"
     );
 }
 
@@ -7307,6 +8947,17 @@ fn snowflake_lateral_flatten_tracks_source_table() {
         result.summary.statement_count >= 1,
         "LATERAL FLATTEN query should parse at least one statement"
     );
+
+    let stmt = first_statement(&result);
+    let columns = column_labels(stmt);
+    assert!(
+        columns.iter().any(|c| c.eq_ignore_ascii_case("p_id")),
+        "LATERAL FLATTEN pseudocolumns should still produce visible output columns"
+    );
+    assert!(
+        columns.iter().any(|c| c.eq_ignore_ascii_case("name")),
+        "best-effort unresolved projections should remain visible alongside FLATTEN outputs"
+    );
 }
 
 #[test]
@@ -7333,6 +8984,22 @@ fn snowflake_higher_order_functions_track_source() {
     assert!(
         result.summary.statement_count >= 1,
         "Higher-order function query should parse at least one statement"
+    );
+}
+
+#[test]
+fn snowflake_reduce_keeps_output_column_when_lineage_resolution_is_partial() {
+    let sql = r#"
+        SELECT REDUCE([1, 2, 3], 0, (acc, val) -> acc + val) AS sum_result
+    "#;
+
+    let result = run_analysis(sql, Dialect::Snowflake, None);
+    let stmt = first_statement(&result);
+    let columns = column_labels(stmt);
+
+    assert!(
+        columns.iter().any(|c| c.eq_ignore_ascii_case("sum_result")),
+        "partially-resolved higher-order functions should still keep their output column"
     );
 }
 

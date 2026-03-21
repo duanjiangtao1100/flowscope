@@ -102,7 +102,7 @@ expression: cleaned
         ]
       },
       {
-        "id": "column_146291330e487758",
+        "id": "column_422dbff9bab1c4b2",
         "type": "column",
         "label": "id",
         "canonicalName": {
@@ -118,21 +118,7 @@ expression: cleaned
         ]
       },
       {
-        "id": "column_d8bba385e09d94a9",
-        "type": "column",
-        "label": "id",
-        "canonicalName": {
-          "name": "id"
-        },
-        "statementRefs": [
-          {
-            "statementIndex": 0,
-            "nodeId": "column_d8bba385e09d94a9"
-          }
-        ]
-      },
-      {
-        "id": "column_e40458cf3907cc5e",
+        "id": "column_9cf31ab8333dc87c",
         "type": "column",
         "label": "email",
         "canonicalName": {
@@ -144,6 +130,20 @@ expression: cleaned
           {
             "statementIndex": 0,
             "nodeId": "column_e40458cf3907cc5e"
+          }
+        ]
+      },
+      {
+        "id": "column_d8bba385e09d94a9",
+        "type": "column",
+        "label": "id",
+        "canonicalName": {
+          "name": "id"
+        },
+        "statementRefs": [
+          {
+            "statementIndex": 0,
+            "nodeId": "column_d8bba385e09d94a9"
           }
         ]
       },
@@ -182,7 +182,7 @@ expression: cleaned
       {
         "id": "edge_0fd7c9d999a9289c",
         "from": "table_61860e36618f6e44",
-        "to": "column_e40458cf3907cc5e",
+        "to": "column_9cf31ab8333dc87c",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -200,7 +200,7 @@ expression: cleaned
       {
         "id": "edge_686fd17f81858f87",
         "from": "table_61860e36618f6e44",
-        "to": "column_146291330e487758",
+        "to": "column_422dbff9bab1c4b2",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -208,7 +208,7 @@ expression: cleaned
       },
       {
         "id": "edge_95d69f2aacc42e40",
-        "from": "column_e40458cf3907cc5e",
+        "from": "column_9cf31ab8333dc87c",
         "to": "column_11dd4284c883d245",
         "type": "data_flow",
         "producerStatement": {
@@ -217,7 +217,7 @@ expression: cleaned
       },
       {
         "id": "edge_ab771613ce0a9cf7",
-        "from": "column_146291330e487758",
+        "from": "column_422dbff9bab1c4b2",
         "to": "column_d8bba385e09d94a9",
         "type": "data_flow",
         "producerStatement": {

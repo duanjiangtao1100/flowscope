@@ -87,17 +87,17 @@ expression: clean_result
   "globalLineage": {
     "nodes": [
       {
-        "id": "column_35d356053710fc8f",
+        "id": "column_5235f558f510c25e",
         "type": "column",
-        "label": "tag",
+        "label": "user_id",
         "canonicalName": {
           "schema": "users",
-          "name": "tag"
+          "name": "user_id"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_35d356053710fc8f"
+            "nodeId": "column_cb9e7c434971f5fc"
           }
         ]
       },
@@ -130,17 +130,17 @@ expression: clean_result
         ]
       },
       {
-        "id": "column_cb9e7c434971f5fc",
+        "id": "column_d6db6b522d1f61b3",
         "type": "column",
-        "label": "user_id",
+        "label": "tag",
         "canonicalName": {
           "schema": "users",
-          "name": "user_id"
+          "name": "tag"
         },
         "statementRefs": [
           {
             "statementIndex": 0,
-            "nodeId": "column_cb9e7c434971f5fc"
+            "nodeId": "column_35d356053710fc8f"
           }
         ]
       },
@@ -185,7 +185,7 @@ expression: clean_result
       },
       {
         "id": "edge_192c6dd95f9bca44",
-        "from": "column_cb9e7c434971f5fc",
+        "from": "column_5235f558f510c25e",
         "to": "column_c6c17791694b01ca",
         "type": "data_flow",
         "producerStatement": {
@@ -194,7 +194,7 @@ expression: clean_result
       },
       {
         "id": "edge_45af111910da72b6",
-        "from": "column_35d356053710fc8f",
+        "from": "column_d6db6b522d1f61b3",
         "to": "column_b446bb46529475d8",
         "type": "data_flow",
         "producerStatement": {
@@ -213,7 +213,7 @@ expression: clean_result
       {
         "id": "edge_f430e6d5281a1dfc",
         "from": "table_10a0682dff76cdbc",
-        "to": "column_cb9e7c434971f5fc",
+        "to": "column_5235f558f510c25e",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
@@ -222,7 +222,7 @@ expression: clean_result
       {
         "id": "edge_fbb0cefa72e20652",
         "from": "table_10a0682dff76cdbc",
-        "to": "column_35d356053710fc8f",
+        "to": "column_d6db6b522d1f61b3",
         "type": "ownership",
         "producerStatement": {
           "statementIndex": 0
