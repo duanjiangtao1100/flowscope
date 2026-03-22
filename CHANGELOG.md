@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-03-22
+
+### Added
+
+#### Core Engine (flowscope-core)
+- **Instance-aware relation tracking** for self-join support — each table occurrence is tracked as a distinct instance, enabling correct lineage through self-joins
+- Instance-aware filters, wildcards, and global lineage propagation
+- Orphan edge cleanup and alias limits for hardened instance tracking
+
+#### Lineage Graph
+- **Join attributes on edges** — join metadata (type, conditions) is now attached to edges rather than nodes, better reflecting the relational model
+- Analysis state lifted to Workspace for cross-statement coordination
+
+### Fixed
+
+#### Core Engine (flowscope-core)
+- Filter predicates attached to wrong table nodes
+- Source-less projections missing base table lineage edges
+- Join dependency edges not created for aggregate and edge-case queries
+- Analyzer lineage regressions in instance-aware subquery column scoping
+
 ## [0.5.1] - 2026-03-16
 
 ### Fixed
