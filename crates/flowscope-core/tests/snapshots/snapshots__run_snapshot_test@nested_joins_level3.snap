@@ -61,17 +61,13 @@ expression: clean_result
           "id": "table_4ce0fb06426c39fb",
           "type": "table",
           "label": "suppliers",
-          "qualifiedName": "suppliers",
-          "joinType": "INNER",
-          "joinCondition": "s.supplier_id = p.supplier_id"
+          "qualifiedName": "suppliers"
         },
         {
           "id": "table_7253befe2c400508",
           "type": "table",
           "label": "products",
-          "qualifiedName": "products",
-          "joinType": "INNER",
-          "joinCondition": "p.product_id = o.product_id"
+          "qualifiedName": "products"
         },
         {
           "id": "table_e500054d128e991c",
@@ -83,9 +79,7 @@ expression: clean_result
               "expression": "c.email = 'sample@example.com'",
               "clauseType": "WHERE"
             }
-          ],
-          "joinType": "INNER",
-          "joinCondition": "c.customer_id = o.customer_id"
+          ]
         },
         {
           "id": "table_eaa6ebb8f158751f",
@@ -111,19 +105,25 @@ expression: clean_result
           "id": "edge_5c25d189c2e2f4f2",
           "from": "column_52f3cd32be0b3d40",
           "to": "column_86b7a87819f6125b",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "p.product_id = o.product_id"
         },
         {
           "id": "edge_5f530d5e48d4edc2",
           "from": "column_c7ce485a3125265a",
           "to": "column_11dd4284c883d245",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "c.customer_id = o.customer_id"
         },
         {
           "id": "edge_6e2a9d0805aed929",
           "from": "column_68824a617e7c7079",
           "to": "column_087b7e48b6c97660",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "s.supplier_id = p.supplier_id"
         },
         {
           "id": "edge_7ba4d705ab735ae9",

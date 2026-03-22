@@ -93,11 +93,12 @@ export class FlowScopeHoverProvider implements vscode.HoverProvider {
       lines.push(`\n*${node.qualifiedName}*`);
     }
 
-    // Join info
-    if (node.joinType) {
-      lines.push(`\n**Join:** ${node.joinType}`);
-      if (node.joinCondition) {
-        lines.push(`\n\`\`\`sql\nON ${node.joinCondition}\n\`\`\``);
+    // Join info (read from edges originating from this node)
+    const joinEdge = stmt.edges.find((e) => e.from === node.id && e.joinType);
+    if (joinEdge?.joinType) {
+      lines.push(`\n**Join:** ${joinEdge.joinType}`);
+      if (joinEdge.joinCondition) {
+        lines.push(`\n\`\`\`sql\nON ${joinEdge.joinCondition}\n\`\`\``);
       }
     }
 

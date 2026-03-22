@@ -444,10 +444,6 @@ export interface Node {
   resolutionSource?: ResolutionSource;
   /** Filter predicates (WHERE clause conditions) that affect this table's rows */
   filters?: FilterPredicate[];
-  /** For table nodes that are JOINed: the type of join used to include this table */
-  joinType?: JoinType;
-  /** For table nodes that are JOINed: the join condition (ON clause) */
-  joinCondition?: string;
   /** For column nodes: aggregation information if this column is aggregated or a grouping key */
   aggregation?: AggregationInfo;
 }

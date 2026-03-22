@@ -555,8 +555,6 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: None,
-                    join_condition: None,
                     aggregation: None,
                 });
 
@@ -704,8 +702,6 @@ impl<'a, 'b> Visitor for LineageVisitor<'a, 'b> {
                         metadata: None,
                         resolution_source: None,
                         filters: Vec::new(),
-                        join_type: None,
-                        join_condition: None,
                         aggregation: None,
                     })
                 });

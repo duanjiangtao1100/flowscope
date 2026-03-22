@@ -53,14 +53,14 @@ CREATE TABLE {prefix}edges (
     FOREIGN KEY (to_node_id, statement_id) REFERENCES {prefix}nodes(id, statement_id)
 );
 
--- Join metadata (linked to nodes with join info)
+-- Join metadata attached to edges (not nodes) to support both table-level
+-- and column-level join semantics.
 CREATE TABLE {prefix}joins (
     id INTEGER PRIMARY KEY,
-    node_id TEXT NOT NULL,
-    statement_id INTEGER NOT NULL,
+    edge_id INTEGER NOT NULL REFERENCES {prefix}edges(id),
+    statement_id INTEGER NOT NULL REFERENCES {prefix}statements(id),
     join_type TEXT NOT NULL,
-    join_condition TEXT,
-    FOREIGN KEY (node_id, statement_id) REFERENCES {prefix}nodes(id, statement_id)
+    join_condition TEXT
 );
 
 -- Filter predicates on nodes
@@ -310,7 +310,7 @@ SELECT
 FROM {prefix}edges e
 JOIN {prefix}nodes fn ON e.from_node_id = fn.id AND e.statement_id = fn.statement_id
 JOIN {prefix}nodes tn ON e.to_node_id = tn.id AND e.statement_id = tn.statement_id
-LEFT JOIN {prefix}joins j ON fn.id = j.node_id AND fn.statement_id = j.statement_id
+LEFT JOIN {prefix}joins j ON e.id = j.edge_id AND e.statement_id = j.statement_id
 LEFT JOIN {prefix}statements s ON e.statement_id = s.id;
 
 -- All joins with context
@@ -320,11 +320,25 @@ SELECT
     s.statement_index,
     j.join_type,
     j.join_condition,
-    n.qualified_name AS table_name,
-    n.label AS table_label
+    COALESCE(fr.qualified_name, fn.qualified_name) AS from_table,
+    COALESCE(fr.label, fn.label) AS from_label,
+    COALESCE(tr.qualified_name, tn.qualified_name) AS to_table,
+    COALESCE(tr.label, tn.label) AS to_label
 FROM {prefix}joins j
-JOIN {prefix}nodes n ON j.node_id = n.id AND j.statement_id = n.statement_id
-LEFT JOIN {prefix}statements s ON n.statement_id = s.id;
+JOIN {prefix}edges e ON j.edge_id = e.id AND j.statement_id = e.statement_id
+JOIN {prefix}nodes fn ON e.from_node_id = fn.id AND e.statement_id = fn.statement_id
+JOIN {prefix}nodes tn ON e.to_node_id = tn.id AND e.statement_id = tn.statement_id
+LEFT JOIN {prefix}edges feo
+    ON feo.statement_id = e.statement_id
+   AND feo.edge_type = 'ownership'
+   AND feo.to_node_id = e.from_node_id
+LEFT JOIN {prefix}nodes fr ON feo.from_node_id = fr.id AND feo.statement_id = fr.statement_id
+LEFT JOIN {prefix}edges teo
+    ON teo.statement_id = e.statement_id
+   AND teo.edge_type = 'ownership'
+   AND teo.to_node_id = e.to_node_id
+LEFT JOIN {prefix}nodes tr ON teo.from_node_id = tr.id AND teo.statement_id = tr.statement_id
+LEFT JOIN {prefix}statements s ON e.statement_id = s.id;
 
 -- Filters applied to nodes
 CREATE VIEW {prefix}node_filters AS
@@ -517,6 +531,7 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE statements"));
         assert!(ddl.contains("CREATE TABLE nodes"));
         assert!(ddl.contains("CREATE TABLE edges"));
+        assert!(ddl.contains("edge_id INTEGER NOT NULL REFERENCES edges(id)"));
         assert!(ddl.contains("CREATE TABLE issues"));
         assert!(ddl.contains("REFERENCES statements(id)"));
         assert!(ddl.contains("REFERENCES nodes(id, statement_id)"));
@@ -532,6 +547,7 @@ mod tests {
         assert!(ddl.contains("CREATE TABLE lineage.nodes"));
         assert!(ddl.contains("CREATE TABLE lineage.edges"));
         assert!(ddl.contains("CREATE TABLE lineage.joins"));
+        assert!(ddl.contains("edge_id INTEGER NOT NULL REFERENCES lineage.edges(id)"));
         assert!(ddl.contains("CREATE TABLE lineage.filters"));
         assert!(ddl.contains("CREATE TABLE lineage.aggregations"));
         assert!(ddl.contains("CREATE TABLE lineage.issues"));

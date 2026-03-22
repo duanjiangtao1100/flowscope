@@ -147,9 +147,7 @@ expression: clean_result
           "id": "table_eaa6ebb8f158751f",
           "type": "table",
           "label": "orders",
-          "qualifiedName": "orders",
-          "joinType": "LEFT",
-          "joinCondition": "u.id = o.user_id"
+          "qualifiedName": "orders"
         }
       ],
       "edges": [
@@ -170,7 +168,9 @@ expression: clean_result
           "from": "column_d780b69ea9480267",
           "to": "column_91ec561dfe172758",
           "type": "derivation",
-          "expression": "SUM(o.total)"
+          "expression": "SUM(o.total)",
+          "joinType": "LEFT",
+          "joinCondition": "u.id = o.user_id"
         },
         {
           "id": "edge_322548822d4b9438",
@@ -216,7 +216,9 @@ expression: clean_result
           "from": "column_ce9b99d49d1c412c",
           "to": "column_3f39e80c6a14bd6c",
           "type": "derivation",
-          "expression": "COUNT(o.id)"
+          "expression": "COUNT(o.id)",
+          "joinType": "LEFT",
+          "joinCondition": "u.id = o.user_id"
         },
         {
           "id": "edge_8f3abcaefa3ed79f",

@@ -11,6 +11,7 @@ mod error;
 mod extract;
 mod html;
 mod json;
+mod join_export;
 mod mermaid;
 mod naming;
 mod schema;

@@ -55,8 +55,6 @@ export interface Node {
   expression?: string;
   span?: Span;
   filters?: FilterPredicate[];
-  joinType?: JoinType;
-  joinCondition?: string;
   aggregation?: AggregationInfo;
 }
 

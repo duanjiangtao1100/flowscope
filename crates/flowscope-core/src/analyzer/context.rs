@@ -167,6 +167,10 @@ pub(crate) struct StatementContext {
     /// Pending wildcards that couldn't be expanded due to missing schema.
     /// Used for backward column inference from downstream references.
     pub(crate) pending_wildcards: Vec<PendingWildcard>,
+    /// Tracks which table nodes were introduced via JOIN (node_id → join metadata).
+    /// Used to identify joined tables for dependency edges, complexity scoring,
+    /// and base-table detection without storing join info on Node structs.
+    pub(crate) joined_table_info: HashMap<Arc<str>, JoinInfo>,
     /// Set when alias instance registration is skipped due to the safety limit.
     /// Checked once after statement analysis to emit a user-visible warning.
     pub(crate) instance_limit_reached: bool,
@@ -220,6 +224,7 @@ impl StatementContext {
             source_table_columns: HashMap::new(),
             implied_foreign_keys: HashMap::new(),
             pending_wildcards: Vec::new(),
+            joined_table_info: HashMap::new(),
             instance_limit_reached: false,
         }
     }
@@ -383,8 +388,6 @@ impl StatementContext {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         };
 

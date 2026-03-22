@@ -163,19 +163,6 @@ pub struct Node {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<FilterPredicate>,
 
-    /// For table nodes that are JOINed: the type of join used to include this table.
-    /// None for the main FROM table, Some(JoinType) for joined tables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join_type: Option<JoinType>,
-
-    /// For table nodes that are JOINed: the join condition (ON clause).
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "super::serde_utils::deserialize_option_arc_str"
-    )]
-    pub join_condition: Option<Arc<str>>,
-
     /// For column nodes: aggregation information if this column is aggregated or a grouping key.
     /// Presence indicates the query uses GROUP BY; the fields indicate the column's role.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,8 +182,6 @@ impl Node {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         }
     }
@@ -213,8 +198,6 @@ impl Node {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         }
     }
@@ -231,8 +214,6 @@ impl Node {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         }
     }
@@ -264,18 +245,6 @@ impl Node {
     /// Set the resolution source.
     pub fn with_resolution_source(mut self, source: ResolutionSource) -> Self {
         self.resolution_source = Some(source);
-        self
-    }
-
-    /// Set the join type.
-    pub fn with_join_type(mut self, join_type: JoinType) -> Self {
-        self.join_type = Some(join_type);
-        self
-    }
-
-    /// Set the join condition.
-    pub fn with_join_condition(mut self, condition: impl Into<Arc<str>>) -> Self {
-        self.join_condition = Some(condition.into());
         self
     }
 }
@@ -317,14 +286,10 @@ pub struct Edge {
     pub operation: Option<Arc<str>>,
 
     /// Optional: specific join type for JOIN edges (INNER, LEFT, RIGHT, FULL, CROSS, etc.)
-    /// Note: For table-level visualization, the frontend typically reads join info from the
-    /// target Node's join_type/join_condition fields. These Edge fields are preserved for
-    /// column-level lineage edges and future use cases where edge-level join context is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_type: Option<JoinType>,
 
     /// Optional: join condition expression (ON clause)
-    /// See join_type comment for usage notes.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -796,8 +761,6 @@ mod tests {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: None,
-                    join_condition: None,
                     aggregation: None,
                 }],
                 edges: vec![],

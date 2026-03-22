@@ -220,6 +220,11 @@ impl<'a> Analyzer<'a> {
 
         self.add_join_dependency_edges(&mut ctx);
 
+        // Propagate join metadata from context onto edges originating from joined tables.
+        // This ensures edges created during column analysis (not just create_source_edge)
+        // carry join info for downstream consumers.
+        Self::propagate_join_info_to_edges(&mut ctx);
+
         // Register implied schema for source tables referenced in the query
         self.register_source_tables_schema(&ctx);
 
@@ -235,8 +240,8 @@ impl<'a> Analyzer<'a> {
         }
 
         // Calculate statement-level stats
-        let join_count = complexity::count_joins(&ctx.nodes);
-        let complexity_score = complexity::calculate_complexity(&ctx.nodes);
+        let join_count = complexity::count_joins(&ctx.joined_table_info);
+        let complexity_score = complexity::calculate_complexity(&ctx.nodes, &ctx.joined_table_info);
 
         Ok(StatementLineage {
             statement_index: index,
@@ -257,38 +262,50 @@ impl<'a> Analyzer<'a> {
             None => return,
         };
 
-        let output_column_ids: HashSet<_> = ctx
-            .edges
-            .iter()
-            .filter(|edge| edge.edge_type == EdgeType::Ownership && edge.from == output_node_id)
-            .map(|edge| edge.to.clone())
-            .collect();
-        let has_direct_output_lineage = ctx.edges.iter().any(|edge| {
-            matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
-                && edge.to == output_node_id
-        });
-        if output_column_ids.is_empty() && !has_direct_output_lineage {
-            return;
+        let output_column_ids: HashSet<_> = if self.column_lineage_enabled {
+            ctx.edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Ownership && edge.from == output_node_id)
+                .map(|edge| edge.to.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        if self.column_lineage_enabled {
+            let has_direct_output_lineage = ctx.edges.iter().any(|edge| {
+                matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+                    && edge.to == output_node_id
+            });
+            if output_column_ids.is_empty() && !has_direct_output_lineage {
+                return;
+            }
         }
 
         let mut table_columns: HashMap<Arc<str>, Vec<Arc<str>>> = HashMap::new();
-        for edge in &ctx.edges {
-            if edge.edge_type == EdgeType::Ownership {
-                table_columns
-                    .entry(edge.from.clone())
-                    .or_default()
-                    .push(edge.to.clone());
+        if self.column_lineage_enabled {
+            for edge in &ctx.edges {
+                if edge.edge_type == EdgeType::Ownership {
+                    table_columns
+                        .entry(edge.from.clone())
+                        .or_default()
+                        .push(edge.to.clone());
+                }
             }
         }
 
         let join_nodes: Vec<JoinNodeInfo> = ctx
             .nodes
             .iter()
-            .filter(|node| node.node_type.is_table_like() && node.join_type.is_some())
-            .map(|node| JoinNodeInfo {
-                node_id: node.id.clone(),
-                join_type: node.join_type,
-                join_condition: node.join_condition.clone(),
+            .filter(|node| {
+                node.node_type.is_table_like() && ctx.joined_table_info.contains_key(&node.id)
+            })
+            .filter_map(|node| {
+                let info = ctx.joined_table_info.get(&node.id)?;
+                Some(JoinNodeInfo {
+                    node_id: node.id.clone(),
+                    join_type: info.join_type,
+                    join_condition: info.join_condition.as_deref().map(Into::into),
+                })
             })
             .collect();
 
@@ -298,13 +315,17 @@ impl<'a> Analyzer<'a> {
                 join_type,
                 join_condition,
             } = join_info;
-            let owned_columns = table_columns.get(&node_id).cloned().unwrap_or_default();
-
-            let contributes_to_output = ctx.edges.iter().any(|edge| {
-                matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
-                    && (edge.from == node_id || owned_columns.iter().any(|col| col == &edge.from))
-                    && (edge.to == output_node_id || output_column_ids.contains(&edge.to))
-            });
+            let contributes_to_output = if self.column_lineage_enabled {
+                let owned_columns = table_columns.get(&node_id).cloned().unwrap_or_default();
+                ctx.edges.iter().any(|edge| {
+                    matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+                        && (edge.from == node_id
+                            || owned_columns.iter().any(|col| col == &edge.from))
+                        && (edge.to == output_node_id || output_column_ids.contains(&edge.to))
+                })
+            } else {
+                false
+            };
 
             if contributes_to_output {
                 continue;
@@ -334,6 +355,67 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Propagate join metadata from the context's `joined_table_info` map onto edges.
+    ///
+    /// Edges created during column analysis (e.g., wildcard expansion, aggregation)
+    /// originate from joined tables but don't carry join info since they were not
+    /// created via `create_source_edge`. This pass fills in the gap so downstream
+    /// consumers (frontend, export) can read join info from edges alone.
+    ///
+    /// Only `DataFlow`, `Derivation`, and `JoinDependency` edges are eligible.
+    /// If new edge types are introduced that should carry join context, extend
+    /// the match below.
+    ///
+    /// Edges that already have `join_type` set are left untouched.
+    fn propagate_join_info_to_edges(ctx: &mut StatementContext) {
+        if ctx.joined_table_info.is_empty() {
+            return;
+        }
+
+        // Single pass: build column→table ownership map and collect indices of edges
+        // that are candidates for join info propagation. Each column has exactly one
+        // owner, so later inserts for the same column are harmless.
+        let mut column_to_table: HashMap<Arc<str>, Arc<str>> = HashMap::new();
+        let mut candidate_indices: Vec<usize> = Vec::new();
+
+        for (i, edge) in ctx.edges.iter().enumerate() {
+            match edge.edge_type {
+                EdgeType::Ownership => {
+                    column_to_table.insert(edge.to.clone(), edge.from.clone());
+                }
+                EdgeType::DataFlow | EdgeType::Derivation | EdgeType::JoinDependency
+                    if edge.join_type.is_none() =>
+                {
+                    candidate_indices.push(i);
+                }
+                _ => {}
+            }
+        }
+
+        // Apply join info only to the candidate edges identified above.
+        for i in candidate_indices {
+            let edge = &ctx.edges[i];
+
+            // Resolve the source to a table node ID (either directly or via column ownership)
+            let source_table_id = if ctx.joined_table_info.contains_key(&edge.from) {
+                Some(edge.from.clone())
+            } else {
+                column_to_table
+                    .get(&edge.from)
+                    .filter(|table_id| ctx.joined_table_info.contains_key(*table_id))
+                    .cloned()
+            };
+
+            if let Some(info) = source_table_id.and_then(|id| ctx.joined_table_info.get(&id)) {
+                let edge = &mut ctx.edges[i];
+                edge.join_type = info.join_type;
+                if edge.join_condition.is_none() {
+                    edge.join_condition = info.join_condition.as_deref().map(Into::into);
+                }
+            }
+        }
+    }
+
     pub(super) fn analyze_insert(&mut self, ctx: &mut StatementContext, insert: &ast::Insert) {
         let target_name = insert.table.to_string();
         let canonical = self.normalize_table_name(&target_name);
@@ -349,8 +431,6 @@ impl<'a> Analyzer<'a> {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         });
 
@@ -622,8 +702,6 @@ impl<'a> Analyzer<'a> {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: None,
-                    join_condition: None,
                     aggregation: None,
                 });
 
@@ -675,8 +753,6 @@ impl<'a> Analyzer<'a> {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: None,
-                    join_condition: None,
                     aggregation: None,
                 });
 
@@ -709,8 +785,6 @@ impl<'a> Analyzer<'a> {
                         metadata: None,
                         resolution_source: None,
                         filters: Vec::new(),
-                        join_type: None,
-                        join_condition: None,
                         aggregation: None,
                     });
 
@@ -783,8 +857,6 @@ impl<'a> Analyzer<'a> {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         });
 
@@ -799,8 +871,6 @@ impl<'a> Analyzer<'a> {
             metadata: None,
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         });
 

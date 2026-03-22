@@ -1,6 +1,5 @@
 ---
 source: crates/flowscope-core/tests/snapshots.rs
-assertion_line: 50
 expression: clean_result
 ---
 {
@@ -84,9 +83,7 @@ expression: clean_result
               "expression": "e.department_id = d.department_id",
               "clauseType": "WHERE"
             }
-          ],
-          "joinType": "INNER",
-          "joinCondition": "true"
+          ]
         },
         {
           "id": "table_e3d59f407f4557b4",
@@ -201,13 +198,17 @@ expression: clean_result
           "id": "edge_f22ee78cb7dba437",
           "from": "column_1f727b33e31ee9ef",
           "to": "column_9a274df9ea201cac",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "true"
         },
         {
           "id": "edge_f52d941fe785b2ae",
           "from": "column_e651a7d1449a8c25",
           "to": "column_e2744ee33fe5dacd",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "true"
         },
         {
           "id": "edge_fd47ea96a810fba1",

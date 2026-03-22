@@ -1,4 +1,5 @@
 import type { StatementLineage, Node, Edge } from '@pondpilot/flowscope-core';
+import { JOIN_TYPE_LABELS } from '../constants';
 
 const CREATE_STATEMENT_TYPES = new Set(['CREATE_TABLE', 'CREATE_TABLE_AS', 'CREATE_VIEW']);
 
@@ -100,4 +101,63 @@ export function buildColumnOwnershipMap<T>(
     }
   }
   return result;
+}
+
+function isRelationType(type: Node['type']): boolean {
+  return type === 'table' || type === 'view' || type === 'cte' || type === OUTPUT_NODE_TYPE;
+}
+
+function resolveRelationNodeId(
+  nodeId: string,
+  nodeById: Map<string, Node>,
+  ownedNodeToRelationId: Map<string, string>
+): string | undefined {
+  const node = nodeById.get(nodeId);
+  if (node && isRelationType(node.type)) {
+    return node.id;
+  }
+
+  return ownedNodeToRelationId.get(nodeId);
+}
+
+/**
+ * Collect the set of table node IDs that were introduced via JOIN.
+ *
+ * A table is considered "joined" if any edge carrying `joinType` resolves back to
+ * that relation as its source owner. Tables not in the returned set are "base" tables.
+ */
+export function buildJoinedTableIds(edges: Edge[], nodes: Node[]): Set<string> {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const ownedNodeToRelationId = new Map<string, string>();
+
+  for (const edge of edges) {
+    if (edge.type !== 'ownership') {
+      continue;
+    }
+
+    const owner = nodeById.get(edge.from);
+    if (owner && isRelationType(owner.type)) {
+      ownedNodeToRelationId.set(edge.to, owner.id);
+    }
+  }
+
+  const ids = new Set<string>();
+  for (const edge of edges) {
+    if (edge.joinType) {
+      const sourceRelationId = resolveRelationNodeId(edge.from, nodeById, ownedNodeToRelationId);
+      if (sourceRelationId) {
+        ids.add(sourceRelationId);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * Format a join type string for display as an edge label.
+ * Uses the JOIN_TYPE_LABELS mapping for human-readable labels.
+ */
+export function formatJoinType(joinType: string | undefined | null): string | undefined {
+  if (!joinType) return undefined;
+  return JOIN_TYPE_LABELS[joinType] || joinType.replace(/_/g, ' ');
 }

@@ -45,9 +45,7 @@ expression: cleaned
           "id": "table_eaa6ebb8f158751f",
           "type": "table",
           "label": "orders",
-          "qualifiedName": "orders",
-          "joinType": "INNER",
-          "joinCondition": "u.id = o.user_id"
+          "qualifiedName": "orders"
         }
       ],
       "edges": [
@@ -85,7 +83,9 @@ expression: cleaned
           "id": "edge_b88d4f17e7312bee",
           "from": "column_cd29f390cdda5f9c",
           "to": "column_5f1cb9854f55ab15",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "u.id = o.user_id"
         }
       ],
       "joinCount": 1,
