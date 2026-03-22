@@ -5649,7 +5649,10 @@ fn column_level_edges_from_joined_tables_carry_join_info() {
         .map(|e| e.to.clone())
         .collect();
 
-    assert!(!customer_column_ids.is_empty(), "customers should own columns");
+    assert!(
+        !customer_column_ids.is_empty(),
+        "customers should own columns"
+    );
 
     // At least one DataFlow/Derivation edge from a customers column should carry join info
     let has_join_info = stmt.edges.iter().any(|edge| {

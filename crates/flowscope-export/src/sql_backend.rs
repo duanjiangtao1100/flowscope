@@ -660,7 +660,10 @@ mod integration_tests {
         let join_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM joins", [], |row| row.get(0))
             .expect("Should query joins table");
-        assert_eq!(join_count, 1, "joined projections should export one logical join");
+        assert_eq!(
+            join_count, 1,
+            "joined projections should export one logical join"
+        );
 
         let join_graph_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM join_graph", [], |row| row.get(0))

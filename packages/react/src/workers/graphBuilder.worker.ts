@@ -17,11 +17,7 @@ import type {
 } from '@pondpilot/flowscope-core';
 import { isTableLikeType } from '@pondpilot/flowscope-core';
 import { GRAPH_CONFIG } from '../constants';
-import {
-  getOutputColumnIds,
-  buildJoinedTableIds,
-  formatJoinType,
-} from '../utils/lineageHelpers';
+import { getOutputColumnIds, buildJoinedTableIds, formatJoinType } from '../utils/lineageHelpers';
 
 // =============================================================================
 // Types for worker communication (all serializable - no Sets, no functions)
