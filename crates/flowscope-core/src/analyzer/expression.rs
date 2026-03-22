@@ -545,56 +545,88 @@ impl<'a, 'b> ExpressionAnalyzer<'a, 'b> {
             // Extract column references from this specific predicate
             let column_refs = self.extract_column_refs_with_warning(predicate);
 
-            // Find unique tables referenced in this predicate.
-            // Track both canonical names (fallback) and instance node IDs (precise).
+            // Find tables referenced in this predicate.
+            // Keep canonical names for source-counting so qualified and
+            // unqualified refs to the same relation are not treated as
+            // cross-table. Routing still prefers instances when the predicate
+            // only uses qualified refs.
             let mut affected_tables: HashSet<String> = HashSet::new();
             let mut affected_instances: HashSet<Arc<str>> = HashSet::new();
+            let mut referenced_tables: HashSet<String> = HashSet::new();
             for col_ref in &column_refs {
-                // Try instance-aware resolution when a qualifier is present
-                if let Some(qualifier) = col_ref.table.as_deref() {
-                    if let Some(node_id) =
-                        self.analyzer.resolve_instance_node_id(self.ctx, qualifier)
-                    {
-                        affected_instances.insert(node_id);
-                        continue;
+                let table_canonical = self
+                    .analyzer
+                    .resolve_filter_column_table(
+                        self.ctx,
+                        col_ref.table.as_deref(),
+                        &col_ref.column,
+                    )
+                    .or_else(|| {
+                        self.analyzer.resolve_column_table(
+                            self.ctx,
+                            col_ref.table.as_deref(),
+                            &col_ref.column,
+                        )
+                    });
+
+                if let Some(table_canonical) = table_canonical {
+                    referenced_tables.insert(table_canonical.clone());
+
+                    if let Some(qualifier) = col_ref.table.as_deref() {
+                        if let Some(node_id) =
+                            self.analyzer.resolve_instance_node_id(self.ctx, qualifier)
+                        {
+                            affected_instances.insert(node_id);
+                        } else {
+                            affected_tables.insert(table_canonical);
+                        }
+                    } else {
+                        // Unqualified refs are tracked canonically so self-join
+                        // ambiguity can broadcast the predicate to all instances.
+                        affected_tables.insert(table_canonical);
                     }
-                }
-                // Fallback: resolve to canonical name. In self-joins, canonical-keyed
-                // filters are applied to ALL nodes sharing that canonical name (see
-                // apply_pending_filters), so an unqualified predicate correctly
-                // propagates to every instance.
-                if let Some(table_canonical) = self.analyzer.resolve_column_table(
-                    self.ctx,
-                    col_ref.table.as_deref(),
-                    &col_ref.column,
-                ) {
-                    affected_tables.insert(table_canonical);
                 }
             }
 
-            // If we couldn't resolve columns to specific tables (e.g., columns from
-            // functions without clear table references, or ambiguous column names),
-            // apply the filter to all tables in the current scope as a conservative
-            // fallback. This may be imprecise for complex multi-table expressions,
-            // but ensures the filter is captured rather than lost.
+            // Conservative fallback for schema-less single-table scopes: if we
+            // could not resolve any columns but only one canonical table is in
+            // scope, treat the predicate as belonging to that relation.
             if affected_tables.is_empty()
                 && affected_instances.is_empty()
                 && !column_refs.is_empty()
             {
-                for table in self.ctx.tables_in_current_scope() {
-                    affected_tables.insert(table);
+                let tables_in_scope = self.ctx.tables_in_current_scope();
+                let unique_tables: HashSet<_> = tables_in_scope.into_iter().collect();
+                if unique_tables.len() == 1 {
+                    affected_tables
+                        .insert(unique_tables.into_iter().next().expect("checked len == 1"));
                 }
             }
 
-            // Add this specific predicate to affected table nodes
-            let filter_text = predicate.to_string();
-            for node_id in &affected_instances {
-                self.ctx
-                    .add_filter_for_instance(node_id, filter_text.clone(), clause_type);
+            // Skip predicates that actually span multiple canonical relations
+            // (e.g., `a.id = b.id`). Same-table refs are preserved even when
+            // they mix instance-specific and canonical routing.
+            if referenced_tables.len() > 1 {
+                continue;
             }
-            for table_canonical in &affected_tables {
-                self.ctx
-                    .add_filter_for_table(table_canonical, filter_text.clone(), clause_type);
+
+            // Add this specific predicate to affected table nodes. Canonical
+            // routing wins whenever an unqualified reference is present so the
+            // same node does not receive a duplicate predicate via both routes.
+            let filter_text = predicate.to_string();
+            if !affected_tables.is_empty() {
+                for table_canonical in &affected_tables {
+                    self.ctx.add_filter_for_table(
+                        table_canonical,
+                        filter_text.clone(),
+                        clause_type,
+                    );
+                }
+            } else {
+                for node_id in &affected_instances {
+                    self.ctx
+                        .add_filter_for_instance(node_id, filter_text.clone(), clause_type);
+                }
             }
         }
     }

@@ -743,46 +743,11 @@ impl<'a> Analyzer<'a> {
             .or_else(|| ctx.cte_definitions.get(&canonical).cloned())
     }
 
-    pub(crate) fn resolve_column_table(
-        &mut self,
-        ctx: &StatementContext,
-        qualifier: Option<&str>,
-        column: &str,
-    ) -> Option<String> {
-        // If qualifier provided, use standard resolution
-        if let Some(q) = qualifier {
-            return self.resolve_table_alias(ctx, Some(q));
-        }
-
-        // No qualifier - try to find which table owns this column
-        // Use scope-based resolution: only consider tables in the current scope.
-        // Instance-aware counting is required so self-joins remain ambiguous.
+    fn candidate_tables_for_column(&self, ctx: &StatementContext, column: &str) -> Vec<String> {
         let tables_in_scope = ctx.tables_in_current_scope();
-        let relation_instances = ctx.relation_instances_in_current_scope();
-
-        if relation_instances.is_empty() {
-            let mut issue = Issue::warning(
-                issue_codes::UNRESOLVED_REFERENCE,
-                format!("Column '{column}' referenced but no tables are currently in scope"),
-            )
-            .with_statement(ctx.statement_index);
-            if let Some(span) = self.find_span(column) {
-                issue = issue.with_span(span);
-            }
-            self.issues.push(issue);
-            return None;
-        }
-
-        // If only one relation instance is in scope, assume column belongs to it.
-        if relation_instances.len() == 1 {
-            return Some(relation_instances[0].canonical.clone());
-        }
-
         let normalized_col = self.normalize_identifier(column);
-
-        // Collect candidates using CTE output columns and schema metadata
-        // Only consider tables that are actually in the current scope
         let mut candidate_tables: Vec<String> = Vec::new();
+
         for table_canonical in &tables_in_scope {
             // Check aliased subquery columns (CTEs and derived tables)
             if let Some(cte_cols) = ctx.resolve_subquery_columns(table_canonical) {
@@ -804,6 +769,74 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
+
+        candidate_tables
+    }
+
+    /// Resolve the canonical source table for filter routing without treating
+    /// multiple instances of the same relation as separate sources.
+    pub(super) fn resolve_filter_column_table(
+        &self,
+        ctx: &StatementContext,
+        qualifier: Option<&str>,
+        column: &str,
+    ) -> Option<String> {
+        if let Some(q) = qualifier {
+            return self.resolve_table_alias(ctx, Some(q));
+        }
+
+        let relation_instances = ctx.relation_instances_in_current_scope();
+        if relation_instances.is_empty() {
+            return None;
+        }
+
+        if relation_instances.len() == 1 {
+            return Some(relation_instances[0].canonical.clone());
+        }
+
+        let candidate_tables = self.candidate_tables_for_column(ctx, column);
+        if candidate_tables.len() == 1 {
+            candidate_tables.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn resolve_column_table(
+        &mut self,
+        ctx: &StatementContext,
+        qualifier: Option<&str>,
+        column: &str,
+    ) -> Option<String> {
+        // If qualifier provided, use standard resolution
+        if let Some(q) = qualifier {
+            return self.resolve_table_alias(ctx, Some(q));
+        }
+
+        // No qualifier - try to find which table owns this column
+        // Use scope-based resolution: only consider tables in the current scope.
+        // Instance-aware counting is required so self-joins remain ambiguous.
+        let relation_instances = ctx.relation_instances_in_current_scope();
+
+        if relation_instances.is_empty() {
+            let mut issue = Issue::warning(
+                issue_codes::UNRESOLVED_REFERENCE,
+                format!("Column '{column}' referenced but no tables are currently in scope"),
+            )
+            .with_statement(ctx.statement_index);
+            if let Some(span) = self.find_span(column) {
+                issue = issue.with_span(span);
+            }
+            self.issues.push(issue);
+            return None;
+        }
+
+        // If only one relation instance is in scope, assume column belongs to it.
+        if relation_instances.len() == 1 {
+            return Some(relation_instances[0].canonical.clone());
+        }
+
+        let candidate_tables = self.candidate_tables_for_column(ctx, column);
 
         match candidate_tables.len() {
             1 => {

@@ -2542,6 +2542,77 @@ fn self_join_unqualified_filter_applies_to_all_instances() {
 }
 
 #[test]
+fn self_join_unqualified_filter_with_other_join_applies_to_all_matching_instances() {
+    let sql = r#"
+        SELECT e1.name, e2.name, d.dept_name
+        FROM employees e1
+        JOIN employees e2 ON e1.manager_id = e2.id
+        JOIN departments d ON e1.dept_id = d.id
+        WHERE active = true
+    "#;
+
+    let schema = SchemaMetadata {
+        allow_implied: true,
+        default_catalog: None,
+        default_schema: None,
+        search_path: None,
+        case_sensitivity: None,
+        tables: vec![
+            schema_table(
+                None,
+                None,
+                "employees",
+                &["id", "manager_id", "dept_id", "name", "active"],
+            ),
+            schema_table(None, None, "departments", &["id", "dept_name"]),
+        ],
+    };
+
+    let result = run_analysis(sql, Dialect::Generic, Some(schema));
+    let stmt = first_statement(&result);
+
+    let employee_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table && n.qualified_name.as_deref() == Some("employees")
+        })
+        .collect();
+    assert_eq!(
+        employee_nodes.len(),
+        2,
+        "self-join should produce 2 employee nodes"
+    );
+
+    for node in &employee_nodes {
+        assert!(
+            node.filters.iter().any(|f| f.expression.contains("active")),
+            "ambiguous self-join filter should apply to all employee instances, but node {} has {:?}",
+            node.id,
+            node.filters
+        );
+    }
+
+    let departments_nodes: Vec<_> = stmt
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type == NodeType::Table && n.qualified_name.as_deref() == Some("departments")
+        })
+        .collect();
+    assert_eq!(
+        departments_nodes.len(),
+        1,
+        "regular join should produce 1 departments node"
+    );
+    assert!(
+        departments_nodes[0].filters.is_empty(),
+        "employee-only ambiguous filter should not attach to departments: {:?}",
+        departments_nodes[0].filters
+    );
+}
+
+#[test]
 fn self_join_mixed_with_regular_join() {
     let sql = r#"
         SELECT e1.name, e2.name, d.dept_name
@@ -5843,6 +5914,111 @@ fn nested_or_predicates_not_split() {
         .iter()
         .any(|f| f.expression.contains("OR") || f.expression.contains("pending"));
     assert!(has_or_filter, "One filter should contain the OR expression");
+}
+
+#[test]
+fn cross_table_predicate_not_attached_to_individual_tables() {
+    // Cross-table predicates like `a.id = b.id` in WHERE should NOT be
+    // attached to either table — they are cross-table conditions, not
+    // individual table filters.
+    let sql = r#"
+        SELECT a.name, b.amount
+        FROM users a
+        JOIN orders b ON a.id = b.user_id
+        WHERE a.status = 'active' AND a.id = b.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let users_node = find_table_node(stmt, "users").expect("users table not found");
+    let orders_node = find_table_node(stmt, "orders").expect("orders table not found");
+
+    eprintln!("users filters: {:?}", users_node.filters);
+    eprintln!("orders filters: {:?}", orders_node.filters);
+
+    // Users should have only the single-table predicate (status = 'active')
+    assert_eq!(
+        users_node.filters.len(),
+        1,
+        "users should have exactly one filter (the single-table predicate)"
+    );
+    assert!(
+        users_node.filters[0].expression.contains("status"),
+        "users filter should be the status predicate"
+    );
+
+    // Orders should have NO filters — the cross-table predicate `a.id = b.id`
+    // should not be attached to it
+    assert!(
+        orders_node.filters.is_empty(),
+        "orders should have no filters (cross-table predicate should be skipped), got: {:?}",
+        orders_node.filters
+    );
+}
+
+#[test]
+fn same_table_qualified_and_unqualified_refs_are_not_treated_as_cross_table() {
+    let sql = r#"
+        SELECT u.id
+        FROM users u
+        WHERE u.id = id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let users_node = find_table_node(stmt, "users").expect("users table not found");
+
+    assert_eq!(
+        users_node.filters.len(),
+        1,
+        "same-table qualified + unqualified predicate should be captured once"
+    );
+    assert!(
+        users_node.filters[0].expression.contains("u.id = id"),
+        "users filter should preserve the mixed predicate, got {:?}",
+        users_node.filters
+    );
+}
+
+#[test]
+fn unresolvable_predicate_not_broadcast_to_all_tables() {
+    // When a column cannot be resolved to any table (e.g., from a function),
+    // the filter should NOT be broadcast to all tables in scope.
+    let sql = r#"
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id
+        WHERE u.status = 'active' AND random() > 0.5
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let users_node = find_table_node(stmt, "users").expect("users table not found");
+    let orders_node = find_table_node(stmt, "orders").expect("orders table not found");
+
+    eprintln!("users filters: {:?}", users_node.filters);
+    eprintln!("orders filters: {:?}", orders_node.filters);
+
+    // Users should have the status filter
+    assert_eq!(
+        users_node.filters.len(),
+        1,
+        "users should have exactly one filter"
+    );
+    assert!(
+        users_node.filters[0].expression.contains("status"),
+        "users filter should be the status predicate"
+    );
+
+    // Orders should NOT have the random() predicate broadcast to it
+    assert!(
+        orders_node.filters.is_empty(),
+        "orders should have no filters (unresolvable predicate should not broadcast), got: {:?}",
+        orders_node.filters
+    );
 }
 
 #[test]

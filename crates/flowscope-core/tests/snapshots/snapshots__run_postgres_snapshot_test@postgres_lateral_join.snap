@@ -77,25 +77,13 @@ expression: clean_result
           "id": "table_1d63721b3610a67f",
           "type": "table",
           "label": "employees",
-          "qualifiedName": "employees",
-          "filters": [
-            {
-              "expression": "e.department_id = d.department_id",
-              "clauseType": "WHERE"
-            }
-          ]
+          "qualifiedName": "employees"
         },
         {
           "id": "table_e3d59f407f4557b4",
           "type": "table",
           "label": "departments",
-          "qualifiedName": "departments",
-          "filters": [
-            {
-              "expression": "e.department_id = d.department_id",
-              "clauseType": "WHERE"
-            }
-          ]
+          "qualifiedName": "departments"
         }
       ],
       "edges": [
@@ -218,7 +206,7 @@ expression: clean_result
         }
       ],
       "joinCount": 1,
-      "complexityScore": 32
+      "complexityScore": 28
     }
   ],
   "globalLineage": {
@@ -595,7 +583,7 @@ expression: clean_result
     "tableCount": 3,
     "columnCount": 10,
     "joinCount": 1,
-    "complexityScore": 32,
+    "complexityScore": 28,
     "issueCount": {
       "errors": 0,
       "warnings": 0,
