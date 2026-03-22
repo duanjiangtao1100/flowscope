@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
+use crate::join_export::representative_join_edge_indexes;
 use crate::schema::{tables_ddl, views_ddl};
 use crate::ExportError;
 use flowscope_core::AnalyzeResult;
@@ -177,7 +178,7 @@ fn sql_opt_bool(v: Option<bool>) -> &'static str {
 
 /// Schema version for the export format.
 /// Increment this when making breaking changes to the schema structure.
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 
 fn write_meta_sql(sql: &mut String, prefix: &str) {
     let version = env!("CARGO_PKG_VERSION");
@@ -219,7 +220,6 @@ fn write_statements_sql(sql: &mut String, result: &AnalyzeResult, prefix: &str) 
 }
 
 fn write_nodes_sql(sql: &mut String, result: &AnalyzeResult, prefix: &str) {
-    let mut join_id: i64 = 0;
     let mut filter_id: i64 = 0;
 
     for (stmt_idx, statement) in result.statements.iter().enumerate() {
@@ -245,20 +245,6 @@ fn write_nodes_sql(sql: &mut String, result: &AnalyzeResult, prefix: &str) {
                 sql_int(span_end),
                 sql_str(resolution.as_deref()),
             ));
-
-            // Write join info if present
-            if let Some(join_type) = &node.join_type {
-                let jt = format!("{:?}", join_type).to_uppercase();
-                sql.push_str(&format!(
-                    "INSERT INTO {prefix}joins (id, node_id, statement_id, join_type, join_condition) VALUES ({}, {}, {}, {}, {});\n",
-                    join_id,
-                    sql_str(Some(node.id.as_ref())),
-                    stmt_idx,
-                    sql_str(Some(&jt)),
-                    sql_str(node.join_condition.as_ref().map(|s| s.as_ref())),
-                ));
-                join_id += 1;
-            }
 
             // Write filters
             for filter in &node.filters {
@@ -291,8 +277,13 @@ fn write_nodes_sql(sql: &mut String, result: &AnalyzeResult, prefix: &str) {
 
 fn write_edges_sql(sql: &mut String, result: &AnalyzeResult, prefix: &str) {
     let mut edge_id: i64 = 0;
+    let mut join_id: i64 = 0;
     for (stmt_idx, statement) in result.statements.iter().enumerate() {
-        for edge in &statement.edges {
+        let join_edge_indexes: HashSet<_> = representative_join_edge_indexes(statement)
+            .into_iter()
+            .collect();
+
+        for (edge_idx, edge) in statement.edges.iter().enumerate() {
             let edge_type = format!("{:?}", edge.edge_type).to_lowercase();
             sql.push_str(&format!(
                 "INSERT INTO {prefix}edges (id, statement_id, edge_type, from_node_id, to_node_id, expression, operation, is_approximate) VALUES ({}, {}, {}, {}, {}, {}, {}, {});\n",
@@ -305,6 +296,25 @@ fn write_edges_sql(sql: &mut String, result: &AnalyzeResult, prefix: &str) {
                 sql_str(edge.operation.as_ref().map(|s| s.as_ref())),
                 sql_bool(edge.approximate.unwrap_or(false)),
             ));
+
+            // Export one representative join row per logical relation pair.
+            if join_edge_indexes.contains(&edge_idx) {
+                let join_type = edge
+                    .join_type
+                    .as_ref()
+                    .expect("representative join edge must carry join metadata");
+                let jt = format!("{:?}", join_type).to_uppercase();
+                sql.push_str(&format!(
+                    "INSERT INTO {prefix}joins (id, edge_id, statement_id, join_type, join_condition) VALUES ({}, {}, {}, {}, {});\n",
+                    join_id,
+                    edge_id,
+                    stmt_idx,
+                    sql_str(Some(&jt)),
+                    sql_str(edge.join_condition.as_ref().map(|s| s.as_ref())),
+                ));
+                join_id += 1;
+            }
+
             edge_id += 1;
         }
     }
@@ -524,7 +534,7 @@ mod tests {
         assert!(sql.contains("INSERT INTO _meta"));
         // Verify schema_version is included
         assert!(
-            sql.contains("('schema_version', '1')"),
+            sql.contains("('schema_version', '2')"),
             "Should include schema_version in _meta"
         );
     }
@@ -538,6 +548,7 @@ mod tests {
             source_name: None,
             options: None,
             schema: None,
+            #[cfg(feature = "templating")]
             template_config: None,
         };
         let result = analyze(&request);
@@ -561,6 +572,7 @@ mod tests {
             source_name: None,
             options: None,
             schema: None,
+            #[cfg(feature = "templating")]
             template_config: None,
         };
         let result = analyze(&request);
@@ -600,12 +612,13 @@ mod integration_tests {
     fn test_export_sql_executes_in_duckdb() {
         // Analyze a query with multiple elements (JOIN, WHERE)
         let request = AnalyzeRequest {
-            sql: "SELECT u.id, u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total > 100".to_string(),
+            sql: "SELECT u.id, u.name, o.total, o.status FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total > 100".to_string(),
             files: None,
             dialect: Dialect::Generic,
             source_name: None,
             options: None,
             schema: None,
+            #[cfg(feature = "templating")]
             template_config: None,
         };
         let result = analyze(&request);
@@ -643,5 +656,29 @@ mod integration_tests {
             .expect("Should query column_lineage view");
         // Just verify the view is queryable, count may be 0
         assert!(lineage_count >= 0);
+
+        let join_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM joins", [], |row| row.get(0))
+            .expect("Should query joins table");
+        assert_eq!(
+            join_count, 1,
+            "joined projections should export one logical join"
+        );
+
+        let join_graph_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM join_graph", [], |row| row.get(0))
+            .expect("Should query join_graph view");
+        assert_eq!(
+            join_graph_count, 1,
+            "join_graph should collapse column-level join metadata to one row"
+        );
+
+        let (from_label, to_label): (String, String) = conn
+            .query_row("SELECT from_label, to_label FROM join_graph", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("Should resolve relation labels in join_graph");
+        assert_eq!(from_label, "orders");
+        assert_eq!(to_label, "Output");
     }
 }

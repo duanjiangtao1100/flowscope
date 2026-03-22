@@ -1,5 +1,6 @@
 //! DuckDB backend implementation.
 
+use crate::join_export::representative_join_edge_indexes;
 use crate::schema::{tables_ddl, views_ddl};
 use crate::ExportError;
 use duckdb::{params, Connection};
@@ -58,7 +59,7 @@ fn write_data(conn: &Connection, result: &AnalyzeResult) -> Result<(), ExportErr
 
 /// Schema version for the export format.
 /// Increment this when making breaking changes to the schema structure.
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 
 fn write_meta(conn: &Connection) -> Result<(), ExportError> {
     conn.execute(
@@ -107,10 +108,6 @@ fn write_nodes(conn: &Connection, result: &AnalyzeResult) -> Result<(), ExportEr
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )?;
 
-    let mut join_stmt = conn.prepare(
-        "INSERT INTO joins (id, node_id, statement_id, join_type, join_condition) VALUES (?, ?, ?, ?, ?)",
-    )?;
-
     let mut filter_stmt = conn.prepare(
         "INSERT INTO filters (id, node_id, statement_id, predicate, filter_type) VALUES (?, ?, ?, ?, ?)",
     )?;
@@ -119,7 +116,6 @@ fn write_nodes(conn: &Connection, result: &AnalyzeResult) -> Result<(), ExportEr
         "INSERT INTO aggregations (node_id, statement_id, is_grouping_key, function, is_distinct) VALUES (?, ?, ?, ?, ?)",
     )?;
 
-    let mut join_id: i64 = 0;
     let mut filter_id: i64 = 0;
 
     for (stmt_idx, statement) in result.statements.iter().enumerate() {
@@ -144,19 +140,6 @@ fn write_nodes(conn: &Connection, result: &AnalyzeResult) -> Result<(), ExportEr
                 span_end,
                 resolution,
             ])?;
-
-            // Write join info if present
-            if let Some(join_type) = &node.join_type {
-                let jt = format!("{:?}", join_type).to_uppercase();
-                join_stmt.execute(params![
-                    join_id,
-                    node.id.as_ref(),
-                    stmt_idx as i64,
-                    jt,
-                    node.join_condition.as_ref().map(|s| s.as_ref()),
-                ])?;
-                join_id += 1;
-            }
 
             // Write filters
             for filter in &node.filters {
@@ -192,9 +175,19 @@ fn write_edges(conn: &Connection, result: &AnalyzeResult) -> Result<(), ExportEr
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )?;
 
+    let mut join_stmt = conn.prepare(
+        "INSERT INTO joins (id, edge_id, statement_id, join_type, join_condition) VALUES (?, ?, ?, ?, ?)",
+    )?;
+
     let mut edge_id: i64 = 0;
+    let mut join_id: i64 = 0;
     for (stmt_idx, statement) in result.statements.iter().enumerate() {
-        for edge in &statement.edges {
+        let join_edge_indexes: std::collections::HashSet<_> =
+            representative_join_edge_indexes(statement)
+                .into_iter()
+                .collect();
+
+        for (edge_idx, edge) in statement.edges.iter().enumerate() {
             let edge_type = format!("{:?}", edge.edge_type).to_lowercase();
             stmt.execute(params![
                 edge_id,
@@ -206,6 +199,24 @@ fn write_edges(conn: &Connection, result: &AnalyzeResult) -> Result<(), ExportEr
                 edge.operation.as_ref().map(|s| s.as_ref()),
                 edge.approximate.unwrap_or(false),
             ])?;
+
+            // Export one representative join row per logical relation pair.
+            if join_edge_indexes.contains(&edge_idx) {
+                let join_type = edge
+                    .join_type
+                    .as_ref()
+                    .expect("representative join edge must carry join metadata");
+                let jt = format!("{:?}", join_type).to_uppercase();
+                join_stmt.execute(params![
+                    join_id,
+                    edge_id,
+                    stmt_idx as i64,
+                    jt,
+                    edge.join_condition.as_ref().map(|s| s.as_ref()),
+                ])?;
+                join_id += 1;
+            }
+
             edge_id += 1;
         }
     }
@@ -357,6 +368,7 @@ mod tests {
             source_name: None,
             options: None,
             schema: None,
+            #[cfg(feature = "templating")]
             template_config: None,
         };
         let result = analyze(&request);
@@ -384,13 +396,14 @@ mod tests {
     #[test]
     fn test_export_with_joins() {
         let request = AnalyzeRequest {
-            sql: "SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id"
+            sql: "SELECT u.name, o.total, o.status FROM users u LEFT JOIN orders o ON u.id = o.user_id"
                 .to_string(),
             files: None,
             dialect: Dialect::Generic,
             source_name: None,
             options: None,
             schema: None,
+            #[cfg(feature = "templating")]
             template_config: None,
         };
         let result = analyze(&request);
@@ -404,6 +417,25 @@ mod tests {
         let join_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM joins", [], |r| r.get(0))
             .unwrap();
-        assert!(join_count > 0);
+        assert_eq!(
+            join_count, 1,
+            "joined projections should export one logical join"
+        );
+
+        let join_graph_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM join_graph", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            join_graph_count, 1,
+            "join_graph should collapse column-level join metadata to one row"
+        );
+
+        let (from_label, to_label): (String, String) = conn
+            .query_row("SELECT from_label, to_label FROM join_graph", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(from_label, "orders");
+        assert_eq!(to_label, "Output");
     }
 }

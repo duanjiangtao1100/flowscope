@@ -150,14 +150,12 @@ impl<'a> Analyzer<'a> {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: ctx.current_join_info.join_type,
-                    join_condition: ctx
-                        .current_join_info
-                        .join_condition
-                        .as_deref()
-                        .map(Into::into),
                     aggregation: None,
                 });
+                if ctx.current_join_info.join_type.is_some() {
+                    ctx.joined_table_info
+                        .insert(instance_id.clone(), ctx.current_join_info.clone());
+                }
                 // Connect CTE definition to its reference instance so that
                 // filter_cte_nodes can trace the full data flow chain.
                 let edge_id = generate_edge_id(&cte_id, &instance_id);
@@ -218,8 +216,6 @@ impl<'a> Analyzer<'a> {
                 }),
                 resolution_source: None,
                 filters: Vec::new(),
-                join_type: None,
-                join_condition: None,
                 aggregation: None,
             };
             ctx.add_node(column_node);
@@ -268,26 +264,16 @@ impl<'a> Analyzer<'a> {
 
     fn apply_join_metadata_to_existing_node(&self, ctx: &mut StatementContext, node_id: &Arc<str>) {
         let join_type = ctx.current_join_info.join_type;
-        let join_condition = ctx.current_join_info.join_condition.as_deref();
+        let join_condition = ctx.current_join_info.join_condition.clone();
 
         if join_type.is_none() && join_condition.is_none() {
             return;
         }
 
-        if let Some(node) = ctx
-            .nodes
-            .iter_mut()
-            .find(|node| node.id.as_ref() == node_id.as_ref())
-        {
-            if node.join_type.is_none() {
-                node.join_type = join_type;
-            }
-            if node.join_condition.is_none() {
-                if let Some(condition) = join_condition {
-                    node.join_condition = Some(condition.into());
-                }
-            }
-        }
+        // Record join info in context map (only if not already recorded)
+        ctx.joined_table_info
+            .entry(node_id.clone())
+            .or_insert_with(|| ctx.current_join_info.clone());
     }
 
     /// Resolves a regular table or view reference.
@@ -418,14 +404,14 @@ impl<'a> Analyzer<'a> {
             metadata,
             resolution_source,
             filters: Vec::new(),
-            join_type: ctx.current_join_info.join_type,
-            join_condition: ctx
-                .current_join_info
-                .join_condition
-                .as_deref()
-                .map(Into::into),
             aggregation: None,
         });
+
+        // Record join metadata in context map (not on the node)
+        if ctx.current_join_info.join_type.is_some() {
+            ctx.joined_table_info
+                .insert(id.clone(), ctx.current_join_info.clone());
+        }
     }
 
     /// Creates a data flow edge from source to target.
@@ -483,8 +469,6 @@ impl<'a> Analyzer<'a> {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: None,
-                    join_condition: None,
                     aggregation: None,
                 };
                 ctx.add_node(col_node);
@@ -950,8 +934,6 @@ impl<'a> Analyzer<'a> {
             }),
             resolution_source: None,
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: params.aggregation,
         };
         ctx.add_node(col_node);
@@ -1046,8 +1028,6 @@ impl<'a> Analyzer<'a> {
                     metadata: None,
                     resolution_source: None,
                     filters: Vec::new(),
-                    join_type: None,
-                    join_condition: None,
                     aggregation: None,
                 };
                 ctx.add_node(source_col_node);
@@ -1098,12 +1078,13 @@ impl<'a> Analyzer<'a> {
         // relation-level dependency to the output column so the base tables are
         // connected in statement lineage and downstream graph rendering.
         if resolved_sources == 0 && params.sources.is_empty() {
-            // Base relations are those without a join_type (i.e., the driving
-            // table in the FROM clause, not tables introduced via JOIN).
+            // Base relations are those not introduced via JOIN (i.e., the driving
+            // table in the FROM clause). We check the joined_table_info map
+            // instead of reading from node fields.
             let base_node_ids: HashSet<&Arc<str>> = ctx
                 .nodes
                 .iter()
-                .filter(|node| node.join_type.is_none())
+                .filter(|node| !ctx.joined_table_info.contains_key(&node.id))
                 .map(|node| &node.id)
                 .collect();
 
@@ -1613,8 +1594,6 @@ impl<'a> Analyzer<'a> {
             metadata: None,
             resolution_source: Some(ResolutionSource::Implied),
             filters: Vec::new(),
-            join_type: None,
-            join_condition: None,
             aggregation: None,
         });
 

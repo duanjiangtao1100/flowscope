@@ -60,9 +60,7 @@ expression: clean_result
           "id": "cte_55404a7d16da64f6",
           "type": "cte",
           "label": "subordinates",
-          "qualifiedName": "subordinates",
-          "joinType": "INNER",
-          "joinCondition": "s.employee_id = e.manager_id"
+          "qualifiedName": "subordinates"
         },
         {
           "id": "output_b558dd754c71cfa6",
@@ -93,7 +91,9 @@ expression: clean_result
           "id": "edge_0d75264916e1dd26",
           "from": "column_3bb15f110141f382",
           "to": "column_7e820398ccfaecd9",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "s.employee_id = e.manager_id"
         },
         {
           "id": "edge_14893331427855ac",
@@ -135,7 +135,9 @@ expression: clean_result
           "id": "edge_7f6694a10bae6288",
           "from": "column_fb3b69287fcc45b6",
           "to": "column_629d7cf5d2e3562d",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "s.employee_id = e.manager_id"
         },
         {
           "id": "edge_8aedc318ed9a4cc8",
@@ -153,7 +155,9 @@ expression: clean_result
           "id": "edge_979d9e98c9bb573f",
           "from": "column_d4e47a99ac16a7c1",
           "to": "column_c157084ae253a93c",
-          "type": "data_flow"
+          "type": "data_flow",
+          "joinType": "INNER",
+          "joinCondition": "s.employee_id = e.manager_id"
         },
         {
           "id": "edge_a4a02611c7eb6903",

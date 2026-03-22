@@ -546,21 +546,6 @@
               "$ref": "#/definitions/FilterPredicate"
             }
           },
-          "joinType": {
-            "description": "For table nodes that are JOINed: the type of join used to include this table.\nNone for the main FROM table, Some(JoinType) for joined tables.",
-            "anyOf": [
-              {
-                "$ref": "#/definitions/JoinType"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "joinCondition": {
-            "description": "For table nodes that are JOINed: the join condition (ON clause).",
-            "type": ["string", "null"]
-          },
           "aggregation": {
             "description": "For column nodes: aggregation information if this column is aggregated or a grouping key.\nPresence indicates the query uses GROUP BY; the fields indicate the column's role.",
             "anyOf": [
@@ -683,6 +668,113 @@
           }
         ]
       },
+      "AggregationInfo": {
+        "description": "Information about aggregation applied to a column.\n\nThis tracks when a column is the result of an aggregation operation (like SUM, COUNT, AVG),\nwhich indicates a cardinality reduction (1:many collapse) in the data flow.",
+        "type": "object",
+        "properties": {
+          "isGroupingKey": {
+            "description": "True if this column is a GROUP BY key (preserves row identity within groups)",
+            "type": "boolean"
+          },
+          "function": {
+            "description": "The aggregation function used (e.g., \"SUM\", \"COUNT\", \"AVG\")\nNone if this is a grouping key or non-aggregated column",
+            "type": ["string", "null"]
+          },
+          "distinct": {
+            "description": "True if this aggregation uses DISTINCT (e.g., COUNT(DISTINCT col))",
+            "type": ["boolean", "null"]
+          }
+        },
+        "required": ["isGroupingKey"]
+      },
+      "Edge": {
+        "description": "An edge connecting two nodes in the lineage graph.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Stable content-based hash ID",
+            "type": "string"
+          },
+          "from": {
+            "description": "Source node ID",
+            "type": "string"
+          },
+          "to": {
+            "description": "Target node ID",
+            "type": "string"
+          },
+          "type": {
+            "description": "Edge type",
+            "allOf": [
+              {
+                "$ref": "#/definitions/EdgeType"
+              }
+            ]
+          },
+          "expression": {
+            "description": "Optional: SQL expression if this edge represents a transformation",
+            "type": ["string", "null"]
+          },
+          "operation": {
+            "description": "Optional: operation label ('JOIN', 'UNION', 'AGGREGATE', etc.)",
+            "type": ["string", "null"]
+          },
+          "joinType": {
+            "description": "Optional: specific join type for JOIN edges (INNER, LEFT, RIGHT, FULL, CROSS, etc.)",
+            "anyOf": [
+              {
+                "$ref": "#/definitions/JoinType"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "joinCondition": {
+            "description": "Optional: join condition expression (ON clause)",
+            "type": ["string", "null"]
+          },
+          "metadata": {
+            "description": "Extensible metadata for future use",
+            "type": ["object", "null"],
+            "additionalProperties": true
+          },
+          "approximate": {
+            "description": "True if this edge represents approximate/uncertain lineage",
+            "type": ["boolean", "null"]
+          }
+        },
+        "required": ["id", "from", "to", "type"]
+      },
+      "EdgeType": {
+        "oneOf": [
+          {
+            "description": "Table/CTE owns columns",
+            "type": "string",
+            "const": "ownership"
+          },
+          {
+            "description": "Data flows from one column to another",
+            "type": "string",
+            "const": "data_flow"
+          },
+          {
+            "description": "Output derived from inputs (with transformation)",
+            "type": "string",
+            "const": "derivation"
+          },
+          {
+            "description": "Join-only dependency from a source to output",
+            "type": "string",
+            "const": "join_dependency"
+          },
+          {
+            "description": "Cross-statement dependency",
+            "type": "string",
+            "const": "cross_statement"
+          }
+        ]
+      },
       "JoinType": {
         "description": "The type of SQL JOIN operation.",
         "oneOf": [
@@ -745,113 +837,6 @@
             "description": "AS OF JOIN (time-series)",
             "type": "string",
             "const": "AS_OF"
-          }
-        ]
-      },
-      "AggregationInfo": {
-        "description": "Information about aggregation applied to a column.\n\nThis tracks when a column is the result of an aggregation operation (like SUM, COUNT, AVG),\nwhich indicates a cardinality reduction (1:many collapse) in the data flow.",
-        "type": "object",
-        "properties": {
-          "isGroupingKey": {
-            "description": "True if this column is a GROUP BY key (preserves row identity within groups)",
-            "type": "boolean"
-          },
-          "function": {
-            "description": "The aggregation function used (e.g., \"SUM\", \"COUNT\", \"AVG\")\nNone if this is a grouping key or non-aggregated column",
-            "type": ["string", "null"]
-          },
-          "distinct": {
-            "description": "True if this aggregation uses DISTINCT (e.g., COUNT(DISTINCT col))",
-            "type": ["boolean", "null"]
-          }
-        },
-        "required": ["isGroupingKey"]
-      },
-      "Edge": {
-        "description": "An edge connecting two nodes in the lineage graph.",
-        "type": "object",
-        "properties": {
-          "id": {
-            "description": "Stable content-based hash ID",
-            "type": "string"
-          },
-          "from": {
-            "description": "Source node ID",
-            "type": "string"
-          },
-          "to": {
-            "description": "Target node ID",
-            "type": "string"
-          },
-          "type": {
-            "description": "Edge type",
-            "allOf": [
-              {
-                "$ref": "#/definitions/EdgeType"
-              }
-            ]
-          },
-          "expression": {
-            "description": "Optional: SQL expression if this edge represents a transformation",
-            "type": ["string", "null"]
-          },
-          "operation": {
-            "description": "Optional: operation label ('JOIN', 'UNION', 'AGGREGATE', etc.)",
-            "type": ["string", "null"]
-          },
-          "joinType": {
-            "description": "Optional: specific join type for JOIN edges (INNER, LEFT, RIGHT, FULL, CROSS, etc.)\nNote: For table-level visualization, the frontend typically reads join info from the\ntarget Node's join_type/join_condition fields. These Edge fields are preserved for\ncolumn-level lineage edges and future use cases where edge-level join context is needed.",
-            "anyOf": [
-              {
-                "$ref": "#/definitions/JoinType"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "joinCondition": {
-            "description": "Optional: join condition expression (ON clause)\nSee join_type comment for usage notes.",
-            "type": ["string", "null"]
-          },
-          "metadata": {
-            "description": "Extensible metadata for future use",
-            "type": ["object", "null"],
-            "additionalProperties": true
-          },
-          "approximate": {
-            "description": "True if this edge represents approximate/uncertain lineage",
-            "type": ["boolean", "null"]
-          }
-        },
-        "required": ["id", "from", "to", "type"]
-      },
-      "EdgeType": {
-        "oneOf": [
-          {
-            "description": "Table/CTE owns columns",
-            "type": "string",
-            "const": "ownership"
-          },
-          {
-            "description": "Data flows from one column to another",
-            "type": "string",
-            "const": "data_flow"
-          },
-          {
-            "description": "Output derived from inputs (with transformation)",
-            "type": "string",
-            "const": "derivation"
-          },
-          {
-            "description": "Join-only dependency from a source to output",
-            "type": "string",
-            "const": "join_dependency"
-          },
-          {
-            "description": "Cross-statement dependency",
-            "type": "string",
-            "const": "cross_statement"
           }
         ]
       },

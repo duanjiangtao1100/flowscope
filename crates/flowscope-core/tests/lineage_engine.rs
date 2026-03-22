@@ -1,7 +1,7 @@
 use flowscope_core::{
-    analyze, issue_codes, AnalyzeRequest, AnalyzeResult, ColumnSchema, ConstraintType, Dialect,
-    Edge, EdgeType, FilterClauseType, JoinType, Node, NodeType, SchemaMetadata,
-    SchemaNamespaceHint, SchemaTable, Severity, StatementLineage,
+    analyze, issue_codes, AnalysisOptions, AnalyzeRequest, AnalyzeResult, ColumnSchema,
+    ConstraintType, Dialect, Edge, EdgeType, FilterClauseType, JoinType, Node, NodeType,
+    SchemaMetadata, SchemaNamespaceHint, SchemaTable, Severity, StatementLineage,
 };
 use rstest::rstest;
 use std::collections::HashSet;
@@ -15,6 +15,24 @@ fn run_analysis(sql: &str, dialect: Dialect, schema: Option<SchemaMetadata>) -> 
         dialect,
         source_name: Some("integration_test".into()),
         options: None,
+        schema,
+        #[cfg(feature = "templating")]
+        template_config: None,
+    })
+}
+
+fn run_analysis_with_options(
+    sql: &str,
+    dialect: Dialect,
+    schema: Option<SchemaMetadata>,
+    options: AnalysisOptions,
+) -> AnalyzeResult {
+    analyze(&AnalyzeRequest {
+        sql: sql.trim().to_string(),
+        files: None,
+        dialect,
+        source_name: Some("integration_test".into()),
+        options: Some(options),
         schema,
         #[cfg(feature = "templating")]
         template_config: None,
@@ -5418,10 +5436,17 @@ fn count_star_self_join_creates_multiple_dependencies() {
         .find(|node| node.node_type == NodeType::Output)
         .expect("Output node should exist");
 
+    // Find nodes that have JoinDependency edges with LEFT join type (joined aliases)
+    let joined_alias_ids: Vec<_> = stmt
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::JoinDependency && e.join_type == Some(JoinType::Left))
+        .map(|e| e.from.clone())
+        .collect();
     let joined_aliases: Vec<_> = stmt
         .nodes
         .iter()
-        .filter(|node| node.node_type == NodeType::Table && node.join_type == Some(JoinType::Left))
+        .filter(|node| node.node_type == NodeType::Table && joined_alias_ids.contains(&node.id))
         .collect();
     assert_eq!(
         joined_aliases.len(),
@@ -5505,6 +5530,47 @@ fn join_only_tables_emit_output_dependency_for_literal_projection() {
 }
 
 #[test]
+fn joined_tables_emit_output_dependency_when_column_lineage_disabled() {
+    let sql = r#"
+        SELECT u.id
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis_with_options(
+        sql,
+        Dialect::Generic,
+        None,
+        AnalysisOptions {
+            enable_column_lineage: Some(false),
+            ..Default::default()
+        },
+    );
+    let stmt = first_statement(&result);
+
+    let output_node = stmt
+        .nodes
+        .iter()
+        .find(|node| node.node_type == NodeType::Output)
+        .expect("output node should exist");
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dependency = stmt.edges.iter().find(|edge| {
+        edge.edge_type == EdgeType::JoinDependency
+            && edge.from == orders_node.id
+            && edge.to == output_node.id
+    });
+
+    let join_dependency = join_dependency
+        .expect("joined table should still connect to the output when column lineage is disabled");
+    assert_eq!(join_dependency.join_type, Some(JoinType::Left));
+    assert_eq!(
+        join_dependency.join_condition.as_deref(),
+        Some("u.id = o.user_id")
+    );
+}
+
+#[test]
 fn wildcard_join_contributors_do_not_emit_output_dependency_without_schema() {
     let sql = r#"
         SELECT *
@@ -5557,6 +5623,80 @@ fn qualified_wildcard_join_only_table_gets_dependency() {
     assert!(
         join_dependency.is_some(),
         "join-only table must get JoinDependency when only other table's wildcard is selected"
+    );
+}
+
+#[test]
+fn column_level_edges_from_joined_tables_carry_join_info() {
+    // Verifies that propagate_join_info_to_edges fills in join metadata on
+    // column-level DataFlow/Derivation edges originating from joined tables.
+    let sql = r#"
+        SELECT o.order_id, c.name
+        FROM orders o
+        INNER JOIN customers c ON o.customer_id = c.id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let customers_node = find_table_node(stmt, "customers").expect("customers not found");
+
+    // Find column-level edges originating from columns owned by the joined table
+    let customer_column_ids: Vec<_> = stmt
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::Ownership && e.from == customers_node.id)
+        .map(|e| e.to.clone())
+        .collect();
+
+    assert!(
+        !customer_column_ids.is_empty(),
+        "customers should own columns"
+    );
+
+    // At least one DataFlow/Derivation edge from a customers column should carry join info
+    let has_join_info = stmt.edges.iter().any(|edge| {
+        matches!(edge.edge_type, EdgeType::DataFlow | EdgeType::Derivation)
+            && customer_column_ids.contains(&edge.from)
+            && edge.join_type == Some(JoinType::Inner)
+    });
+
+    assert!(
+        has_join_info,
+        "column-level edges from joined table should carry join_type after propagation"
+    );
+}
+
+#[test]
+fn propagated_join_info_does_not_overwrite_existing() {
+    // A JoinDependency edge created in add_join_dependency_edges already has
+    // join_type set. propagate_join_info_to_edges must not overwrite it.
+    let sql = r#"
+        SELECT u.id
+        FROM users u
+        LEFT JOIN orders o ON u.id = o.user_id
+    "#;
+
+    let result = run_analysis(sql, Dialect::Generic, None);
+    let stmt = first_statement(&result);
+
+    let orders_node = find_table_node(stmt, "orders").expect("orders not found");
+
+    let join_dep = stmt
+        .edges
+        .iter()
+        .find(|e| e.edge_type == EdgeType::JoinDependency && e.from == orders_node.id)
+        .expect("JoinDependency edge should exist for join-only table");
+
+    assert_eq!(
+        join_dep.join_type,
+        Some(JoinType::Left),
+        "JoinDependency edge should retain its original join_type"
+    );
+    assert_eq!(
+        join_dep.join_condition.as_deref(),
+        Some("u.id = o.user_id"),
+        "JoinDependency edge should retain its original join_condition"
     );
 }
 
@@ -5718,47 +5858,56 @@ fn multiple_join_types_captured() {
     let result = run_analysis(sql, Dialect::Generic, None);
     let stmt = first_statement(&result);
 
-    // Main table (orders) should have no join_type
-    let orders_node = find_table_node(stmt, "orders").expect("orders table not found");
-    assert!(
-        orders_node.join_type.is_none(),
-        "Main FROM table should have no join_type"
-    );
-
-    // Joined tables should have correct join types
+    // All table nodes should exist
+    let _orders_node = find_table_node(stmt, "orders").expect("orders table not found");
     let customers_node = find_table_node(stmt, "customers").expect("customers table not found");
     let products_node = find_table_node(stmt, "products").expect("products table not found");
     let inventory_node = find_table_node(stmt, "inventory").expect("inventory table not found");
 
     use flowscope_core::JoinType;
+
+    // Helper: find an edge originating from a given node with join_type set
+    let find_join_edge = |node_id: &str| -> Option<&flowscope_core::Edge> {
+        stmt.edges
+            .iter()
+            .find(|e| e.from.as_ref() == node_id && e.join_type.is_some())
+    };
+
+    // Join info should live on edges, not nodes
+    let customers_edge =
+        find_join_edge(customers_node.id.as_ref()).expect("customers should have a join edge");
     assert_eq!(
-        customers_node.join_type,
+        customers_edge.join_type,
         Some(JoinType::Left),
-        "customers should be LEFT joined"
+        "customers edge should be LEFT joined"
     );
-    assert_eq!(
-        products_node.join_type,
-        Some(JoinType::Inner),
-        "products should be INNER joined"
-    );
-    assert_eq!(
-        inventory_node.join_type,
-        Some(JoinType::Full),
-        "inventory should be FULL joined"
+    assert!(
+        customers_edge.join_condition.is_some(),
+        "customers edge should have join condition"
     );
 
-    // Join conditions should be captured
-    assert!(
-        customers_node.join_condition.is_some(),
-        "customers should have join condition"
+    let products_edge =
+        find_join_edge(products_node.id.as_ref()).expect("products should have a join edge");
+    assert_eq!(
+        products_edge.join_type,
+        Some(JoinType::Inner),
+        "products edge should be INNER joined"
     );
     assert!(
-        products_node.join_condition.is_some(),
-        "products should have join condition"
+        products_edge.join_condition.is_some(),
+        "products edge should have join condition"
+    );
+
+    let inventory_edge =
+        find_join_edge(inventory_node.id.as_ref()).expect("inventory should have a join edge");
+    assert_eq!(
+        inventory_edge.join_type,
+        Some(JoinType::Full),
+        "inventory edge should be FULL joined"
     );
     assert!(
-        inventory_node.join_condition.is_some(),
-        "inventory should have join condition"
+        inventory_edge.join_condition.is_some(),
+        "inventory edge should have join condition"
     );
 }
 
@@ -5785,14 +5934,31 @@ fn cte_join_metadata_captured() {
     assert!(!cte_nodes.is_empty(), "user_ltv CTE nodes not found");
 
     use flowscope_core::JoinType;
-    let joined_cte = cte_nodes
+    // Find an edge from a user_ltv CTE node (or its owned columns) that has LEFT join metadata
+    let cte_node_ids: Vec<_> = cte_nodes.iter().map(|n| n.id.as_ref()).collect();
+    let cte_col_ids: Vec<_> = stmt
+        .edges
         .iter()
-        .find(|node| node.join_type == Some(JoinType::Left))
-        .expect("joined CTE instance should capture LEFT join metadata");
+        .filter(|e| {
+            e.edge_type == flowscope_core::EdgeType::Ownership
+                && cte_node_ids.contains(&e.from.as_ref())
+        })
+        .map(|e| e.to.clone())
+        .collect();
+    let cte_related_ids: Vec<&str> = cte_node_ids
+        .iter()
+        .copied()
+        .chain(cte_col_ids.iter().map(|s| s.as_ref()))
+        .collect();
+    let join_edge = stmt
+        .edges
+        .iter()
+        .find(|e| cte_related_ids.contains(&e.from.as_ref()) && e.join_type == Some(JoinType::Left))
+        .expect("CTE should have an edge with LEFT join metadata");
     assert_eq!(
-        joined_cte.join_condition.as_deref(),
+        join_edge.join_condition.as_deref(),
         Some("u.user_id = ltv.user_id"),
-        "joined CTE instance should capture join condition"
+        "CTE edge should capture join condition"
     );
 }
 
@@ -6419,12 +6585,16 @@ fn left_semi_join_tracks_tables() {
         assert!(orders_node.is_some(), "orders node exists");
         assert!(customers_node.is_some(), "customers node exists");
 
-        // Check join type on joined table
+        // Check join type on edge from joined table
         if let Some(cust) = customers_node {
+            let join_edge = stmt
+                .edges
+                .iter()
+                .find(|e| e.from == cust.id && e.join_type.is_some());
             assert_eq!(
-                cust.join_type,
+                join_edge.and_then(|e| e.join_type),
                 Some(JoinType::LeftSemi),
-                "should recognize LEFT SEMI JOIN"
+                "should recognize LEFT SEMI JOIN on edge"
             );
         }
     }
@@ -6448,10 +6618,14 @@ fn left_anti_join_tracks_tables() {
 
         let returns_node = find_table_node(stmt, "returns");
         if let Some(ret) = returns_node {
+            let join_edge = stmt
+                .edges
+                .iter()
+                .find(|e| e.from == ret.id && e.join_type.is_some());
             assert_eq!(
-                ret.join_type,
+                join_edge.and_then(|e| e.join_type),
                 Some(JoinType::LeftAnti),
-                "should recognize LEFT ANTI JOIN"
+                "should recognize LEFT ANTI JOIN on edge"
             );
         }
     }
@@ -6476,11 +6650,22 @@ fn straight_join_mysql_syntax() {
         let stmt = first_statement(&result);
         let cust_node = find_table_node(stmt, "customers");
         if let Some(cust) = cust_node {
-            // STRAIGHT_JOIN maps to Inner join type
+            // STRAIGHT_JOIN maps to Inner join type (on edge)
+            // Check edges from the node or its owned columns
+            let owned_col_ids: Vec<_> = stmt
+                .edges
+                .iter()
+                .filter(|e| e.edge_type == EdgeType::Ownership && e.from == cust.id)
+                .map(|e| e.to.clone())
+                .collect();
+            let join_edge = stmt.edges.iter().find(|e| {
+                e.join_type.is_some()
+                    && (e.from == cust.id || owned_col_ids.iter().any(|c| c == &e.from))
+            });
             assert_eq!(
-                cust.join_type,
+                join_edge.and_then(|e| e.join_type),
                 Some(JoinType::Inner),
-                "STRAIGHT_JOIN should be treated as Inner join"
+                "STRAIGHT_JOIN should be treated as Inner join on edge"
             );
         }
     }
@@ -6818,22 +7003,51 @@ fn multiple_join_types_in_single_query() {
 
     let stmt = first_statement(&result);
 
-    // Verify join types are correctly identified
+    // Verify join types are correctly identified on edges.
+    // Look for edges from the table node itself, or from columns owned by the table.
+    let find_join_edge = |node_id: &str| -> Option<JoinType> {
+        // Collect column IDs owned by this table
+        let owned_col_ids: Vec<_> = stmt
+            .edges
+            .iter()
+            .filter(|e| e.edge_type == EdgeType::Ownership && e.from.as_ref() == node_id)
+            .map(|e| e.to.clone())
+            .collect();
+        stmt.edges
+            .iter()
+            .find(|e| {
+                e.join_type.is_some()
+                    && (e.from.as_ref() == node_id || owned_col_ids.iter().any(|c| c == &e.from))
+            })
+            .and_then(|e| e.join_type)
+    };
     if let Some(cust) = find_table_node(stmt, "customers") {
-        assert_eq!(cust.join_type, Some(JoinType::Inner), "INNER JOIN detected");
+        assert_eq!(
+            find_join_edge(cust.id.as_ref()),
+            Some(JoinType::Inner),
+            "INNER JOIN detected on edge"
+        );
     }
     if let Some(prod) = find_table_node(stmt, "products") {
-        assert_eq!(prod.join_type, Some(JoinType::Left), "LEFT JOIN detected");
+        assert_eq!(
+            find_join_edge(prod.id.as_ref()),
+            Some(JoinType::Left),
+            "LEFT JOIN detected on edge"
+        );
     }
     if let Some(status) = find_table_node(stmt, "order_status") {
         assert_eq!(
-            status.join_type,
+            find_join_edge(status.id.as_ref()),
             Some(JoinType::Right),
-            "RIGHT JOIN detected"
+            "RIGHT JOIN detected on edge"
         );
     }
     if let Some(cfg) = find_table_node(stmt, "config") {
-        assert_eq!(cfg.join_type, Some(JoinType::Cross), "CROSS JOIN detected");
+        assert_eq!(
+            find_join_edge(cfg.id.as_ref()),
+            Some(JoinType::Cross),
+            "CROSS JOIN detected on edge"
+        );
     }
 }
 

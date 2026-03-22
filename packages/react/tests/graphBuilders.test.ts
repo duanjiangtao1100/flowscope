@@ -96,7 +96,7 @@ const createInsertLineage = (): StatementLineage => ({
 });
 
 describe('mergeStatements', () => {
-  it('preserves join metadata from later statements referencing the same table', () => {
+  it('preserves edge join metadata from later statements', () => {
     const firstStmt: StatementLineage = {
       statementIndex: 0,
       statementType: 'SELECT',
@@ -115,19 +115,26 @@ describe('mergeStatements', () => {
           type: 'table',
           label: 'users',
           qualifiedName: 'users',
+        },
+      ],
+      edges: [
+        {
+          id: 'edge:join',
+          from: 'table:users',
+          to: 'output',
+          type: 'data_flow',
           joinType: 'LEFT',
           joinCondition: 'u.id = o.user_id',
         },
       ],
-      edges: [],
       joinCount: 1,
       complexityScore: 1,
     };
 
     const merged = mergeStatements([firstStmt, secondStmt]);
-    const usersNode = merged.nodes.find((n) => n.id === 'table:users');
-    expect(usersNode?.joinType).toBe('LEFT');
-    expect(usersNode?.joinCondition).toBe('u.id = o.user_id');
+    const joinEdge = merged.edges.find((e) => e.id === 'edge:join');
+    expect(joinEdge?.joinType).toBe('LEFT');
+    expect(joinEdge?.joinCondition).toBe('u.id = o.user_id');
   });
 });
 
@@ -578,8 +585,6 @@ describe('graphBuilders DML handling', () => {
           type: 'table',
           label: 'orders',
           qualifiedName: 'orders',
-          joinType: 'LEFT',
-          joinCondition: 'u.id = o.user_id',
         },
         { id: 'column:count', type: 'column', label: 'count', expression: 'COUNT(*)' },
       ],
@@ -633,20 +638,57 @@ describe('graphBuilders DML handling', () => {
           type: 'table',
           label: 'orders',
           qualifiedName: 'orders',
+        },
+        {
+          id: 'column:orders.total',
+          type: 'column',
+          label: 'total',
+          qualifiedName: 'orders.total',
+        },
+        {
+          id: 'output:1',
+          type: 'output',
+          label: 'Output',
+        },
+        {
+          id: 'column:output.total',
+          type: 'column',
+          label: 'total',
+        },
+      ],
+      edges: [
+        {
+          id: 'edge:orders:owns:total',
+          from: 'table:orders',
+          to: 'column:orders.total',
+          type: 'ownership',
+        },
+        {
+          id: 'edge:output:owns:total',
+          from: 'output:1',
+          to: 'column:output.total',
+          type: 'ownership',
+        },
+        {
+          id: 'edge:orders:total:output',
+          from: 'column:orders.total',
+          to: 'column:output.total',
+          type: 'data_flow',
           joinType: 'INNER',
         },
       ],
-      edges: [],
       joinCount: 1,
       complexityScore: 1,
     };
 
     const nodes = buildFlowNodes(statement, null, '', new Set<string>(), new Set<string>());
     const usersNode = nodes.find((node) => node.id === 'table:users');
+    const ordersNode = nodes.find((node) => node.id === 'table:orders');
     const recentOrdersNode = nodes.find((node) => node.id === 'cte:recent_orders');
     const viewNode = nodes.find((node) => node.id === 'view:active_users');
 
     expect(usersNode?.data.isBaseTable).toBe(true);
+    expect(ordersNode?.data.isBaseTable).toBe(false);
     expect(recentOrdersNode?.data.isBaseTable).toBeFalsy();
     expect(viewNode?.data.isBaseTable).toBeFalsy();
   });

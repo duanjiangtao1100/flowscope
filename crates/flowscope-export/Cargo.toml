@@ -15,6 +15,7 @@ description = "Database export for FlowScope analysis results"
 [features]
 default = ["duckdb"]
 duckdb = ["dep:duckdb"]
+templating = ["flowscope-core/templating"]
 
 [dependencies]
 flowscope-core.workspace = true

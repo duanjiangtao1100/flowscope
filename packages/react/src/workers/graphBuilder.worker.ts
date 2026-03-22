@@ -16,8 +16,8 @@ import type {
   AggregationInfo,
 } from '@pondpilot/flowscope-core';
 import { isTableLikeType } from '@pondpilot/flowscope-core';
-import { GRAPH_CONFIG, JOIN_TYPE_LABELS } from '../constants';
-import { getOutputColumnIds } from '../utils/lineageHelpers';
+import { GRAPH_CONFIG } from '../constants';
+import { getOutputColumnIds, buildJoinedTableIds, formatJoinType } from '../utils/lineageHelpers';
 
 // =============================================================================
 // Types for worker communication (all serializable - no Sets, no functions)
@@ -269,14 +269,6 @@ function isSelectStatement(statement: StatementLineage): boolean {
 }
 
 /**
- * Format join type for display as edge label.
- */
-function formatJoinType(joinType: string | undefined | null): string | undefined {
-  if (!joinType) return undefined;
-  return JOIN_TYPE_LABELS[joinType] || joinType.replace(/_/g, ' ');
-}
-
-/**
  * Build column ownership map: column ID -> table ID.
  */
 function buildColumnOwnershipMap(
@@ -407,13 +399,15 @@ function buildFlowNodes(
   const outputNode = statement.nodes.find((n) => n.type === OUTPUT_NODE_TYPE);
   const outputNodeId = outputNode?.id ?? GRAPH_CONFIG.VIRTUAL_OUTPUT_NODE_ID;
   const isSelect = isSelectStatement(statement);
-  const hasJoinNodes = tableNodes.some((node) => !!node.joinType);
+  // Identify tables introduced via JOIN (base tables are those NOT in this set)
+  const joinedTableIds = buildJoinedTableIds(statement.edges, statement.nodes);
+  const hasJoinNodes = joinedTableIds.size > 0;
 
   const baseTableIds = new Set<string>();
   if (hasJoinNodes) {
     tableNodes.forEach((node) => {
       if (node.type !== 'table') return;
-      if (!node.joinType) {
+      if (!joinedTableIds.has(node.id)) {
         baseTableIds.add(node.id);
       }
     });
@@ -582,7 +576,12 @@ function buildFlowEdges(
       return computeIsCollapsed(tableId, defaultCollapsed, collapsedNodeIds);
     };
 
-    const pushTableEdge = (sourceTableId: string, targetTableId: string, edgeType: string) => {
+    const pushTableEdge = (
+      sourceTableId: string,
+      targetTableId: string,
+      edgeType: string,
+      sourceEdge?: Edge
+    ) => {
       if (sourceTableId === targetTableId) {
         return;
       }
@@ -593,8 +592,7 @@ function buildFlowEdges(
       }
 
       tableEdgeKeys.add(edgeKey);
-      const sourceNode = tableNodeMap.get(sourceTableId);
-      const joinType = formatJoinType(sourceNode?.joinType);
+      const joinType = formatJoinType(sourceEdge?.joinType);
 
       const uiEdgeType = edgeType === JOIN_DEPENDENCY_EDGE_TYPE ? 'joinDependency' : edgeType;
 
@@ -606,8 +604,8 @@ function buildFlowEdges(
         label: joinType,
         data: {
           type: uiEdgeType,
-          joinType: sourceNode?.joinType,
-          joinCondition: sourceNode?.joinCondition,
+          joinType: sourceEdge?.joinType,
+          joinCondition: sourceEdge?.joinCondition,
         },
       });
     };
@@ -639,7 +637,7 @@ function buildFlowEdges(
             const isTargetCollapsed = isTableCollapsed(targetTableId);
 
             if (isSourceCollapsed || isTargetCollapsed) {
-              pushTableEdge(sourceTableId, targetTableId, edge.type);
+              pushTableEdge(sourceTableId, targetTableId, edge.type, edge);
               return;
             }
 
@@ -662,17 +660,13 @@ function buildFlowEdges(
               },
             });
           }
-        } else if (
-          sourceRelationId &&
-          targetRelationId &&
-          sourceRelationId !== targetRelationId
-        ) {
+        } else if (sourceRelationId && targetRelationId && sourceRelationId !== targetRelationId) {
           // Handle relation-to-column edges (e.g., base table → COUNT(*) output column)
           // as table-level edges. Self-referential edges (same relation) are excluded
           // since they don't represent cross-table data flow.
           const tablePairKey = `${sourceRelationId}_to_${targetRelationId}`;
           tablePairsFromColumns.add(tablePairKey);
-          pushTableEdge(sourceRelationId, targetRelationId, edge.type);
+          pushTableEdge(sourceRelationId, targetRelationId, edge.type, edge);
         }
       });
 
@@ -698,7 +692,7 @@ function buildFlowEdges(
           return;
         }
 
-        pushTableEdge(edge.from, edge.to, edge.type);
+        pushTableEdge(edge.from, edge.to, edge.type, edge);
       });
 
     return flowEdges;
@@ -708,16 +702,24 @@ function buildFlowEdges(
   const flowEdges: SerializedFlowEdge[] = [];
   const seenEdges = new Set<string>();
   const selectSourceTableIds = new Set<string>();
+  // Track join info per source table for output edge labeling.
+  // First edge with join info wins — if a table participates in multiple joins,
+  // only the first encountered join metadata is kept for the output edge label.
+  const tableJoinInfo = new Map<string, { joinType?: string; joinCondition?: string }>();
 
   for (const edge of statement.edges) {
     if (edge.type === 'data_flow' || edge.type === 'derivation') {
       if (isSelect && outputColumnIds.has(edge.to)) {
-        // Resolve source table: either the column's owning table, or the relation
-        // itself when a table node directly feeds an output column (e.g., COUNT(*)).
         const sourceTableId =
           columnToTableMap.get(edge.from) || (tableNodeMap.has(edge.from) ? edge.from : undefined);
         if (sourceTableId) {
           selectSourceTableIds.add(sourceTableId);
+          if (edge.joinType && !tableJoinInfo.has(sourceTableId)) {
+            tableJoinInfo.set(sourceTableId, {
+              joinType: edge.joinType,
+              joinCondition: edge.joinCondition,
+            });
+          }
         }
         continue;
       }
@@ -730,8 +732,7 @@ function buildFlowEdges(
         if (!seenEdges.has(edgeKey)) {
           seenEdges.add(edgeKey);
 
-          const sourceNode = tableNodeMap.get(sourceTableId);
-          const joinType = formatJoinType(sourceNode?.joinType);
+          const joinType = formatJoinType(edge.joinType);
 
           flowEdges.push({
             id: `edge_${edgeKey}`,
@@ -741,13 +742,12 @@ function buildFlowEdges(
             label: joinType,
             data: {
               type: edge.type,
-              joinType: sourceNode?.joinType,
-              joinCondition: sourceNode?.joinCondition,
+              joinType: edge.joinType,
+              joinCondition: edge.joinCondition,
             },
           });
         }
       } else {
-        // Fallback for column -> table edges
         const sourceFromColumn = columnToTableMap.get(edge.from);
         const targetFromColumn = columnToTableMap.get(edge.to);
         const sourceTable = tableNodeMap.get(edge.from);
@@ -761,8 +761,7 @@ function buildFlowEdges(
           if (!seenEdges.has(edgeKey)) {
             seenEdges.add(edgeKey);
 
-            const sourceNode = tableNodeMap.get(resolvedSourceId);
-            const joinType = formatJoinType(sourceNode?.joinType);
+            const joinType = formatJoinType(edge.joinType);
 
             flowEdges.push({
               id: `edge_${edgeKey}`,
@@ -772,8 +771,8 @@ function buildFlowEdges(
               label: joinType,
               data: {
                 type: edge.type,
-                joinType: sourceNode?.joinType,
-                joinCondition: sourceNode?.joinCondition,
+                joinType: edge.joinType,
+                joinCondition: edge.joinCondition,
               },
             });
           }
@@ -799,8 +798,7 @@ function buildFlowEdges(
 
       seenEdges.add(edgeKey);
 
-      const sourceNode = tableNodeMap.get(sourceId);
-      const joinType = formatJoinType(edge.joinType || sourceNode?.joinType);
+      const joinType = formatJoinType(edge.joinType);
 
       flowEdges.push({
         id: edge.id,
@@ -810,16 +808,16 @@ function buildFlowEdges(
         label: joinType,
         data: {
           type: 'joinDependency',
-          joinType: edge.joinType || sourceNode?.joinType,
-          joinCondition: edge.joinCondition || sourceNode?.joinCondition,
+          joinType: edge.joinType,
+          joinCondition: edge.joinCondition,
         },
       });
     });
 
   if (isSelect && selectSourceTableIds.size > 0) {
     selectSourceTableIds.forEach((tableId) => {
-      const tableNode = tableNodeMap.get(tableId);
-      const joinType = formatJoinType(tableNode?.joinType);
+      const info = tableJoinInfo.get(tableId);
+      const joinType = formatJoinType(info?.joinType);
 
       flowEdges.push({
         id: `edge_${tableId}_to_output`,
@@ -829,8 +827,8 @@ function buildFlowEdges(
         label: joinType,
         data: {
           type: 'data_flow',
-          joinType: tableNode?.joinType,
-          joinCondition: tableNode?.joinCondition,
+          joinType: info?.joinType,
+          joinCondition: info?.joinCondition,
         },
       });
     });
@@ -896,12 +894,6 @@ function mergeStatements(statements: StatementLineage[]): StatementLineage {
         return;
       }
 
-      if (!existing.joinType && node.joinType) {
-        existing.joinType = node.joinType;
-      }
-      if (!existing.joinCondition && node.joinCondition) {
-        existing.joinCondition = node.joinCondition;
-      }
       if (node.filters && node.filters.length > 0) {
         existing.filters = [...(existing.filters || []), ...node.filters];
       }

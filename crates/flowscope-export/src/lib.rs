@@ -10,6 +10,7 @@ mod csv;
 mod error;
 mod extract;
 mod html;
+mod join_export;
 mod json;
 mod mermaid;
 mod naming;
