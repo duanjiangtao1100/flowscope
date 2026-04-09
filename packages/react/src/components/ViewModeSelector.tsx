@@ -21,13 +21,13 @@ const VIEW_MODES: Array<{
   {
     value: 'script',
     label: 'Script',
-    description: 'Show relationships between scripts through shared tables',
+    description: '脚本模式-通过共享的表来展示脚本之间的关系\n\n- 作用:\n  - 节点是SQL脚本文件\n  - 边表示两个脚本之间通过共享的表产生关联\n  - 适合看：哪些脚本之间有数据依赖关系',
     icon: FileCode,
   },
   {
     value: 'table',
     label: 'Table',
-    description: 'Show tables with relationships (default view)',
+    description: 'Table模式-展示表与表之间的关系\n\n- 作用:\n  - 节点是数据库表/视图/CTE\n  - 边表示表之间的直接血缘关系\n  - 适合看：数据具体是如何从一张表流向另一张表的',
     icon: Table2,
   },
 ];

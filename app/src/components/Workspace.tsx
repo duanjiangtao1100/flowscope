@@ -1,5 +1,4 @@
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
-import { Share2, Github } from 'lucide-react';
 import { toast } from 'sonner';
 import { useLineageActions, useLineageState } from '@pondpilot/flowscope-react';
 import { Button } from './ui/button';
@@ -10,7 +9,6 @@ import type { ImperativePanelHandle } from 'react-resizable-panels';
 import { EditorArea } from './EditorArea';
 import { AnalysisView } from './AnalysisView';
 import { ProjectSelector } from './ProjectSelector';
-import { ShareDialog } from './ShareDialog';
 import { ExportDialog } from './ExportDialog';
 import { ThemeToggle } from './ThemeToggle';
 import { KeyboardShortcutsDialog } from './KeyboardShortcutsDialog';
@@ -41,7 +39,7 @@ interface WorkspaceProps {
 const EDITOR_PANEL_DEFAULT_SIZE = 33;
 
 export function Workspace({ backendReady, error, onRetry, isRetrying }: WorkspaceProps) {
-  const { currentProject, selectFile, activeProjectId, isBackendMode } = useProject();
+  const { currentProject, selectFile, activeProjectId } = useProject();
   const { adapter } = useBackend();
   const analysis = useAnalysis(backendReady, { adapter });
   const lineageActions = useLineageActions();
@@ -57,7 +55,6 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
   const { result, viewMode, layoutAlgorithm } = lineageState;
   const [fileSelectorOpen, setFileSelectorOpen] = useState(false);
   const [projectSelectorOpen, setProjectSelectorOpen] = useState(false);
-  const [shareDialogOpen, setShareDialogOpen] = useState(false);
   const [shortcutsDialogOpen, setShortcutsDialogOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 
@@ -183,17 +180,6 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
         key: '?',
         handler: () => setShortcutsDialogOpen(true),
       },
-      // Share dialog (disabled in serve mode)
-      {
-        key: 's',
-        cmdOrCtrl: true,
-        shift: true,
-        handler: () => {
-          if (currentProject && !isBackendMode) {
-            setShareDialogOpen(true);
-          }
-        },
-      },
       // Theme toggle (Cmd+\ to avoid browser conflict with Cmd+Shift+T)
       {
         key: '\\',
@@ -207,7 +193,7 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
         handler: () => setCommandPaletteOpen(true),
       },
     ],
-    [toggleEditorPanel, currentProject, cycleTheme, isBackendMode]
+    [toggleEditorPanel, currentProject, cycleTheme]
   );
 
   useGlobalShortcuts(shortcuts);
@@ -253,11 +239,6 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
           break;
         case 'tab-issues':
           if (activeProjectId) setActiveTab(activeProjectId, 'issues');
-          break;
-
-        // Actions
-        case 'share':
-          if (currentProject && !isBackendMode) setShareDialogOpen(true);
           break;
 
         // Settings
@@ -306,7 +287,6 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
       toggleShowScriptTables,
       setLayoutAlgorithm,
       layoutAlgorithm,
-      isBackendMode,
     ]
   );
 
@@ -342,15 +322,6 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
           <ThemeToggle />
         </div>
       </header>
-
-      {/* Share Dialog */}
-      {currentProject && (
-        <ShareDialog
-          open={shareDialogOpen}
-          onOpenChange={setShareDialogOpen}
-          project={currentProject}
-        />
-      )}
 
       {/* Keyboard Shortcuts Help Dialog */}
       <KeyboardShortcutsDialog

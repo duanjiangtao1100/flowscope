@@ -59,11 +59,11 @@ export function SchemaEditor({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-4xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>{isReadOnly ? 'View Schema' : 'Edit Schema'}</DialogTitle>
+          <DialogTitle>{isReadOnly ? '查看Schema' : '编辑Schema'}</DialogTitle>
           <DialogDescription>
             {isReadOnly
-              ? 'This schema was loaded from the server (database introspection). It cannot be edited in serve mode.'
-              : 'Define your database schema using CREATE TABLE statements. This schema will be used to augment the lineage analysis without appearing in the graph.'}
+              ? '此schema已从服务器加载（数据库自省）。在serve模式下无法编辑。'
+              : '使用CREATE TABLE语句定义您的数据库schema。此schema将用于增强血统分析，但不会显示在图表中。'}
           </DialogDescription>
         </DialogHeader>
 
@@ -79,13 +79,13 @@ export function SchemaEditor({
 
         <DialogFooter>
           {isReadOnly ? (
-            <Button onClick={handleClose}>Close</Button>
+            <Button onClick={handleClose}>关闭</Button>
           ) : (
             <>
               <Button variant="outline" onClick={handleClose}>
-                Cancel
+                取消
               </Button>
-              <Button onClick={handleSave}>Save Schema</Button>
+              <Button onClick={handleSave}>保存Schema</Button>
             </>
           )}
         </DialogFooter>

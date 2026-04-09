@@ -1019,8 +1019,8 @@ export function GraphView({
             <ToolbarToggleButton
               isActive={!defaultCollapsed}
               onClick={() => actions.setAllNodesCollapsed(!defaultCollapsed)}
-              ariaLabel={defaultCollapsed ? 'Expand all tables' : 'Collapse all tables'}
-              tooltip={defaultCollapsed ? 'Expand all tables' : 'Collapse all tables'}
+              ariaLabel={defaultCollapsed ? '展开所有表' : '折叠所有表'}
+              tooltip={defaultCollapsed ? '展开所有表' : '折叠所有表'}
               icon={
                 defaultCollapsed ? (
                   <Maximize2 className="size-4" strokeWidth={1.5} />
@@ -1034,8 +1034,8 @@ export function GraphView({
             <ToolbarToggleButton
               isActive={showColumnEdges}
               onClick={actions.toggleColumnEdges}
-              ariaLabel={showColumnEdges ? 'Show table connections' : 'Show column lineage'}
-              tooltip={showColumnEdges ? 'Show table connections' : 'Show column lineage'}
+              ariaLabel={showColumnEdges ? '展示表级血缘' : '展示列级血缘'}
+              tooltip={showColumnEdges ? '展示表级血缘' : '展示列级血缘'}
               icon={
                 showColumnEdges ? (
                   <GitBranch className="size-4" strokeWidth={1.5} />

@@ -368,10 +368,10 @@ export function AnalysisView({
       >
         <div className="px-4 py-2 border-b flex items-center justify-between bg-muted/10 h-[44px] shrink-0">
           <TabsList>
-            <TabsTrigger value="lineage">Lineage</TabsTrigger>
-            <TabsTrigger value="hierarchy">Hierarchy</TabsTrigger>
-            <TabsTrigger value="matrix">Matrix</TabsTrigger>
-            <TabsTrigger value="schema">Schema</TabsTrigger>
+            <TabsTrigger value="lineage">血缘关系分析</TabsTrigger>
+            <TabsTrigger value="hierarchy">层级依赖分析</TabsTrigger>
+            <TabsTrigger value="matrix">表关系矩阵</TabsTrigger>
+            <TabsTrigger value="schema">表结构图</TabsTrigger>
             {hasIssues && (
               <TabsTrigger value="issues" className="text-warning-light dark:text-warning-dark">
                 Issues ({summary.issueCount.errors + summary.issueCount.warnings})
@@ -399,12 +399,12 @@ export function AnalysisView({
                       className="h-7 text-xs"
                     >
                       <Settings className="h-3 w-3 mr-1" />
-                      Schema
+                      编辑Schema
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>
                     <p className="flex items-center gap-2">
-                      Edit schema
+                      编辑Schema
                       <kbd className="px-1.5 py-0.5 text-xs bg-muted rounded border font-mono">
                         {getShortcutDisplay('edit-schema')}
                       </kbd>

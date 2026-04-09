@@ -104,7 +104,7 @@ export function EditorToolbar({
             ) : (
               <Play className="h-3.5 w-3.5 fill-current" />
             )}
-            <span className="hidden sm:inline">Run</span>
+            <span className="hidden sm:inline">运行</span>
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -117,23 +117,23 @@ export function EditorToolbar({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
-              <DropdownMenuLabel>Run Configuration</DropdownMenuLabel>
+              <DropdownMenuLabel>运行配置</DropdownMenuLabel>
               <DropdownMenuSeparator />
               <DropdownMenuRadioGroup
                 value={runMode}
                 onValueChange={(v) => onRunModeChange(v as RunMode)}
               >
                 <DropdownMenuRadioItem value="current" className="text-xs justify-between">
-                  <span>Run Active File Only</span>
+                  <span>只运行当前文件</span>
                   <kbd className="ml-4 inline-flex h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium text-muted-foreground">
                     <span className="text-xs">⌘</span>⇧↵
                   </kbd>
                 </DropdownMenuRadioItem>
                 <DropdownMenuRadioItem value="all" className="text-xs">
-                  Run All Files ({allFileCount})
+                  运行所有文件 ({allFileCount})
                 </DropdownMenuRadioItem>
                 <DropdownMenuRadioItem value="custom" className="text-xs">
-                  Run Selected ({selectedCount})
+                  运行选中的文件 ({selectedCount})
                 </DropdownMenuRadioItem>
               </DropdownMenuRadioGroup>
               <DropdownMenuSeparator />
@@ -141,7 +141,7 @@ export function EditorToolbar({
                 <kbd className="inline-flex h-5 select-none items-center gap-1 rounded border bg-muted px-1.5 font-mono text-[10px] font-medium">
                   <span className="text-xs">⌘</span>↵
                 </kbd>
-                <span className="ml-2">Run in current mode</span>
+                <span className="ml-2">在当前模式下运行</span>
               </div>
             </DropdownMenuContent>
           </DropdownMenu>
