@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Database, GitBranch, Shield, Keyboard } from 'lucide-react';
+import { Database, GitBranch, Shield } from 'lucide-react';
 
 import {
   Dialog,
@@ -36,9 +36,9 @@ export function WelcomeModal({ onClose }: WelcomeModalProps) {
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && handleClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="text-xl">Welcome to DataLineageAnalysis</DialogTitle>
+          <DialogTitle className="text-xl">欢迎使用 DataLineageAnalysis</DialogTitle>
           <DialogDescription>
-            A privacy-first SQL lineage engine that runs entirely in your browser.
+            一个完全在浏览器中运行的隐私优先 SQL 血缘分析引擎。
           </DialogDescription>
         </DialogHeader>
 
@@ -46,9 +46,9 @@ export function WelcomeModal({ onClose }: WelcomeModalProps) {
           <div className="flex items-start gap-3">
             <Database className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
             <div>
-              <p className="font-medium text-sm">SQL Lineage Analysis</p>
+              <p className="font-medium text-sm">SQL 血缘分析</p>
               <p className="text-sm text-muted-foreground">
-                Visualize how data flows through your queries across tables, CTEs, and columns.
+                可视化数据如何在表、CTE 和列之间流动。
               </p>
             </div>
           </div>
@@ -56,9 +56,9 @@ export function WelcomeModal({ onClose }: WelcomeModalProps) {
           <div className="flex items-start gap-3">
             <GitBranch className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
             <div>
-              <p className="font-medium text-sm">Multi-File Projects</p>
+              <p className="font-medium text-sm">多文件项目</p>
               <p className="text-sm text-muted-foreground">
-                Organize your SQL files into projects and analyze dependencies across files.
+                将您的 SQL 文件组织成项目，并分析文件之间的依赖关系。
               </p>
             </div>
           </div>
@@ -66,28 +66,16 @@ export function WelcomeModal({ onClose }: WelcomeModalProps) {
           <div className="flex items-start gap-3">
             <Shield className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
             <div>
-              <p className="font-medium text-sm">Privacy First</p>
+              <p className="font-medium text-sm">隐私优先</p>
               <p className="text-sm text-muted-foreground">
-                All analysis runs locally in your browser. Your SQL never leaves your machine.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-start gap-3">
-            <Keyboard className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
-            <div>
-              <p className="font-medium text-sm">Keyboard Driven</p>
-              <p className="text-sm text-muted-foreground">
-                <kbd className="px-1.5 py-0.5 text-xs bg-muted rounded border">⌘P</kbd> projects,{' '}
-                <kbd className="px-1.5 py-0.5 text-xs bg-muted rounded border">⌘O</kbd> files,{' '}
-                <kbd className="px-1.5 py-0.5 text-xs bg-muted rounded border">⌘Enter</kbd> analyze
+                所有分析都在您的浏览器本地运行。您的 SQL 永远不会离开您的机器。
               </p>
             </div>
           </div>
         </div>
 
         <DialogFooter>
-          <Button onClick={handleClose}>Get Started</Button>
+          <Button onClick={handleClose}>开始使用</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
