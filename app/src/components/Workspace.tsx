@@ -321,7 +321,7 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
           {/* Logo */}
           <div className="flex items-center gap-3">
             <FlowScopeLogo className="w-8 h-8 text-foreground/30 dark:text-white/30" />
-            <span className="text-lg font-semibold text-foreground">FlowScope</span>
+            <span className="text-lg font-semibold text-foreground">DataLineageAnalysis</span>
           </div>
 
           {/* Project Selector */}
@@ -337,51 +337,8 @@ export function Workspace({ backendReady, error, onRetry, isRetrying }: Workspac
                 projectName={currentProject.name}
                 graphRef={graphContainerRef}
               />
-              {/* Hide Share button in serve mode - files come from CLI */}
-              {!isBackendMode && (
-                <TooltipProvider>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        onClick={() => setShareDialogOpen(true)}
-                      >
-                        <Share2 className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p className="flex items-center gap-2">
-                        Share project
-                        <kbd className="px-1.5 py-0.5 text-xs bg-muted rounded border font-mono">
-                          {getShortcutDisplay('share')}
-                        </kbd>
-                      </p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              )}
             </>
           )}
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" className="h-8 w-8" asChild>
-                  <a
-                    href="https://github.com/pondpilot/flowscope"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    <Github className="h-4 w-4" />
-                  </a>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>
-                <p>View on GitHub</p>
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
           <ThemeToggle />
         </div>
       </header>

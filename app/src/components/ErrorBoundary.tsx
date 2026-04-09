@@ -33,7 +33,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error('FlowScope Error:', error, errorInfo);
+    console.error('DataLineageAnalysis Error:', error, errorInfo);
 
     this.setState({
       error,
@@ -69,7 +69,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
             <div className="mb-4">
               <p className="text-sm text-muted-foreground mb-2">
-                An unexpected error occurred in FlowScope. Please try reloading the page.
+                An unexpected error occurred in DataLineageAnalysis. Please try reloading the page.
               </p>
 
               {this.state.error && (

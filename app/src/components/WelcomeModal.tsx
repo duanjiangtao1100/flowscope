@@ -36,7 +36,7 @@ export function WelcomeModal({ onClose }: WelcomeModalProps) {
     <Dialog open={open} onOpenChange={(isOpen) => !isOpen && handleClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="text-xl">Welcome to FlowScope</DialogTitle>
+          <DialogTitle className="text-xl">Welcome to DataLineageAnalysis</DialogTitle>
           <DialogDescription>
             A privacy-first SQL lineage engine that runs entirely in your browser.
           </DialogDescription>
