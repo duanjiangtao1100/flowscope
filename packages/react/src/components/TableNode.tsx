@@ -539,50 +539,25 @@ function TableNodeComponent({ id, data, selected }: NodeProps): JSX.Element {
 
       {!isCollapsed && nodeData.columns.length > 0 && (
         <div style={{ padding: '6px 12px', position: 'relative' }}>
-          {nodeData.columns.length >= COLUMN_VIRTUALIZATION_THRESHOLD ? (
-            // Virtualized list for large column counts
-            <List
-              style={{
-                height: Math.min(
-                  nodeData.columns.length * COLUMN_ROW_HEIGHT,
-                  GRAPH_CONFIG.MAX_COLUMN_HEIGHT
-                ),
-                overflowX: 'hidden',
-              }}
-              rowCount={nodeData.columns.length}
-              rowHeight={COLUMN_ROW_HEIGHT}
-              rowComponent={VirtualizedColumnRow}
-              rowProps={{
-                columns: nodeData.columns,
-                showColumnEdges,
-                onSelectColumn: selectNode,
-                colors,
-                textSecondary: palette.textSecondary,
-              }}
-              overscanCount={5}
-            />
-          ) : (
-            // Regular rendering for small column counts (avoid virtualization overhead)
-            // maxHeight ensures consistent behavior with virtualized list
-            <div
-              style={{
-                maxHeight: GRAPH_CONFIG.MAX_COLUMN_HEIGHT,
-                overflowY: 'auto',
-                overflowX: 'hidden',
-              }}
-            >
-              {nodeData.columns.map((col: ColumnNodeInfo) => (
-                <ColumnRow
-                  key={col.id}
-                  col={col}
-                  showColumnEdges={showColumnEdges}
-                  onSelectColumn={selectNode}
-                  colors={colors}
-                  textSecondary={palette.textSecondary}
-                />
-              ))}
-            </div>
-          )}
+          {/* Always use regular rendering - virtualization causes column edge handle misalignment */}
+          <div
+            style={{
+              maxHeight: GRAPH_CONFIG.MAX_COLUMN_HEIGHT,
+              overflowY: 'auto',
+              overflowX: 'hidden',
+            }}
+          >
+            {nodeData.columns.map((col: ColumnNodeInfo) => (
+              <ColumnRow
+                key={col.id}
+                col={col}
+                showColumnEdges={showColumnEdges}
+                onSelectColumn={selectNode}
+                colors={colors}
+                textSecondary={palette.textSecondary}
+              />
+            ))}
+          </div>
         </div>
       )}
       {!isCollapsed && nodeData.filters && nodeData.filters.length > 0 && (
